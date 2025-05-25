@@ -1,0 +1,208 @@
+name: KCD1_TPVToggle - Build and Release ASI
+
+permissions:
+  contents: write # Needed to create releases and upload artifacts
+  actions: read # Needed to read workflow inputs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., 0.1.0, 0.1.1-alpha)"
+        required: true
+        type: string
+      release_title:
+        description: "Title for the release (e.g., 'Initial TPV Toggle Release')"
+        required: false
+        type: string
+      changelog:
+        description: "Changelog for this release (Markdown format)"
+        required: false
+        type: string
+        default: "- Initial release."
+      prerelease:
+        description: "Mark as a pre-release?"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build KCD1_TPVToggle (MinGW ASI)
+    runs-on: windows-latest
+    outputs:
+      asi_artifact_name: ${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}
+      project_version: ${{ github.event.inputs.version }} # Pass version to release job
+      # Output path to the final zip, relative to repository root for upload
+      asi_zip_path: TPVToggle/${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}
+
+    defaults: # Set default working directory for steps in this job
+      run:
+        working-directory: TPVToggle
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+
+      - name: Cache MinGW
+        id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          path: C:\ProgramData\chocolatey\lib\mingw
+          key: ${{ runner.os }}-mingw-13.2.0-v2
+
+      - name: Install MinGW (if not cached)
+        if: steps.cache-mingw.outputs.cache-hit != 'true'
+        run: choco install mingw --version=13.2.0 --yes --force --no-progress
+        shell: powershell
+
+      - name: Add MinGW to PATH
+        run: echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        shell: powershell
+
+      - name: Install CMake
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' --yes --force --no-progress
+        shell: powershell
+
+      - name: Verify Tools
+        run: |
+          echo "--- Verifying g++ (MinGW) ---"
+          g++ --version
+          echo "--- Verifying make (MinGW) ---"
+          mingw32-make --version || make --version
+          echo "--- Verifying cmake ---"
+          cmake --version
+        shell: bash
+
+      - name: Configure with CMake
+        run: |
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+
+      - name: Build with CMake
+        run: cmake --build build --config Release --parallel $(nproc || echo 2)
+        shell: bash
+
+      - name: Verify Build Output
+        run: |
+          echo "Build directory contents (inside TPVToggle/build/):"
+          ls -la build/
+          echo "Checking for final ASI file (KCD1_TPVToggle.asi):"
+          ls -la build/KCD1_TPVToggle.asi || echo "Final ASI file (KCD1_TPVToggle.asi) not found in TPVToggle/build/"
+        shell: bash
+
+      - name: Determine Artifact Names
+        id: determine-artifact-names
+        run: |
+          $version_input = "${{ github.event.inputs.version }}"
+          $version_safe = $version_input.Replace("+", "_plus_") # Sanitize '+' for filenames
+          $asi_zip_name = "KCD1_TPVToggle_ASI_v${version_safe}.zip"
+          echo "ASI_ARTIFACT_NAME=$asi_zip_name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        shell: pwsh
+
+      - name: Create ASI ZIP Package
+        run: |
+          $acknowledgements_file = "KCD1_TPVToggle_Acknowledgements.txt" # Assumes this is in TPVToggle/
+          $ini_file = "KCD1_TPVToggle.ini" # Assumes this is in TPVToggle/
+
+          # Check for the final ASI file (name set by CMake)
+          if (Test-Path "build\KCD1_TPVToggle.asi") {
+            Write-Output "Creating ASI package with: KCD1_TPVToggle.asi (from build/)"
+            New-Item -ItemType Directory -Path "package_asi" -Force # Creates package_asi inside TPVToggle/
+            Copy-Item -Path "build\KCD1_TPVToggle.asi" -Destination "package_asi\"
+
+            if (Test-Path $acknowledgements_file) {
+              Copy-Item -Path $acknowledgements_file -Destination "package_asi\"
+            } else {
+              Write-Warning "File not found: $acknowledgements_file (expected in TPVToggle/)"
+            }
+
+            if (Test-Path $ini_file) {
+              Copy-Item -Path $ini_file -Destination "package_asi\"
+            } else {
+              Write-Warning "File not found: $ini_file (expected in TPVToggle/). Users will need to create it or use defaults."
+            }
+
+            Compress-Archive -Path "package_asi\*" -DestinationPath "${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}" -Force
+            # ZIP file will be created in TPVToggle/ folder
+          } else {
+            Write-Error "Build error: No ASI file found at TPVToggle\build\KCD1_TPVToggle.asi. Check CMake output name."
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Upload ASI Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asi-package-${{ github.event.inputs.version }} # Make artifact name unique per version
+          path: TPVToggle/${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }} # Path is relative to REPO_ROOT
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - name: Download ASI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: asi-package-${{ needs.build.outputs.project_version }} # Match the uploaded artifact name
+          path: asi_package_dir # Artifacts are downloaded into this directory
+
+      - name: List downloaded artifacts
+        run: |
+          echo "--- ASI Package Contents (after download) ---"
+          ls -R asi_package_dir
+
+      - name: Prepare release files
+        id: file_list
+        run: |
+          # The downloaded artifact (the ZIP file) is directly in asi_package_dir/
+          # Its name is needs.build.outputs.asi_artifact_name
+          ASI_ZIP_PATH_IN_ARTIFACT_DIR="asi_package_dir/${{ needs.build.outputs.asi_artifact_name }}"
+
+          if [ -f "$ASI_ZIP_PATH_IN_ARTIFACT_DIR" ]; then
+            echo "FILES_TO_RELEASE=$ASI_ZIP_PATH_IN_ARTIFACT_DIR" >> $GITHUB_OUTPUT
+            echo "Found ASI ZIP: $ASI_ZIP_PATH_IN_ARTIFACT_DIR"
+          else
+            echo "Error: ASI ZIP file '${{ needs.build.outputs.asi_artifact_name }}' not found in asi_package_dir/"
+            exit 1
+          fi
+        shell: bash
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.file_list.outputs.FILES_TO_RELEASE }}
+          name: KCD1 TPV Toggle v${{ github.event.inputs.version }}
+          tag_name: KCD1_TPVToggle-v${{ github.event.inputs.version }} # Ensure tag matches expected format
+          body: |
+            **Release Title:** ${{ github.event.inputs.release_title }}
+            **Version:** ${{ github.event.inputs.version }}
+
+            **Changelog:**
+            ${{ github.event.inputs.changelog }}
+
+            **Artifacts:**
+            This release includes the ASI loader version of the mod:
+
+            *   `${{ needs.build.outputs.asi_artifact_name }}`: ASI Loader version. Drop `KCD1_TPVToggle.asi` and `KCD1_TPVToggle.ini` into your KCD1 game directory (where KingdomCome.exe is located).
+
+            **Requirements:**
+            *   A compatible ASI Loader (e.g., Ultimate ASI Loader) installed for Kingdom Come: Deliverance.
+
+            **Installation:**
+            1.  Ensure you have an ASI Loader installed for KCD1.
+            2.  Extract the contents of `${{ needs.build.outputs.asi_artifact_name }}` (which should be `KCD1_TPVToggle.asi`, `KCD1_TPVToggle.ini`, and `KCD1_TPVToggle_Acknowledgements.txt`) into your Kingdom Come: Deliverance game directory (where `KingdomCome.exe` is located).
+            3.  Configure `KCD1_TPVToggle.ini` to set your preferred hotkeys if defaults are not desired.
+
+            **What this mod does:**
+            Adds a configurable hotkey to toggle between First-Person View (FPV) and Third-Person View (TPV) in Kingdom Come: Deliverance. Also supports dedicated keys to force FPV or TPV.
+
+            Built with DetourModKit.
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
