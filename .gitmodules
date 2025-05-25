@@ -1,0 +1,3 @@
+[submodule "external/DetourModKit"]
+	path = TPVToggle/external/DetourModKit
+	url = https://github.com/tkhquang/DetourModKit.git
