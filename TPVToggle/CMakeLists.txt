@@ -80,12 +80,13 @@ set_target_properties(${PROJECT_NAME}-ASI PROPERTIES
   PREFIX ""
 )
 
-# Linker flags for size optimization (MinGW)
+# Linker flags for size optimization and static linking (MinGW)
 if(NOT MSVC)
   target_link_options(${PROJECT_NAME}-ASI PRIVATE
     -Wl,--gc-sections
     -static-libgcc
     -static-libstdc++
+    -static
   )
 endif()
 
