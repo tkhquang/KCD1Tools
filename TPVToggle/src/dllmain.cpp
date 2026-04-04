@@ -192,6 +192,7 @@ namespace Mod
         DMKConfig::log_all();
 
         logger.set_log_level(DMKLogger::string_to_log_level(g_config.log_level_str));
+        logger.enable_async_mode();
 
         DMKMemory::init_cache();
 
