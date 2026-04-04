@@ -28,15 +28,14 @@ on:
 
 jobs:
   build:
-    name: Build KCD1_TPVToggle (MinGW ASI)
+    name: Build KCD1_TPVToggle (MSVC ASI)
     runs-on: windows-latest
     outputs:
       asi_artifact_name: ${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}
-      project_version: ${{ github.event.inputs.version }} # Pass version to release job
-      # Output path to the final zip, relative to repository root for upload
+      project_version: ${{ github.event.inputs.version }}
       asi_zip_path: TPVToggle/${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}
 
-    defaults: # Set default working directory for steps in this job
+    defaults:
       run:
         working-directory: TPVToggle
 
@@ -46,89 +45,72 @@ jobs:
         with:
           submodules: "recursive"
 
-      - name: Cache MinGW
-        id: cache-mingw
-        uses: actions/cache@v4
-        with:
-          path: C:\ProgramData\chocolatey\lib\mingw
-          key: ${{ runner.os }}-mingw-13.2.0-v2
-
-      - name: Install MinGW (if not cached)
-        if: steps.cache-mingw.outputs.cache-hit != 'true'
-        run: choco install mingw --version=13.2.0 --yes --force --no-progress
-        shell: powershell
-
-      - name: Add MinGW to PATH
-        run: echo "C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        shell: powershell
-
-      - name: Install CMake
-        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' --yes --force --no-progress
-        shell: powershell
-
       - name: Verify Tools
         run: |
-          echo "--- Verifying g++ (MinGW) ---"
-          g++ --version
-          echo "--- Verifying make (MinGW) ---"
-          mingw32-make --version || make --version
+          echo "--- Verifying MSVC ---"
+          cl 2>&1 | head -1 || true
           echo "--- Verifying cmake ---"
           cmake --version
         shell: bash
 
       - name: Configure with CMake
-        run: |
-          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build --preset msvc-release
         shell: bash
 
       - name: Build with CMake
-        run: cmake --build build --config Release --parallel $(nproc || echo 2)
+        run: cmake --build build/release-msvc --config Release
         shell: bash
 
       - name: Verify Build Output
         run: |
-          echo "Build directory contents (inside TPVToggle/build/):"
-          ls -la build/
-          echo "Checking for final ASI file (KCD1_TPVToggle.asi):"
-          ls -la build/KCD1_TPVToggle.asi || echo "Final ASI file (KCD1_TPVToggle.asi) not found in TPVToggle/build/"
+          echo "Build directory contents:"
+          ls -la build/release-msvc/Release/ 2>/dev/null || ls -la build/release-msvc/
+          echo "Checking for final ASI file:"
+          ls -la build/release-msvc/Release/KCD1_TPVToggle.asi 2>/dev/null || ls -la build/release-msvc/KCD1_TPVToggle.asi 2>/dev/null || echo "ASI file not found"
         shell: bash
 
       - name: Determine Artifact Names
         id: determine-artifact-names
         run: |
           $version_input = "${{ github.event.inputs.version }}"
-          $version_safe = $version_input.Replace("+", "_plus_") # Sanitize '+' for filenames
+          $version_safe = $version_input.Replace("+", "_plus_")
           $asi_zip_name = "KCD1_TPVToggle_ASI_v${version_safe}.zip"
           echo "ASI_ARTIFACT_NAME=$asi_zip_name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
         shell: pwsh
 
       - name: Create ASI ZIP Package
         run: |
-          $acknowledgements_file = "KCD1_TPVToggle_Acknowledgements.txt" # Assumes this is in TPVToggle/
-          $ini_file = "KCD1_TPVToggle.ini" # Assumes this is in TPVToggle/
+          $acknowledgements_file = "KCD1_TPVToggle_Acknowledgements.txt"
+          $ini_file = "KCD1_TPVToggle.ini"
 
-          # Check for the final ASI file (name set by CMake)
-          if (Test-Path "build\KCD1_TPVToggle.asi") {
-            Write-Output "Creating ASI package with: KCD1_TPVToggle.asi (from build/)"
-            New-Item -ItemType Directory -Path "package_asi" -Force # Creates package_asi inside TPVToggle/
-            Copy-Item -Path "build\KCD1_TPVToggle.asi" -Destination "package_asi\"
+          # Check for the final ASI file - MSVC puts it in Release subdirectory
+          $asi_path = $null
+          if (Test-Path "build\release-msvc\Release\KCD1_TPVToggle.asi") {
+            $asi_path = "build\release-msvc\Release\KCD1_TPVToggle.asi"
+          } elseif (Test-Path "build\release-msvc\KCD1_TPVToggle.asi") {
+            $asi_path = "build\release-msvc\KCD1_TPVToggle.asi"
+          }
+
+          if ($asi_path) {
+            Write-Output "Creating ASI package with: $asi_path"
+            New-Item -ItemType Directory -Path "package_asi" -Force
+            Copy-Item -Path $asi_path -Destination "package_asi\"
 
             if (Test-Path $acknowledgements_file) {
               Copy-Item -Path $acknowledgements_file -Destination "package_asi\"
             } else {
-              Write-Warning "File not found: $acknowledgements_file (expected in TPVToggle/)"
+              Write-Warning "File not found: $acknowledgements_file"
             }
 
             if (Test-Path $ini_file) {
               Copy-Item -Path $ini_file -Destination "package_asi\"
             } else {
-              Write-Warning "File not found: $ini_file (expected in TPVToggle/). Users will need to create it or use defaults."
+              Write-Warning "File not found: $ini_file"
             }
 
             Compress-Archive -Path "package_asi\*" -DestinationPath "${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}" -Force
-            # ZIP file will be created in TPVToggle/ folder
           } else {
-            Write-Error "Build error: No ASI file found at TPVToggle\build\KCD1_TPVToggle.asi. Check CMake output name."
+            Write-Error "Build error: No ASI file found. Check CMake output."
             exit 1
           }
         shell: pwsh
@@ -136,8 +118,8 @@ jobs:
       - name: Upload ASI Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: asi-package-${{ github.event.inputs.version }} # Make artifact name unique per version
-          path: TPVToggle/${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }} # Path is relative to REPO_ROOT
+          name: asi-package-${{ github.event.inputs.version }}
+          path: TPVToggle/${{ steps.determine-artifact-names.outputs.ASI_ARTIFACT_NAME }}
 
   create-release:
     name: Create GitHub Release
@@ -148,8 +130,8 @@ jobs:
       - name: Download ASI artifact
         uses: actions/download-artifact@v4
         with:
-          name: asi-package-${{ needs.build.outputs.project_version }} # Match the uploaded artifact name
-          path: asi_package_dir # Artifacts are downloaded into this directory
+          name: asi-package-${{ needs.build.outputs.project_version }}
+          path: asi_package_dir
 
       - name: List downloaded artifacts
         run: |
@@ -159,8 +141,6 @@ jobs:
       - name: Prepare release files
         id: file_list
         run: |
-          # The downloaded artifact (the ZIP file) is directly in asi_package_dir/
-          # Its name is needs.build.outputs.asi_artifact_name
           ASI_ZIP_PATH_IN_ARTIFACT_DIR="asi_package_dir/${{ needs.build.outputs.asi_artifact_name }}"
 
           if [ -f "$ASI_ZIP_PATH_IN_ARTIFACT_DIR" ]; then
@@ -177,7 +157,7 @@ jobs:
         with:
           files: ${{ steps.file_list.outputs.FILES_TO_RELEASE }}
           name: KCD1 TPV Toggle v${{ github.event.inputs.version }}
-          tag_name: KCD1_TPVToggle-v${{ github.event.inputs.version }} # Ensure tag matches expected format
+          tag_name: KCD1_TPVToggle-v${{ github.event.inputs.version }}
           body: |
             **Release Title:** ${{ github.event.inputs.release_title }}
             **Version:** ${{ github.event.inputs.version }}

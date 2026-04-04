@@ -1,0 +1,133 @@
+[size=5]Description[/size]
+This mod adds a simple way to toggle between first-person and third-person camera views in the original Kingdom Come: Deliverance using customizable hotkeys. Requested by [url=https://next.nexusmods.com/profile/horror11]horror11[/url], [url=https://next.nexusmods.com/profile/spinner1112]spinner1112[/url].
+
+This is a basic version for KCD1. Currently, only the TPV toggle itself works. Other features from the [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/1550]KCD2 TPV Toggle mod[/url] (like automatic switching, custom FOV, etc.) are [b]not yet implemented[/b]. They may be added in the future if time permits, but no promises are made as development focus is primarily on KCD2.
+
+[size=5]Key Features[/size]
+[list]
+[*] Toggle between first-person and third-person views with a keypress (default: F3)
+[*] Dedicated keys for forcing first-person or third-person view
+[*] Keyboard, mouse, and gamepad input supported natively
+[*] Supports Steam (v1.9.7) and GOG (v1.9.6) versions
+[*] Settings are customizable through the [b]KCD1_TPVToggle.ini[/b] file
+[*] Open-source: [url=https://github.com/tkhquang/KCD1Tools]KCD1Tools GitHub Repository[/url]
+[/list]
+
+[size=5]Requirements[/size]
+[list]
+[*] Kingdom Come: Deliverance (Steam v1.9.7 or GOG v1.9.6)
+[*] [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] (or a compatible ASI loader)
+[/list]
+
+[size=5]Installation[/size]
+
+[size=4]Step 1: Install an ASI Loader[/size]
+You need an ASI Loader to load [b].asi[/b] mods. If you already have one (e.g. from another mod), skip to Step 2.
+
+Download the [b]x64[/b] build of [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] and place one of the following DLLs into your game directory (where [b]KingdomCome.exe[/b] is located):
+[list]
+[*] [b]dinput8.dll[/b] - Recommended
+[*] [b]version.dll[/b] - Alternative if dinput8.dll conflicts
+[*] [b]winmm.dll[/b] - Another alternative
+[/list]
+
+[b]How to verify:[/b] After completing Step 2, launch the game once. If no [b]KCD1_TPVToggle.log[/b] file appears in your game directory, the ASI Loader is not loading. Try renaming the DLL to one of the other variants listed above.
+
+[size=4]Step 2: Install the mod[/size]
+1. Download the latest release from the files section
+2. Extract [b]KCD1_TPVToggle.asi[/b] and [b]KCD1_TPVToggle.ini[/b] into your game directory
+
+[size=4]Step 3: Launch and play[/size]
+Launch the game. Press [b]F3[/b] (default) to toggle the camera view.
+
+[size=4]File placement[/size]
+[code]
+<Your KCD1 Game Folder>/Bin/Win64/
+├── KingdomCome.exe         (Game executable)
+├── dinput8.dll             (ASI Loader)
+├── KCD1_TPVToggle.asi      (This mod)
+├── KCD1_TPVToggle.ini      (This mod's configuration)
+└── ...
+[/code]
+
+[size=5]Configuration[/size]
+Customize hotkeys by editing the [b]KCD1_TPVToggle.ini[/b] file located in your game directory. Keys use human-readable names (e.g., [b]F3[/b], [b]Ctrl+F3[/b]). Gamepad buttons are also supported (e.g., [b]Gamepad_LB+Gamepad_A[/b]).
+
+[code]
+[Settings]
+; ToggleKey: Key(s) to toggle between first-person and third-person views.
+; Default: F3
+ToggleKey = F3
+
+; FPVKey: Key(s) that always force first-person view.
+FPVKey =
+
+; TPVKey: Key(s) that always force third-person view.
+TPVKey =
+
+; LogLevel: Trace, Debug, Info, Warning, Error
+LogLevel = Info
+
+[/code]
+
+[size=5]Hotkey Format[/size]
+[list]
+[*] Named keys: F3, V, Numpad1, Mouse4, Gamepad_A, etc.
+[*] Modifiers: Ctrl, Shift, Alt (or LCtrl, RCtrl, etc.)
+[*] Multiple combos: [b]F3,Gamepad_LB+Gamepad_A[/b] (F3 alone OR hold LB + press A)
+[*] Empty value disables the binding
+[/list]
+
+See the full list at the [url=https://github.com/tkhquang/DetourModKit?tab=readme-ov-file#supported-input-names]Supported Input Names[/url] reference.
+
+[size=5]Using with Controllers[/size]
+DetourModKit supports gamepad input natively via the [b]XInput[/b] API. Use gamepad button names directly in the INI file:
+
+[code]
+; Toggle with gamepad Y button
+ToggleKey = Gamepad_Y
+
+; Use a modifier combo
+ToggleKey = Gamepad_LB+Gamepad_Y
+
+; Multiple independent combos (comma = OR)
+ToggleKey = F3,Gamepad_LB+Gamepad_Y
+[/code]
+
+[b]XInput only:[/b] Xbox controllers work natively. For PS4/PS5/Switch controllers, use an XInput translation layer (e.g. DS4Windows, DualSenseX, BetterJoy) or Steam Input to present your controller as XInput. See [url=https://github.com/tkhquang/DetourModKit?tab=readme-ov-file#gamepad-compatibility]Gamepad Compatibility[/url] for details.
+
+[size=5]Known Issues & Limitations[/size]
+[list]
+[*] This is a basic implementation. The third-person camera uses the game's underlying (possibly experimental) TPV system and may have quirks
+[*] Camera may clip through objects in third-person view
+[*] Some UI elements or specific game interactions might not look or work perfectly in TPV. Forcing FPV for these might be necessary
+[*] Advanced features from the KCD2 version (like FOV settings, automatic menu switching) are not present in this KCD1 version
+[*] After a major game update, the mod may stop working until a new version is released
+[/list]
+
+[size=5]Troubleshooting[/size]
+If you encounter issues:
+[list]
+[*] Set [b]LogLevel = Debug[/b] in the INI file
+[*] Check the log file in your game directory ([b]KCD1_TPVToggle.log[/b])
+[*] For memory pattern errors, the mod needs an update for the current game version
+[*] Ensure your ASI Loader is correctly installed and working
+[*] Make sure the [b]KCD1_TPVToggle.ini[/b] file is in the same directory as the [b].asi[/b] file
+[/list]
+
+[b]After a game update:[/b] The AOB pattern scanning system automatically adapts to minor game changes, but major updates may require mod updates if core game functions have been modified.
+
+[size=5]Credits & Source Code[/size]
+Built with [url=https://github.com/tkhquang/DetourModKit]DetourModKit[/url] for core functionality.
+
+[list]
+[*] Based on the [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/1550]TPV Toggle for KCD2[/url]
+[*] [url=https://github.com/ThirteenAG]ThirteenAG[/url] for the Ultimate ASI Loader
+[*] [url=https://github.com/cursey]cursey[/url] for SafetyHook
+[*] Brodie Thiesfield for SimpleIni
+[*] Warhorse Studios for Kingdom Come: Deliverance
+[/list]
+
+The source code for this mod and other KCD1 tools can be found on [url=https://github.com/tkhquang/KCD1Tools]GitHub[/url].
+
+Your feedback and bug reports are appreciated! Please understand that development for this KCD1 version is secondary to KCD2 projects.
