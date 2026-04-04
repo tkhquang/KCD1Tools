@@ -54,11 +54,11 @@ jobs:
         shell: bash
 
       - name: Configure with CMake
-        run: cmake -S . -B build --preset msvc-release
+        run: cmake --preset msvc-release
         shell: bash
 
       - name: Build with CMake
-        run: cmake --build build/release-msvc --config Release
+        run: cmake --build --preset msvc-release
         shell: bash
 
       - name: Verify Build Output
