@@ -8,12 +8,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# --- Compiler Flags ---
-if(MSVC)
-  add_compile_options(/W4)
+# --- MSVC Compile/Link Options (applied per-target below, not globally) ---
+
+# --- LTO for Release Builds ---
+include(CheckIPOSupported)
+check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_OUTPUT)
+if(IPO_SUPPORTED)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+  message(STATUS "LTO enabled for Release builds")
 else()
-  # GCC/Clang/MinGW specific flags - remove -flto to avoid linking issues
-  add_compile_options(-Wall -Wextra -Os -ffunction-sections -fdata-sections)
+  message(STATUS "LTO not supported: ${IPO_OUTPUT}")
 endif()
 
 # --- Windows Definitions ---
@@ -73,22 +77,23 @@ target_link_libraries(${PROJECT_NAME}-ASI PRIVATE
   kernel32
 )
 
+target_compile_options(${PROJECT_NAME}-ASI PRIVATE
+  /W4
+  $<$<CONFIG:Release>:/O1>
+  $<$<CONFIG:Release>:/Gy>
+  $<$<CONFIG:Release>:/Gw>
+)
+target_link_options(${PROJECT_NAME}-ASI PRIVATE
+  $<$<CONFIG:Release>:/OPT:REF>
+  $<$<CONFIG:Release>:/OPT:ICF>
+)
+
 # Set output name and properties for ASI
 set_target_properties(${PROJECT_NAME}-ASI PROPERTIES
   OUTPUT_NAME "KCD1_TPVToggle-temp-asi"
   SUFFIX ".asi"
   PREFIX ""
 )
-
-# Linker flags for size optimization and static linking (MinGW)
-if(NOT MSVC)
-  target_link_options(${PROJECT_NAME}-ASI PRIVATE
-    -Wl,--gc-sections
-    -static-libgcc
-    -static-libstdc++
-    -static
-  )
-endif()
 
 # Post-build steps to rename to desired names
 add_custom_command(TARGET ${PROJECT_NAME}-ASI POST_BUILD
