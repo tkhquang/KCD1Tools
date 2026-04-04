@@ -42,6 +42,14 @@ namespace Mod
     constexpr WORD CAMERA_MODE_TPV = 1;
     constexpr int INIT_RETRY_MS = 500;
 
+    constexpr const char *CAMERA_MODE_NAME_FPV = "FPV";
+    constexpr const char *CAMERA_MODE_NAME_TPV = "TPV";
+
+    const char *get_camera_mode_name(WORD mode)
+    {
+        return mode == CAMERA_MODE_TPV ? CAMERA_MODE_NAME_TPV : CAMERA_MODE_NAME_FPV;
+    }
+
     /** @brief AOB pattern definition. The `|` marker sets the offset to the MOV RAX,[RIP+disp32] instruction. */
     struct PatternDef
     {
@@ -108,14 +116,16 @@ namespace Mod
         if (current != mode)
         {
             *reinterpret_cast<WORD *>(flag_addr) = mode;
-            DMKLogger::get_instance().info("Camera mode set to: {}", mode);
+            DMKLogger::get_instance().info("Camera mode set to: {} ({})", mode, get_camera_mode_name(mode));
         }
     }
 
     void ToggleView()
     {
-        WORD newMode = GetCameraMode() == CAMERA_MODE_TPV ? CAMERA_MODE_FPV : CAMERA_MODE_TPV;
-        DMKLogger::get_instance().info("Toggling camera mode: {} -> {}", GetCameraMode(), newMode);
+        WORD currentMode = GetCameraMode();
+        WORD newMode = currentMode == CAMERA_MODE_TPV ? CAMERA_MODE_FPV : CAMERA_MODE_TPV;
+        DMKLogger::get_instance().debug("Toggling camera mode: {} -> {}",
+                                        get_camera_mode_name(currentMode), get_camera_mode_name(newMode));
         SetCameraMode(newMode);
     }
 
