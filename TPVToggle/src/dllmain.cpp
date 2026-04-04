@@ -14,8 +14,17 @@
 
 #include <DetourModKit.hpp>
 
+#include "version.hpp"
+
 namespace Mod
 {
+    // --- Mod identity ---
+    inline constexpr const char *MOD_VERSION = VERSION_STRING;
+    inline constexpr const char *MOD_NAME = "KCD1_TPVToggle";
+    inline constexpr const char *MOD_AUTHOR = "tkhquang";
+    inline constexpr const char *MOD_SOURCE = "https://github.com/tkhquang/KCD1Tools";
+    inline constexpr const char *MOD_NEXUS = "https://www.nexusmods.com/kingdomcomedeliverance/mods/2009";
+
     struct Config
     {
         DMKKeyComboList toggle_combos;
@@ -167,6 +176,11 @@ namespace Mod
     {
         DMKLogger::configure("KCD1_TPVToggle", "KCD1_TPVToggle.log", "%Y-%m-%d %H:%M:%S");
         DMKLogger &logger = DMKLogger::get_instance();
+
+        // Mod info
+        logger.info("{} v{} by {}", MOD_NAME, MOD_VERSION, MOD_AUTHOR);
+        logger.info("Source: {}", MOD_SOURCE);
+        logger.info("Nexus: {}", MOD_NEXUS);
 
         DMKConfig::register_key_combo(
             "Settings", "ToggleKey", "Toggle View Keys",
