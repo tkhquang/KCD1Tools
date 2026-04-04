@@ -8,14 +8,13 @@ This is a basic version for KCD1. Currently, only the TPV toggle itself works. O
 [*] Toggle between first-person and third-person views with a keypress (default: F3)
 [*] Dedicated keys for forcing first-person or third-person view
 [*] Keyboard, mouse, and gamepad input supported natively
-[*] Supports Steam (v1.9.7) and GOG (v1.9.6) versions
 [*] Settings are customizable through the [b]KCD1_TPVToggle.ini[/b] file
 [*] Open-source: [url=https://github.com/tkhquang/KCD1Tools]KCD1Tools GitHub Repository[/url]
 [/list]
 
 [size=5]Requirements[/size]
 [list]
-[*] Kingdom Come: Deliverance (Steam v1.9.7 or GOG v1.9.6)
+[*] Kingdom Come: Deliverance (tested on Steam version, other versions may work)
 [*] [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] (or a compatible ASI loader)
 [/list]
 
