@@ -1,0 +1,49 @@
+[size=5]Foreword[/size]
+This is a raw port of my KCD2 mod, [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/3263]Proper Third Person View (TPV Camera)[/url], to the first Kingdom Come: Deliverance. It is the same mod, design, and INI; only the game and its binary addresses differ.
+
+To avoid maintaining two copies of the same documentation, this page stays minimal. For the full feature list, controls, configuration, and troubleshooting, please see the [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/3263]KCD2 mod page[/url] - it all applies here as well.
+
+[size=5]Requirements[/size]
+[list]
+[*]Kingdom Come: Deliverance[/*]
+[*]An ASI loader - NOT included, you download it yourself (see Step 1 below)[/*]
+[/list]
+
+[size=5]Installation[/size]
+This mod is an [b].asi[/b] plugin, so it needs an ASI loader to run. The loader is [b]not included[/b] in this download - you install it once, yourself (Step 1). If you already have an ASI loader for KC:D from another mod, skip to Step 2.
+
+[size=4]Step 1: Install an ASI loader[/size]
+Download [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] by ThirteenAG and place ONE of these DLLs in your game's binary folder (the Bin/Win64 folder that contains WHGame.dll and KingdomCome.exe):
+[list]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/dinput8-x64.zip][b]dinput8.dll[/b][/url] - Recommended[/*]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/version-x64.zip][b]version.dll[/b][/url] - Alternative if dinput8.dll does not work[/*]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/winmm-x64.zip][b]winmm.dll[/b][/url] - Another alternative[/*]
+[/list]
+Each link downloads a ZIP; extract just the DLL and drop it next to WHGame.dll.
+
+[size=4]Step 2: Install the mod[/size]
+1. Download the latest version from the Files tab.
+2. Extract ALL files into that SAME binary folder, next to WHGame.dll and the loader DLL:
+[code]<KC:D installation folder>/Bin/Win64/[/code]
+
+[size=4]Step 3: Launch and play[/size]
+Launch the game; third-person turns on automatically once you reach gameplay. Press F3 (or hold LB + RB on a controller) to toggle back to first-person.
+
+[b]How to verify the loader works:[/b] after launching once, check for a [b]KCD1_TPVCamera.log[/b] file in the binary folder. If it is not there, the loader is not loading the mod - rename your loader DLL to one of the other variants (version.dll, winmm.dll) and relaunch.
+
+[size=5]Configuration[/size]
+Hotkeys and settings live in KCD1_TPVCamera.ini (every option is documented inline). Defaults: toggle third-person F3 (or hold LB + RB), free-look orbit F4, preset overlay Home. The camera framing is preset-driven; open the in-game overlay (Home) to tune and save presets. The INI layout and overlay are identical to the KCD2 mod, so its [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/3263]mod page[/url] documents everything in detail.
+
+[b]After a game update:[/b] the mod locates each game function it hooks through several fallback signatures and self-heals internal data offsets, so it adapts to many game changes automatically. Major updates may still need a mod update if core game functions are heavily rewritten.
+
+[size=5]Credits & Source Code[/size]
+Built with [url=https://github.com/tkhquang/DetourModKit]DetourModKit[/url] for core functionality.
+[list]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader]Ultimate ASI Loader[/url] by ThirteenAG - ASI loading layer[/*]
+[*][url=https://github.com/cursey/safetyhook]SafetyHook[/url] by cursey - inline / mid-function hooking[/*]
+[*][url=https://github.com/brofield/simpleini]SimpleIni[/url] by Brodie Thiesfield - INI configuration parser[/*]
+[*][url=https://github.com/FransBouma]Frans 'Otis_Inf' Bouma[/url] - for his camera tools and inspiration[/*]
+[*]Warhorse Studios for creating Kingdom Come: Deliverance[/*]
+[/list]
+
+Source code for this port is in the [url=https://github.com/tkhquang/KCD1Tools]KCD1Tools GitHub repository[/url]. The original KCD2 mod lives in [url=https://github.com/tkhquang/KCD2Tools]KCD2Tools[/url].

@@ -1,5 +1,22 @@
 .idea/*
 
 **/build/*
+# Keep the release packaging template tracked: the release workflow zips build/template/*
+# (the INI, in-archive readme, and acknowledgements) together with the freshly built .asi.
+!**/build/template
 
 !/**/.gitkeep
+
+# Build output / artifacts
+/out/
+.vs/
+*.user
+*.asi
+*.dll
+*.pdb
+*.log
+CMakeUserPresets.json
+
+# Python
+__pycache__/
+*.pyc
