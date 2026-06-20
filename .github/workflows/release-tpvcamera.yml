@@ -36,7 +36,10 @@ jobs:
         with:
           fetch-depth: 0
           submodules: "recursive"
-          token: ${{ secrets.PAT }}
+          # Use a PAT if configured (lets pushed commits/tags trigger other
+          # workflows); otherwise fall back to the built-in GITHUB_TOKEN, which
+          # has contents:write (see permissions above) and can push + tag.
+          token: ${{ secrets.PAT || github.token }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
