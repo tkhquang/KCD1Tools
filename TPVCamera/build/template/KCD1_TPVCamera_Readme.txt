@@ -1,5 +1,5 @@
 KINGDOM COME: DELIVERANCE - THIRD PERSON CAMERA
-Version 0.1.0
+Version 1.0.0
 
 A raw port of the KCD2 mod "Proper Third Person View (TPV Camera)" to the first
 Kingdom Come: Deliverance. It is the same mod and INI; only the game and its binary
