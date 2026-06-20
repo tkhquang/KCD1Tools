@@ -1,3 +1,6 @@
 [submodule "external/DetourModKit"]
 	path = TPVToggle/external/DetourModKit
 	url = https://github.com/tkhquang/DetourModKit.git
+[submodule "TPVCamera/external/DetourModKit"]
+	path = TPVCamera/external/DetourModKit
+	url = https://github.com/tkhquang/DetourModKit.git

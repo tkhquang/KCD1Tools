@@ -44,9 +44,10 @@ else()
 endif()
 
 # --- DetourModKit Dependency ---
-# Preferred: a per-mod submodule at external/DetourModKit. Until that is added, the
-# build reuses the sibling TPVToggle submodule already present in this repo. Override
-# with -DKCD1_DMK_DIR=<path>.
+# Preferred and default: the per-mod submodule at external/DetourModKit, pinned to
+# DetourModKit v3.8.2 (the same release the KCD2 TPVCamera targets). If it is not
+# initialized, the build falls back to an on-disk sibling checkout (see below).
+# Override with -DKCD1_DMK_DIR=<path>.
 set(KCD1_DMK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DetourModKit" CACHE PATH
   "Path to a DetourModKit source checkout")
 
@@ -54,8 +55,8 @@ if(NOT EXISTS "${KCD1_DMK_DIR}/CMakeLists.txt")
   # This mod targets the DetourModKit 3.8.x API (same as the KCD2 TPVCamera it was
   # ported from: Anchors cascades, Bootstrap, Memory::seh_read, Rtti). The sibling
   # TPVToggle submodule pins an older 2.0.0 API that is NOT source-compatible, so it
-  # is intentionally not used here. Until a per-mod submodule is added at
-  # external/DetourModKit, fall back to the on-disk KCD2Tools 3.8.x checkout.
+  # is intentionally not used here. If the per-mod submodule at external/DetourModKit
+  # is not initialized, fall back to the on-disk KCD2Tools 3.8.x checkout.
   set(_dmk_candidates
     "${CMAKE_CURRENT_SOURCE_DIR}/../../KCD2Tools/TPVCamera/external/DetourModKit"
   )
