@@ -20,7 +20,7 @@
  *
  *          Gated on cursor-hidden (the main menu renders a camera with a RESOLVED player, so c_player / aim-pose
  *          validity do NOT distinguish it -- only the OS cursor does), InteractFromCamera, and a valid published
- *          aim pose. SEH-guarded throughout; v10 is restored on every path. Resolved via static RVAs.
+ *          aim pose. SEH-guarded throughout; v10 is restored on every path. Resolved at runtime via AOB cascades.
  */
 
 #include "interaction_hook.hpp"
@@ -51,31 +51,28 @@ namespace TPVCamera
                                                       uintptr_t out2, int mode);
         SelectionFunc s_selection_original = nullptr;
 
-        // sub_180430AA4: returns the CCryAction/game framework singleton (lazily inits + caches). v10 (the
-        // selection's look-ray view pose) is reached through it.
-        using FrameworkGetterFunc = uintptr_t(__fastcall *)();
-        FrameworkGetterFunc s_framework_getter = nullptr;
-
         // --- diagnostics (game thread only; atomic for the trace line) ---
         std::atomic<unsigned long long> s_redirects{0};
         const char *s_last_reason = "none";
         std::chrono::steady_clock::time_point s_last_log{};
 
-        /** @brief SEH-guarded call to the framework getter (an engine call, not a guarded read). 0 on fault. */
-        uintptr_t call_framework_getter() noexcept
+        /**
+         * @brief Resolves the live game-framework base (== global context) at runtime. 0 if not live.
+         * @details The interaction redirect needs the framework's view subsystem (framework +
+         *          FRAMEWORK_VIEW_OFFSET). The framework is the value held in the global-context .data slot (the
+         *          engine's framework getter does nothing but load that slot), so it is read from the slot the
+         *          Context AOB cascade resolves: *(ctx_slot) equals the getter's return. A total Context cascade
+         *          miss fails closed (0), and resolve_view_pose then leaves the native selection in place.
+         */
+        uintptr_t resolve_framework() noexcept
         {
-            if (s_framework_getter == nullptr)
+            const uintptr_t ctx_slot = anchor_address(AnchorId::Context);
+            if (ctx_slot == 0)
             {
                 return 0;
             }
-            __try
-            {
-                return s_framework_getter();
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                return 0;
-            }
+            const auto framework = DMK::Memory::seh_read<uintptr_t>(ctx_slot);
+            return (framework && DMK::Memory::plausible_userspace_ptr(*framework)) ? *framework : 0;
         }
 
         /**
@@ -85,7 +82,7 @@ namespace TPVCamera
          */
         uintptr_t resolve_view_pose() noexcept
         {
-            const uintptr_t framework = call_framework_getter();
+            const uintptr_t framework = resolve_framework();
             if (framework == 0 || !DMK::Memory::plausible_userspace_ptr(framework))
             {
                 return 0;
@@ -295,15 +292,12 @@ namespace TPVCamera
                 throw std::runtime_error("module base unknown");
             }
 
-            s_framework_getter =
-                reinterpret_cast<FrameworkGetterFunc>(module_base + Constants::FRAMEWORK_GETTER_STATIC_RVA);
-
-            // InteractorLookRay carries an AOB cascade (k_interactorLookRayCandidates); the static RVA is the
-            // fail-closed fallback for a total cascade miss.
-            uintptr_t hook_addr = anchor_address(AnchorId::InteractorLookRay);
+            // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates); a total cascade miss
+            // fails closed.
+            const uintptr_t hook_addr = anchor_address(AnchorId::InteractorLookRay);
             if (hook_addr == 0)
             {
-                hook_addr = module_base + Constants::INTERACTOR_LOOKRAY_STATIC_RVA; // sub_1803E51EC
+                throw std::runtime_error("InteractorLookRay cascade unresolved (interaction selection)");
             }
 
             auto result = DMK::HookManager::get_instance().create_inline_hook(

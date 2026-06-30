@@ -7,16 +7,14 @@
  * the feature to keep working. Resolution is delegated to DetourModKit's module-scoped cascade scanner
  * (DMK::Scanner::resolve_cascade_in_module), confined to the WHGame.dll image.
  *
- * KCD1 1.9.7 is a FROZEN build, so most non-hook locations resolve via static RVA + offset / gEnv member /
- * vtable slot / pointer chain (see constants.hpp) rather than an AOB. Only the inline-hook targets that must
- * survive a sibling mod's prologue hook are pattern-resolved here. To keep the KCD1 mod a faithful mirror of
+ * Every game-image address the mod hooks or reads is resolved at runtime; no static RVAs are baked in. Most
+ * targets carry a multi-candidate cascade here (Context, Genv, CryActionFramework, Frustum, HeadVisibility,
+ * InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide, MenuOpen); a total cascade miss fails closed
+ * at the consumer (the feature degrades or that init step throws). To keep the KCD1 mod a faithful mirror of
  * KCD2 (same AnchorId set, same anchor_address() API so the ported modules compile unchanged), the AnchorId
- * enum mirrors KCD2's, but the KCD1 anchor TABLE only wires the cascades KCD1 actually resolves by pattern
- * (Genv, Frustum, HeadVisibility). The remaining anchors resolve to 0 and their consumers either fall back to
- * a static RVA (InputDispatch -> INPUT_DISPATCH_STATIC_RVA) or are stubbed (ActionDispatch, Interaction*,
- * Overlay*, Menu*). Genv is pattern-resolved here (RIP-relative cascade) AND keeps a static-RVA fallback in
- * resolve_genv() (Constants::GENV_STATIC) for a total miss. Context / RayWorldIntersection / GetObjectsInBox
- * are reached via static RVA / gEnv / vtable slot directly, so they are not in the table.
+ * enum mirrors KCD2's; the KCD1 anchor TABLE wires the cascades above and leaves the rest empty (their ids
+ * resolve to 0). RayWorldIntersection / GetObjectsInBox are reached via gEnv member + live vtable slot, so
+ * they are not in the table.
  */
 #ifndef TPVCAMERA_AOB_RESOLVER_HPP
 #define TPVCAMERA_AOB_RESOLVER_HPP
@@ -40,9 +38,8 @@ namespace TPVCamera
         // with ResolveMode::RipRelative. The distinctive instruction(s) AFTER the load make each site unique --
         // the guard+load prefix alone is the generic shape shared by every such getter, so the suffix carries
         // the identity. game_interface publishes this slot ADDRESS (not the pointer it holds, which is null
-        // until a level loads) and falls back to Constants::GLOBAL_CONTEXT_STATIC_OFFSET on a total miss. The
-        // load instruction sits at pattern offset 12 (disp32 at +15, RIP base at +19); all resolve to
-        // 0x1834FFD10.
+        // until a level loads); a total cascade miss fails closed. The load instruction sits at pattern offset
+        // 12 (disp32 at +15, RIP base at +19); all resolve to the global-context slot.
         inline constexpr AddrCandidate k_contextCandidates[] = {
             // sub_18033BF10: mov rax, cs:ctx; mov rcx,r12; mov rbx,[rax+128h].
             {"Context_P1_GetterMovRcxR12",
@@ -64,9 +61,9 @@ namespace TPVCamera
         // through RIP-relative references. Each candidate decodes one such reference back to the struct base
         // with ResolveMode::RipRelative (base = match + instr_end_offset + int32(match + disp_offset)); the
         // disp32 is wildcarded so the pattern survives the struct or the referencing code moving. Three
-        // independent reference sites in three different functions give real cascade redundancy, and
-        // resolve_genv() in camera_hook falls back to the static RVA (Constants::GENV_STATIC) on a total miss.
-        // All three resolve to GENV_STATIC (0x1829D16C0) on 1.9.7 (IDA-verified, n=1 each).
+        // independent reference sites in three different functions give real cascade redundancy; resolve_genv()
+        // in camera_hook fails closed (returns 0) on a total miss. All three resolve to the same g_env base
+        // (IDA-verified, n=1 each).
         inline constexpr AddrCandidate k_genvCandidates[] = {
             // sub_180E91554 struct-init: `lea rax,g_env; lea rcx,Y; mov [rdi],rcx`. The lea is at the pattern
             // start (disp32 at +3, 7-byte lea). KCD1 analog of KCD2's Genv_P2_LeaStructInit.
@@ -84,6 +81,34 @@ namespace TPVCamera
             {"Genv_P3_CallMovNullCheck",
              "E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9 74 15 48 8B 01 33 D2 FF 50 18", ResolveMode::RipRelative, 8,
              12},
+        };
+
+        // --- CCryAction (game framework) singleton pointer slot (g_pGameFramework) ----------------
+        // The root of the C_Player chain. KCD2 reached the framework via gEnv->pGame->GetIGameFramework();
+        // KCD1 has the CCryAction singleton in a fixed .data slot that the framework-creation path fills
+        // (CCryAction::CCryAction -> `mov cs:g_pGameFramework, rax`). The embedded singleton's module-relative
+        // offset is build-specific (it moves between game builds), so rather than hard-coding it the slot
+        // ADDRESS is resolved here from three independent RIP-relative references and the consumer dereferences
+        // it (camera_hook resolve_cry_action()), exactly as the Context / Genv slots are. Each candidate decodes
+        // a `mov reg, cs:g_pGameFramework` (or the store) back to the SLOT with ResolveMode::RipRelative; the
+        // load sits at pattern offset 0 (disp32 at +3, RIP base at +7). The slot's VALUE is the live CCryAction
+        // object the player walk reads; it holds null until the framework is constructed, and resolution is
+        // runtime-only (a total cascade miss returns 0). All three are unique (n=1) and resolve to the same slot
+        // on both the Steam and GOG builds (IDA-verified).
+        inline constexpr AddrCandidate k_cryActionFrameworkCandidates[] = {
+            // sub_18212E348 shutdown path: `mov rcx, cs:g_pGameFramework; test rcx,rcx; jz; mov rax,[rcx];
+            // call [rax+50h]`. The `call qword[rax+0x50]` (FF 50 50) past the null-check is the rare landmark.
+            {"CryActionFramework_P1_ShutdownVCall",
+             "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 01 FF 50 50", ResolveMode::RipRelative, 3, 7},
+            // sub_1821399BC (C_Game::CreateInstance path): `mov rcx,cs:slot; mov rax,[rcx]; call [rax+98h];
+            // mov rcx,cs:slot; call CreateInstance`. The two slot loads bracketing call[rax+0x98] are unique.
+            {"CryActionFramework_P2_CreateInstance",
+             "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 98 00 00 00 48 8B 0D ?? ?? ?? ?? E8", ResolveMode::RipRelative, 3,
+             7},
+            // sub_182135608 (framework-create prologue): `mov rax,cs:slot; mov r13,r8; mov rsi,rdx; mov r15,rcx;
+            // test rax,rax`. The r13/rsi/r15 arg-shuffle of this specific function is the landmark.
+            {"CryActionFramework_P3_CreatePrologue",
+             "48 8B 05 ?? ?? ?? ?? 4D 8B E8 48 8B F2 4C 8B F9 48 85 C0", ResolveMode::RipRelative, 3, 7},
         };
 
         // --- Camera frustum builder (CCamera::UpdateFrustumPlanes) entry -----
@@ -129,8 +154,8 @@ namespace TPVCamera
         // KCD1 hook point sub_1803E60B8 (CBaseInput vtable slot 12). Every input event funnels through it; the
         // free-look orbit hooks it to capture the look delta and freeze look input while orbiting. It is only
         // ever called virtually (no direct call site exists), so all three anchors are in-function landmarks
-        // in different regions of the body, each walking back to the entry (0x1803E60B8); the consumer still
-        // falls back to Constants::INPUT_DISPATCH_STATIC_RVA on a total miss. P1 is the prologue; P2 is the
+        // in different regions of the body, each walking back to the entry; resolution is runtime-only (a total
+        // miss fails closed, disabling free-look orbit). P1 is the prologue; P2 is the
         // `m_flags |= 2` self-init guard (`mov al,[rcx+disp]; test al,2; jnz; or al,2; mov [rcx+disp],al`,
         // disps wildcarded); P3 is the deeper event-type dispatch (`call; cmp [rdi+disp], 1002h`), the most
         // independent of the three.
@@ -146,8 +171,8 @@ namespace TPVCamera
         // --- Global action dispatcher (sub_1801FF740, the C++ source of Lua Player:OnAction) ----
         // The orbit move-detection hook taps this: it fires once per action-map action with the action name,
         // activation and value. It is reached only virtually (every xref is a vtable data slot), so the three
-        // anchors are in-function landmarks at increasing depth, each walking back to the entry (0x1801FF740);
-        // the consumer falls back to Constants::PLAYER_ONACTION_STATIC_RVA on a total miss.
+        // anchors are in-function landmarks at increasing depth, each walking back to the entry; resolution is
+        // runtime-only (a total miss fails closed, disabling orbit move-detection).
         inline constexpr AddrCandidate k_actionDispatchCandidates[] = {
             // Prologue: mov rax,rsp; shadow-save rbx/rsi; movss [rax+disp],xmm3; push rbp/rdi/r12/r14/r15;
             // lea rbp,[rax-disp]; sub rsp,imm32. The xmm3 store and the r12/r14/r15 push run are the rare bytes.
@@ -169,7 +194,7 @@ namespace TPVCamera
         // --- In-game menu open/close toggle (sub_1805B84CC, DisplayIngameMenu; state byte at this+0x41) ----
         // The menu game-state hook taps this. KCD1 has a single toggle (no separate open/close functions), so
         // it is wired to AnchorId::MenuOpen and the MenuClose row stays empty. All three anchors resolve to the
-        // entry (0x1805B84CC); the consumer falls back to Constants::MENU_TOGGLE_STATIC_RVA on a total miss.
+        // entry; resolution is runtime-only (a total miss fails closed).
         inline constexpr AddrCandidate k_menuToggleCandidates[] = {
             // Prologue: shadow-save rbx/rbp/rsi; push rdi; sub rsp,20h; mov sil,dl; mov rdi,rcx; cmp [rcx+disp],dl.
             {"MenuToggle_P1_Prologue",
@@ -190,8 +215,8 @@ namespace TPVCamera
         // --- Action-filter Enable/DisableFilter worker (sub_1804FCC0C) ---------------------------
         // The overlay / apse UI signal hook taps this enable/disable convergence point. KCD1 has a single
         // worker (no separate hide/show functions), so it is wired to AnchorId::OverlayHide and the OverlayShow
-        // row stays empty. All three anchors resolve to the entry (0x1804FCC0C); the consumer falls back to
-        // Constants::ACTION_FILTER_WORKER_STATIC_RVA on a total miss.
+        // row stays empty. All three anchors resolve to the entry; resolution is runtime-only (a total miss
+        // fails closed).
         inline constexpr AddrCandidate k_actionFilterWorkerCandidates[] = {
             // Prologue: mov rax,rsp; shadow-save rbx/rbp/rsi; push rdi; sub rsp,30h; mov esi,r9d; mov bpl,r8b;
             // mov rdi,rdx; mov rbx,rcx. The bpl/esi byte moves of the 4-arg shuffle are the rare bytes.
@@ -214,8 +239,8 @@ namespace TPVCamera
         // --- Interactor selection / look-ray builder (sub_1803E51EC) -----------------------------
         // The camera-space interaction hook wraps this to slide the selection ray onto the render camera +
         // crosshair. It is reached virtually, so the three anchors are in-function landmarks (all already past
-        // the 5-byte prologue, so a sibling prologue hook does not break them), each walking back to the entry
-        // (0x1803E51EC); the consumer falls back to Constants::INTERACTOR_LOOKRAY_STATIC_RVA on a total miss.
+        // the 5-byte prologue, so a sibling prologue hook does not break them), each walking back to the entry;
+        // resolution is runtime-only (a total miss fails closed).
         inline constexpr AddrCandidate k_interactorLookRayCandidates[] = {
             // Near-entry frame setup (entry+0x16): lea rbp,[rax+disp32]; sub rsp,imm32; mov r14d,[rbp+disp32];
             // mov r15,r8; movaps [rax+disp],xmm6; mov rbp,rdx.
@@ -237,29 +262,32 @@ namespace TPVCamera
 
     /**
      * @brief Stable identity for every game-image anchor the mod resolves at startup.
-     * @details Mirrors the KCD2 AnchorId set so the ported modules compile unchanged. The enumerator order IS
-     *          the table order; Count is the element count and is not a valid anchor. On KCD1 the Context,
-     *          Genv, Frustum, HeadVisibility, InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide
-     *          (the action-filter worker) and MenuOpen (the menu toggle) ids carry a cascade; every other id
-     *          resolves to 0 (its consumer falls back to a static RVA / gEnv / vtable slot, or is stubbed).
+     * @details Mirrors the KCD2 AnchorId set so the ported modules compile unchanged, plus the KCD1-specific
+     *          CryActionFramework id appended at the end (KCD2 reaches the framework through gEnv, KCD1 through
+     *          a .data singleton slot). The enumerator order IS the table order; Count is the element count and
+     *          is not a valid anchor. On KCD1 the Context, Genv, CryActionFramework, Frustum, HeadVisibility,
+     *          InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide (the action-filter worker) and
+     *          MenuOpen (the menu toggle) ids carry a cascade; every other id resolves to 0 (its consumer
+     *          reaches the target via a gEnv member / vtable slot, or is stubbed).
      */
     enum class AnchorId : std::size_t
     {
-        Context,              // global-context storage slot (KCD1: RIP-relative AOB cascade + static-RVA fallback)
-        Genv,                 // SSystemGlobalEnvironment base (KCD1: RIP-relative AOB cascade + static-RVA fallback)
+        Context,              // global-context storage slot (KCD1: RIP-relative AOB cascade)
+        Genv,                 // SSystemGlobalEnvironment base (KCD1: RIP-relative AOB cascade)
         Frustum,              // camera frustum builder (mandatory hook target)
         HeadVisibility,       // head-visibility setter
-        InputDispatch,        // generic input-event dispatcher (KCD1: AOB cascade + static-RVA fallback)
-        ActionDispatch,       // global action dispatcher (KCD1: AOB cascade + static-RVA fallback)
+        InputDispatch,        // generic input-event dispatcher (KCD1: AOB cascade)
+        ActionDispatch,       // global action dispatcher (KCD1: AOB cascade)
         RayWorldIntersection, // IPhysicalWorld::RayWorldIntersection (KCD1: vtable slot, not in the table)
         InteractionRayBuild,  // interaction ray-query builder (KCD1: unused; reserved)
-        InteractorLookRay,    // interactor look-ray builder (KCD1: AOB cascade + static-RVA fallback)
+        InteractorLookRay,    // interactor look-ray builder (KCD1: AOB cascade)
         InteractionOnScreen,  // on-screen reticle projection gate (KCD1: stubbed)
-        OverlayHide,          // action-filter worker (KCD1: AOB cascade + static-RVA fallback; one toggle for hide/show)
+        OverlayHide,          // action-filter worker (KCD1: AOB cascade; one toggle for hide/show)
         OverlayShow,          // ShowOverlays (KCD1: folded into OverlayHide's single worker; not in the table)
-        MenuOpen,             // menu open/close toggle (KCD1: AOB cascade + static-RVA fallback; one toggle for both)
+        MenuOpen,             // menu open/close toggle (KCD1: AOB cascade; one toggle for both)
         MenuClose,            // UI menu-close entry (KCD1: folded into MenuOpen's single toggle; not in the table)
         GetObjectsInBox,      // I3DEngine::GetObjectsInBox (KCD1: vtable slot, not in the table)
+        CryActionFramework,   // CCryAction game-framework singleton .data slot (KCD1-specific: RIP-rel AOB cascade)
         Count,
     };
 
@@ -270,7 +298,7 @@ namespace TPVCamera
      *          explicit range is required: the DMK default host_module_range() is the host EXE, not
      *          WHGame.dll. Each resolved address is stored for anchor_address(); a per-anchor status line plus
      *          an assess_quality() summary are logged. Anchors with no cascade record 0 and their consumers
-     *          degrade (static-RVA fallback or stub).
+     *          degrade (fail closed, or reach the target via a gEnv member / vtable slot).
      * @note Setup/control-plane only: allocates and spawns a transient worker pool. Call once at init.
      */
     void resolve_all_anchors(std::uintptr_t module_base, std::size_t module_size);

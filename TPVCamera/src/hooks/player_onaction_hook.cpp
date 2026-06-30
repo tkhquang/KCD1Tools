@@ -7,7 +7,8 @@
  * IDENTICAL to KCD2's: (this, const char** name, uint activation, float value). It runs the action-map
  * press/release/hold state machine and is the C++ source of Lua Player:OnAction, so every player action
  * (movement included) flows through it. The hook latches |value| per movement action and always forwards to
- * the original unchanged. Resolved via a static RVA (the KCD2 AOB anchors a stripped string; 1.9.7 is frozen).
+ * the original unchanged. Resolved at runtime by the ActionDispatch AOB cascade (the KCD2 AOB anchors a
+ * profiler string stripped from KCD1).
  */
 
 #include "hooks/player_onaction_hook.hpp"
@@ -31,7 +32,7 @@
 namespace TPVCamera
 {
 
-    // Global action dispatcher sub_1801FF740 (RVA PLAYER_ONACTION_STATIC_RVA): fires once per action-map
+    // Global action dispatcher sub_1801FF740: fires once per action-map
     // action (the C++ source of Lua Player:OnAction) and returns a pointer we forward unchanged. action_name
     // points to a ref-counted C-string (the action name, e.g. "xi_movey"); value is the post-action-map axis
     // magnitude. activation is 1=press, 2=release, 4=hold.
@@ -385,12 +386,13 @@ namespace TPVCamera
                 logger.warning("PlayerOnAction: module base unknown; orbit move-detection disabled");
                 return false;
             }
-            // ActionDispatch carries an AOB cascade (k_actionDispatchCandidates); the static RVA is the
-            // fail-closed fallback for a total cascade miss.
-            uintptr_t dispatch_addr = anchor_address(AnchorId::ActionDispatch);
+            // ActionDispatch is a runtime AOB cascade (k_actionDispatchCandidates); a total cascade miss fails
+            // closed (orbit move-detection disabled).
+            const uintptr_t dispatch_addr = anchor_address(AnchorId::ActionDispatch);
             if (dispatch_addr == 0)
             {
-                dispatch_addr = module_base + Constants::PLAYER_ONACTION_STATIC_RVA;
+                logger.warning("PlayerOnAction: action dispatcher cascade unresolved; orbit move-detection off");
+                return false;
             }
 
             DMK::HookManager &hook_manager = DMK::HookManager::get_instance();

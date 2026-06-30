@@ -91,8 +91,8 @@ namespace TPVCamera
     static SetHeadVisibilityFunc s_set_head_visibility_original = nullptr;
     static InputDispatchFunc s_input_dispatch_original = nullptr;
 
-    // Resolved SSystemGlobalEnvironment (g_env) base, set once at init (AOB, with the static RVA as
-    // fallback). Reused by the player/animchar walks; p_physical_world is g_env + PHYSICAL_WORLD_OFFSET.
+    // Resolved SSystemGlobalEnvironment (g_env) base, set once at init (runtime AOB cascade; 0 if it does not
+    // resolve). Reused by the player/animchar walks; p_physical_world is g_env + PHYSICAL_WORLD_OFFSET.
     static uintptr_t s_genv_runtime = 0;
 
     // CView vtable address, cached lazily on the first frustum-builder camera whose embedding object
@@ -239,9 +239,31 @@ namespace TPVCamera
     }
 
     /**
-     * @brief Resolves the live C_Player via the static CCryAction each frame (validated by its vtable); 0 on
+     * @brief Resolves the live CCryAction (game-framework) singleton base build-agnostically; 0 if not live.
+     * @details The CCryAction singleton's module-relative offset is build-specific (it moves between game
+     *          builds), so it is reached purely at runtime through the g_pGameFramework .data slot resolved by
+     *          the CryActionFramework RIP-relative AOB cascade, never a hard-coded module offset. The slot's
+     *          value is the CCryAction object pointer; it is null until the framework is constructed (0 is
+     *          returned then and the caller retries next frame) and 0 is also returned if the cascade did not
+     *          resolve. Render-thread safe: anchor_address() is a lock-free read of a value resolved once at
+     *          init, and the slot deref is SEH-guarded.
+     */
+    static uintptr_t resolve_cry_action() noexcept
+    {
+        const uintptr_t fw_slot = anchor_address(AnchorId::CryActionFramework);
+        if (fw_slot == 0)
+        {
+            return 0;
+        }
+        const auto cry_action = DMK::Memory::seh_read<uintptr_t>(fw_slot);
+        return (cry_action && DMK::Memory::plausible_userspace_ptr(*cry_action)) ? *cry_action : 0;
+    }
+
+    /**
+     * @brief Resolves the live C_Player via the CCryAction framework each frame (validated by its vtable); 0 on
      *        failure.
-     * @details Walks CCryAction (module_base + CCRYACTION_STATIC_OFFSET) -> p_action_game -> C_Player, then
+     * @details Walks CCryAction (resolve_cry_action(): the g_pGameFramework slot, static offset fallback) ->
+     *          p_action_game -> C_Player, then
      *          confirms C_Player by its main vtable. Resolving FRESH every frame -- rather than trusting a
      *          mirrored pointer that goes null/stale across view transitions and reloads -- is what keeps the
      *          move-detection and body-turn locked onto the CURRENT player. Always called from within an SEH
@@ -254,10 +276,11 @@ namespace TPVCamera
         {
             return 0;
         }
-        // KCD1: CCryAction is a static embedded singleton at module_base + CCRYACTION_STATIC_OFFSET
-        // (RTTI "CCryAction"), validated by its vtable. No g_env / p_game / GetIGameFramework walk.
-        const uintptr_t cry_action = mod.base + Constants::CCRYACTION_STATIC_OFFSET;
-        if (!DMK::Memory::plausible_userspace_ptr(cry_action))
+        // KCD1: CCryAction is the game-framework singleton, reached at runtime through the g_pGameFramework
+        // .data slot (CryActionFramework AOB cascade) so it survives a game rebuild that relocates it. Confirmed
+        // by the C_Player vtable below. No g_env / p_game / GetIGameFramework walk.
+        const uintptr_t cry_action = resolve_cry_action();
+        if (cry_action == 0)
         {
             return 0;
         }
@@ -352,13 +375,13 @@ namespace TPVCamera
      * @brief Resolves the player look controller and drives the real aim while orbiting: eases the PITCH
      *        toward level and/or sets the YAW (heading). Separated from the SEH wrapper so this frame
      *        holds no unwinding objects.
-     * @details Walks the player look chain (static CCryAction -> p_action_game -> C_Player -> look controller;
+     * @details Walks the player look chain (CCryAction via resolve_cry_action() -> p_action_game -> C_Player -> look controller;
      *          see constants.hpp) and validates C_Player by its vtable. The look quaternion the cameras read
      *          is RE-DERIVED from the controller's scalar pitch every frame, so writing that scalar (not the
      *          derived quat, which is overwritten) is what actually moves the eye and the character head. The
      *          mod redirects the look input while orbiting, so the writes stick; on any failure it returns
-     *          without writing and the camera-side level blend still levels the view. CCryAction is a static
-     *          embedded singleton; the rest is a guarded walk.
+     *          without writing and the camera-side level blend still levels the view. CCryAction is resolved
+     *          build-agnostically via resolve_cry_action() (g_pGameFramework slot); the rest is a guarded walk.
      * @param pitch_ease Per-frame fraction to move the look pitch toward level, in [0, 1] (0 = leave it).
      * @param set_yaw When true, the look yaw is set to yaw_value to align the heading to the camera.
      * @param yaw_value Target look yaw in radians (engine convention: forward = (-sin yaw, cos yaw)).
@@ -370,10 +393,11 @@ namespace TPVCamera
         {
             return;
         }
-        // KCD1: CCryAction is a static embedded singleton at module_base + CCRYACTION_STATIC_OFFSET
-        // (RTTI "CCryAction"), validated by its vtable. No g_env / p_game / GetIGameFramework walk.
-        const uintptr_t cry_action = mod.base + Constants::CCRYACTION_STATIC_OFFSET;
-        if (!DMK::Memory::plausible_userspace_ptr(cry_action))
+        // KCD1: CCryAction is the game-framework singleton, reached at runtime through the g_pGameFramework
+        // .data slot (CryActionFramework AOB cascade) so it survives a game rebuild that relocates it. Confirmed
+        // by the C_Player vtable below. No g_env / p_game / GetIGameFramework walk.
+        const uintptr_t cry_action = resolve_cry_action();
+        if (cry_action == 0)
         {
             return;
         }
@@ -2413,17 +2437,17 @@ namespace TPVCamera
      * @brief Resolves the SSystemGlobalEnvironment (g_env) base, patch-resiliently.
      * @details Resolves the g_env base from the Genv anchor (a RIP-relative lea/mov [rip+g_env]
      *          reference-site cascade, see aob_resolver.hpp k_genvCandidates), so the address survives
-     *          game patches that shift the RVA. On a total cascade miss this falls through to the known
-     *          static RVA (Constants::GENV_STATIC), which is authoritative for the frozen 1.9.7 build.
-     *          The result is screened as a plausible user-space pointer before it is accepted.
-     * @return The g_env base address (anchor result, or the static fallback).
+     *          game patches that shift it. Resolution is runtime-only: a total cascade miss returns 0 and the
+     *          g_env-dependent features (physics raycast, hardware-mouse and 3D-engine reads) stay off. The
+     *          result is screened as a plausible user-space pointer before it is accepted.
+     * @return The g_env base address, or 0 if the cascade did not resolve.
      */
-    static uintptr_t resolve_genv(uintptr_t module_base)
+    static uintptr_t resolve_genv()
     {
         DMK::Logger &logger = DMK::Logger::get_instance();
 
-        // The Genv anchor (when wired) resolves the g_env base from a lea/mov [rip+g_env] reference site
-        // (resolved up front by resolve_all_anchors()); the result is screened as a plausible pointer.
+        // The Genv anchor resolves the g_env base from a lea/mov [rip+g_env] reference site (resolved up front
+        // by resolve_all_anchors()); the result is screened as a plausible pointer.
         const uintptr_t resolved = anchor_address(AnchorId::Genv);
         if (resolved != 0 && DMK::Memory::plausible_userspace_ptr(resolved))
         {
@@ -2431,10 +2455,8 @@ namespace TPVCamera
             return resolved;
         }
 
-        const uintptr_t fallback = module_base + (Constants::GENV_STATIC - Constants::IMAGE_BASE);
-        logger.warning("Camera: g_env AOB unavailable; using static fallback at {}",
-                       DMK::Format::format_address(fallback));
-        return fallback;
+        logger.warning("Camera: g_env cascade unresolved; g_env-dependent features disabled");
+        return 0;
     }
 
     bool initialize_camera(uintptr_t module_base, size_t module_size)
@@ -2448,9 +2470,9 @@ namespace TPVCamera
         cam.applying.store(false);
         cam.zoom_offset.store(0.0f);
 
-        // Resolve g_env once (patch-resilient AOB, static RVA fallback). The CView vtable is
-        // identified lazily by RTTI on the first game-view camera, so nothing is resolved here.
-        s_genv_runtime = resolve_genv(module_base);
+        // Resolve g_env once (patch-resilient runtime AOB). The CView vtable is identified lazily by RTTI on
+        // the first game-view camera, so nothing is resolved here.
+        s_genv_runtime = resolve_genv();
 
         // Resolve the engine ray helper for collision + aim convergence. Best-effort: on a miss
         // those features no-op (the camera still renders), so the result is intentionally discarded.
@@ -2507,23 +2529,25 @@ namespace TPVCamera
                 }
             }
 
-            // The input-dispatcher hook powers free-look orbit. Best-effort: a miss only
-            // disables orbit, the offset camera still works. The detour is inert until the
-            // orbit key is held, so it is harmless when free-look is unused. InputDispatch is an
-            // AOB cascade (k_inputDispatchCandidates); the static RVA is the fail-closed fallback.
-            uintptr_t input_addr = anchor_address(AnchorId::InputDispatch);
+            // The input-dispatcher hook powers free-look orbit. Best-effort: a miss only disables orbit, the
+            // offset camera still works. The detour is inert until the orbit key is held, so it is harmless when
+            // free-look is unused. InputDispatch is a runtime AOB cascade (k_inputDispatchCandidates).
+            const uintptr_t input_addr = anchor_address(AnchorId::InputDispatch);
             if (input_addr == 0)
             {
-                input_addr = module_base + Constants::INPUT_DISPATCH_STATIC_RVA;
+                logger.warning("Camera: Input dispatcher cascade unresolved; free-look orbit unavailable");
             }
-            auto input_result = hook_manager.create_inline_hook(
-                "CameraInputDispatch", input_addr, reinterpret_cast<void *>(detour_input_dispatch),
-                reinterpret_cast<void **>(&s_input_dispatch_original), hook_config);
-
-            if (!input_result.has_value())
+            else
             {
-                logger.warning("Camera: Input dispatcher hook failed ({}); free-look orbit unavailable",
-                               DMK::Hook::error_to_string(input_result.error()));
+                auto input_result = hook_manager.create_inline_hook(
+                    "CameraInputDispatch", input_addr, reinterpret_cast<void *>(detour_input_dispatch),
+                    reinterpret_cast<void **>(&s_input_dispatch_original), hook_config);
+
+                if (!input_result.has_value())
+                {
+                    logger.warning("Camera: Input dispatcher hook failed ({}); free-look orbit unavailable",
+                                   DMK::Hook::error_to_string(input_result.error()));
+                }
             }
 
             logger.info("Camera: Third-person camera hooks installed");

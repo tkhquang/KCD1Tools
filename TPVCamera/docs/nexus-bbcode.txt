@@ -3,6 +3,11 @@ This is a raw port of my KCD2 mod, [url=https://www.nexusmods.com/kingdomcomedel
 
 To avoid maintaining two copies of the same documentation, this page stays minimal. For the full feature list, controls, configuration, and troubleshooting, please see the [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/3263]KCD2 mod page[/url] - it all applies here as well.
 
+[size=2]Note: [b]This video is for KCD2[/b] but you get the idea of how this mod looks like in game
+Please forgive me for the bad video quality and framerate T_T[/size]
+
+[youtube]NuCQHDoQnVE[/youtube]
+
 [size=5]Requirements[/size]
 [list]
 [*]Kingdom Come: Deliverance[/*]
@@ -36,6 +41,12 @@ Hotkeys and settings live in KCD1_TPVCamera.ini (every option is documented inli
 
 [b]After a game update:[/b] the mod locates each game function it hooks through several fallback signatures and self-heals internal data offsets, so it adapts to many game changes automatically. Major updates may still need a mod update if core game functions are heavily rewritten.
 
+[size=5]Recommended Mods[/size]
+These pair well with a third-person camera:
+[list]
+[*][url=https://www.nexusmods.com/kingdomcomedeliverance/mods/28]No Helmet Vision[/url] - removes the helmet vision letterbox/black bars that look out of place in third-person.[/*]
+[*][url=https://www.nexusmods.com/kingdomcomedeliverance/mods/366]First-person Herb Picking[/url] - keeps certain actions and interactions in third person instead of forcing the view back to game default camera.[/*]
+[/list]
 [size=5]Credits & Source Code[/size]
 Built with [url=https://github.com/tkhquang/DetourModKit]DetourModKit[/url] for core functionality.
 [list]

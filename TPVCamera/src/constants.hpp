@@ -3,10 +3,9 @@
  * @brief Central definitions for constants used throughout the mod.
  *
  * Includes version info, filenames, memory offsets, RTTI type names, and engine
- * flag values. Code/data locations are resolved by the multi-candidate AOB
- * cascades in aob_resolver.hpp so they survive game updates; the few static
- * vtable/code addresses kept here are translated to runtime via
- * module_base + (static - IMAGE_BASE) and serve only as last-resort fallbacks.
+ * flag values. Code/data locations are resolved purely at runtime by the
+ * multi-candidate AOB cascades in aob_resolver.hpp so they survive game updates;
+ * this file keeps no hard-coded image addresses.
  *
  * This is the KCD1 1.9.7 retarget of the KCD2 TPVCamera mod: the structure,
  * constant NAMES and comments mirror the KCD2 source so the two builds stay
@@ -65,10 +64,6 @@ namespace Constants
     // every gameplay camera funnels through (gated to the game view by the embedding
     // CView vtable, camera - SVIEWPARAMS_VIEWMATRIX_OFFSET).
 
-    // Static image base of WHGame.DLL; used to translate static vtable/code addresses
-    // into runtime addresses (runtime = module_base + (static - IMAGE_BASE)).
-    constexpr uintptr_t IMAGE_BASE = 0x180000000;
-
     // RTTI type-descriptor name of the CView class. The frustum-builder detour confirms a
     // camera belongs to a game view by matching the embedding object's vtable against this
     // name (via DMK::Rtti), then caches that vtable address for a fast per-camera qword
@@ -79,8 +74,9 @@ namespace Constants
     // Player look/aim orientation chain. Used to LEVEL the aim pitch while free-look orbit is active
     // so the character's head and the eye look forward (not just the camera).
     //
-    // KCD1 uses a STATIC CCryAction singleton (NOT gEnv->pGame->GetIGameFramework). Chain:
-    //   CCryAction  = module_base + CCRYACTION_STATIC_OFFSET  (embedded static singleton; RTTI "CCryAction")
+    // KCD1 uses a CCryAction singleton (NOT gEnv->pGame->GetIGameFramework). Chain:
+    //   CCryAction  = *(g_pGameFramework slot)  (resolved at runtime by the AnchorId::CryActionFramework AOB
+    //                 cascade; RTTI "CCryAction") -- see camera_hook resolve_cry_action()
     //   CActionGame = *(CCryAction + CCRYACTION_ACTIONGAME_OFFSET)   [KCD2 used +0x88]
     //   C_Player    = *(CActionGame + CACTIONGAME_LOCAL_ACTOR_OFFSET), validated by its RTTI type name [KCD2 +0xA40]
     //   -> look controller (C_Player + C_PLAYER_LOOK_CONTROLLER_OFFSET)   [KCD2 +0x238]
@@ -89,14 +85,11 @@ namespace Constants
     // KCD1 pitch primary is +0x48 with a synced copy at +0x08 (KCD2 had pitch +0x8/+0x48). To LEVEL the
     // aim write BOTH pitch copies; the cameras read the derived quat lc+0x24, not the scalar.
 
-    // g_env (SSystemGlobalEnvironment) base. KCD1 is a frozen build, so the static address is authoritative;
+    // g_env (SSystemGlobalEnvironment) base is resolved at runtime by the AnchorId::Genv AOB cascade;
     // pPhysicalWorld/p3DEngine/pHardwareMouse are members reached via the GENV_* offsets below.
-    constexpr uintptr_t GENV_STATIC = 0x1829D16C0;
     // RTTI type-descriptor name of C_Player, used to validate the resolved actor (replaces a
     // hardcoded vtable address so the check survives patches).
     constexpr const char *C_PLAYER_RTTI_NAME = ".?AVC_Player@entitymodule@wh@@";
-    // KCD1 static CCryAction singleton (embedded; +0 = CCryAction vtable; RTTI "CCryAction").
-    constexpr ptrdiff_t CCRYACTION_STATIC_OFFSET = 0x375F080;
     // RTTI type-descriptor name of CCryAction, used to validate the resolved framework object.
     constexpr const char *CCRYACTION_RTTI_NAME = ".?AVCCryAction@@";
     constexpr ptrdiff_t CCRYACTION_ACTIONGAME_OFFSET = 0x78; // [KCD2 +0x88]
@@ -160,10 +153,10 @@ namespace Constants
     // visible while the third-person offset is rendering so the player is not headless
     // from behind. KCD1 setter = sub_18106201C.
 
-    // Global action dispatcher: the KCD2 AOB keys on a profiler/action string stripped from retail 1.9.7, but
-    // the dispatcher itself was located via the surviving "OnAction" Lua string -> the player OnAction bridge
-    // sub_181077628 (see PLAYER_ONACTION_STATIC_RVA). The player_onaction_hook now hooks it for orbit
-    // move-detection (the AnchorId::ActionDispatch cascade stays empty; the consumer uses the static RVA).
+    // Global action dispatcher: the KCD2 AOB keys on a profiler/action string stripped from KCD1, but the
+    // dispatcher itself was located via the surviving "OnAction" Lua string -> the player OnAction bridge
+    // sub_181077628. The player_onaction_hook hooks it for orbit move-detection, resolved at runtime by the
+    // AnchorId::ActionDispatch cascade (k_actionDispatchCandidates).
 
     // --- Physics world raycast (camera collision + aim convergence) ---
     // IPhysicalWorld::RayWorldIntersection inline helper (k_rayWorldIntersectionCandidates). Casts a
@@ -304,8 +297,6 @@ namespace Constants
     // p3DEngine (I3DEngine*) is a g_env member at g_env + GENV_3DENGINE_OFFSET; the query function is
     // reached through the live C3DEngine vtable slot. Both are screened on each use.
     constexpr ptrdiff_t GENV_3DENGINE_OFFSET = 0x08;
-    // C3DEngine vtable (static RVA) used to validate the live vtable before reaching GetObjectsInBox by slot.
-    constexpr uintptr_t C3DENGINE_VTABLE_STATIC = 0x27160A8;
     // I3DEngine::GetObjectsInBox = C3DEngine vtable SLOT 233 (+233*8). [KCD2 used slot 243.]
     //   uint32 GetObjectsInBox(this /*rcx*/, const AABB* bbox /*rdx; 6 floats min.xyz,max.xyz*/,
     //   IRenderNode** p_out /*r8*/). p_out == null returns the count only; otherwise it memcpys the FULL
@@ -366,45 +357,42 @@ namespace Constants
     // for InteractiveScene usables (shrines/beds/doors) is still not ported (its KCD1 analog is unresolved).
 
     // KCD2 hooked the in-game menu (MenuOpen/MenuClose) and UI overlays (HideOverlays/ShowOverlays) via AOBs
-    // that get 0 matches on KCD1 1.9.7. KCD1 reaches the same game-states through different convergences, each
-    // resolved by a static RVA below: the menu via the wh::guimodule toggle (MENU_TOGGLE_STATIC_RVA) and the
-    // overlay/apse UI (inventory, codex, map) via the CryEngine action-filter worker
-    // (ACTION_FILTER_WORKER_STATIC_RVA). Dialogue is detected separately via the active-camera RTTI (the
-    // dialogue camera swaps to wh::game::C_CameraDialog, type_id 2 -- see CAMERA_TYPE_DIALOG).
+    // that get 0 matches on KCD1. KCD1 reaches the same game-states through different convergences, each
+    // resolved at runtime by its own AOB cascade: the menu via the wh::guimodule toggle (AnchorId::MenuOpen)
+    // and the overlay/apse UI (inventory, codex, map) via the CryEngine action-filter worker
+    // (AnchorId::OverlayHide). Dialogue is detected separately via the active-camera RTTI (the dialogue camera
+    // swaps to wh::game::C_CameraDialog, type_id 2 -- see CAMERA_TYPE_DIALOG).
 
-    // Generic input-event dispatcher (k_inputDispatchCandidates): KCD1 hook point is
-    // CBaseInput::PostInputEvent = sub_1803E60B8 (RVA 0x3E60B8; CBaseInput vtable slot 12). Every input
-    // event (movement and look, FPV and TPV) funnels through here. The free-look hooks it to capture the
-    // mouse-look delta and freeze look input while orbiting.
-    constexpr uintptr_t INPUT_DISPATCH_STATIC_RVA = 0x3E60B8; // sub_1803E60B8 fallback target
+    // Generic input-event dispatcher (k_inputDispatchCandidates resolves it at runtime): KCD1 hook point is
+    // CBaseInput::PostInputEvent (sub_1803E60B8; CBaseInput vtable slot 12). Every input event (movement and
+    // look, FPV and TPV) funnels through here. The free-look hooks it to capture the mouse-look delta and
+    // freeze look input while orbiting.
 
-    // Global action dispatcher (the C++ source of Lua Player:OnAction) = sub_1801FF740 (RVA 0x1FF740).
-    // Found via the surviving "OnAction" Lua string; signature is IDENTICAL to KCD2's sub_1808EBEE4 (clean,
-    // non-variadic): _QWORD*(this /*rcx*/, const char** name /*rdx*/, uint activation /*r8d: 1=press,
-    // 2=release, 4=hold*/, float value /*xmm3*/). It runs the action-map press/release/hold state machine and
-    // forwards to Lua OnAction; every player action (movement: moveforward/xi_movey, value ~1 held / 0
-    // released) flows through it. The orbit move-detection hooks it and latches |value|. (The earlier leaf
-    // sub_181077628 was the per-entity Lua bridge, which player movement does NOT reach.) KCD2 found its
-    // dispatcher by a profiler string stripped from KCD1, so this uses a static RVA (1.9.7 is frozen).
-    constexpr uintptr_t PLAYER_ONACTION_STATIC_RVA = 0x1FF740; // sub_1801FF740 (global action dispatcher)
+    // Global action dispatcher (the C++ source of Lua Player:OnAction), sub_1801FF740 on the dev build,
+    // resolved at runtime by k_actionDispatchCandidates. Found via the surviving "OnAction" Lua string;
+    // signature is IDENTICAL to KCD2's sub_1808EBEE4 (clean, non-variadic): _QWORD*(this /*rcx*/, const char**
+    // name /*rdx*/, uint activation /*r8d: 1=press, 2=release, 4=hold*/, float value /*xmm3*/). It runs the
+    // action-map press/release/hold state machine and forwards to Lua OnAction; every player action (movement:
+    // moveforward/xi_movey, value ~1 held / 0 released) flows through it. The orbit move-detection hooks it and
+    // latches |value|. (The earlier leaf sub_181077628 was the per-entity Lua bridge, which player movement does
+    // NOT reach.)
 
-    // In-game menu open/close toggle = sub_1805B84CC (RVA 0x5B84CC), the wh::guimodule menu show/hide
-    // convergence: void(this /*rcx*/, char display /*dl: 1=open, 0=close*/). It acts only on a state CHANGE
-    // (*(this+0x41) is the current menu-open byte) and is the single point ALL menu open/close paths funnel
-    // through (Flash "DisplayIngameMenu" handler sub_1805B849C, input, etc -- 5+ callers). Found via the
-    // C_UIMenuEvents registry (sub_1811425C8). KCD2 hooked separate vtable MenuOpen/MenuClose; KCD1 has this
-    // one toggle instead. Hooked for the Menu game-state (AnchorId::MenuOpen/MenuClose cascades stay empty).
-    constexpr uintptr_t MENU_TOGGLE_STATIC_RVA = 0x5B84CC; // sub_1805B84CC (DisplayIngameMenu toggle)
+    // In-game menu open/close toggle sub_1805B84CC, the wh::guimodule menu show/hide convergence:
+    // void(this /*rcx*/, char display /*dl: 1=open, 0=close*/). It acts only on a state CHANGE (*(this+0x41) is
+    // the current menu-open byte) and is the single point ALL menu open/close paths funnel through (Flash
+    // "DisplayIngameMenu" handler sub_1805B849C, input, etc -- 5+ callers). Found via the C_UIMenuEvents
+    // registry (sub_1811425C8). KCD2 hooked separate vtable MenuOpen/MenuClose; KCD1 has this one toggle
+    // instead, resolved at runtime by k_menuToggleCandidates (wired to AnchorId::MenuOpen; MenuClose stays
+    // empty).
 
-    // Action-map filter enable/disable worker = sub_1804FCC0C (RVA 0x4FCC0C): the single convergence both
+    // Action-map filter enable/disable worker sub_1804FCC0C: the single convergence both
     // CActionMapManager::EnableFilter (vtable slot 28 = sub_1804FC414) and DisableFilter (slot 29 =
     // sub_1804FCBF0) funnel through: void*(this /*rcx*/, const char* name /*rdx*/, char enable /*r8b: !=0
     // enable, 0 disable*/, uint a4, char a5). A null/empty name is the engine "all filters" branch. Every
-    // blocking apse/UI screen enables a NAMED filter here and in plain gameplay NO filter is enabled,
-    // so this is KCD1's reliable overlay signal (the KCD2 HideOverlays/ShowOverlays AOBs get
-    // 0 matches). Found via the CActionMapManager vtable (??_7CActionMapManager@@6B@ @ 0x182733200).
-    // ui_overlay_hooks.cpp hooks it to drive overlay_state().active.
-    constexpr uintptr_t ACTION_FILTER_WORKER_STATIC_RVA = 0x4FCC0C; // sub_1804FCC0C (EnableFilter/DisableFilter worker)
+    // blocking apse/UI screen enables a NAMED filter here and in plain gameplay NO filter is enabled, so this is
+    // KCD1's reliable overlay signal (the KCD2 HideOverlays/ShowOverlays AOBs get 0 matches). Found via the
+    // CActionMapManager vtable (??_7CActionMapManager@@6B@). Resolved at runtime by
+    // k_actionFilterWorkerCandidates; ui_overlay_hooks.cpp hooks it to drive overlay_state().active.
 
     // Action-filter names that signal a blocking apse/UI screen: the inventory and codex (and
     // the in-game menu overlay) raise "only_ui", the world map raises "only_map", dialogue raises "only_dialog",
@@ -418,28 +406,24 @@ namespace Constants
     constexpr const char *ACTION_FILTER_ONLY_DIALOG = "only_dialog"; // dialogue
     constexpr const char *ACTION_FILTER_ONLY_MENU = "only_menu";     // main menu / frontend (no level gameplay)
 
-    // Camera-space interaction (look-ray redirect). The C_PlayerInteractor per-tick target selection (vtable
-    // slot 5 sub_1803E5054 -> sub_1803E51EC) builds its "what am I looking at / press to use" ray from the
-    // FRAMEWORK VIEW (eye), then casts it through the ray-query builder sub_1803E5B1C (RVA 0x3E5B1C), which
-    // copies origin (a2, Vec3) and dir (a3, Vec3) into the query and returns it. In third person the
-    // eye-anchored ray diverges from the screen-centre crosshair, so the use-target misses what the crosshair
-    // points at. The hook intercepts the builder and, ONLY when the caller's return address is inside the
-    // selection sub_1803E51EC (the look-ray range below), substitutes the render camera + crosshair pose. KCD1
-    // builder is 7-arg (out, origin, dir, objtypes, flags, skip_ents, n) -- no trailing 'mode' that KCD2's
-    // analog sub_180530584 had. Found live via a write-watch on the selected-target id at interactor+0x84.
-    constexpr uintptr_t INTERACTION_RAYBUILD_STATIC_RVA = 0x3E5B1C; // sub_1803E5B1C (interaction ray-query builder)
-    constexpr uintptr_t INTERACTOR_LOOKRAY_STATIC_RVA = 0x3E51EC;   // sub_1803E51EC (interactor selection / look-ray)
-    constexpr uintptr_t INTERACTOR_LOOKRAY_SPAN = 0x437;            // size of sub_1803E51EC (caller-range filter bound)
+    // Camera-space interaction (look-ray redirect). The C_PlayerInteractor per-tick target selection
+    // (vtable slot 5 sub_1803E5054 -> sub_1803E51EC) builds its "what am I looking at / press to use" ray and
+    // evaluates candidates from the FRAMEWORK VIEW (eye). In third person the eye-anchored ray diverges from the
+    // screen-centre crosshair, so the use-target misses what the crosshair points at. interaction_hook.cpp wraps
+    // the selection sub_1803E51EC (resolved at runtime by k_interactorLookRayCandidates, AnchorId::
+    // InteractorLookRay) and transiently substitutes the render camera + crosshair pose. KCD1 reads the shared
+    // view downstream, so no separate ray-builder rewrite is needed (the KCD2 sub_180530584 analog did not
+    // port). Found live via a write-watch on the selected-target id at interactor+0x84.
 
     // View-consistent interaction redirect (the safe KCD1 approach). The selection sub_1803E51EC builds its
     // look ray AND evaluates candidates from the framework view pose v10, so a ray-only redirect leaves a
     // camera-ray + eye-view mismatch that crashes. Instead the hook wraps sub_1803E51EC and transiently
     // overwrites v10 with the render camera + crosshair, then restores it. v10 is resolved as:
-    //   framework = FRAMEWORK_GETTER (sub_180430AA4, returns the CCryAction/game framework singleton);
+    //   framework = *(global-context slot)  (the AnchorId::Context cascade; the engine getter sub_180430AA4
+    //               just loads that slot -- see interaction_hook resolve_framework());
     //   view = *(framework + FRAMEWORK_VIEW_OFFSET);
     //   v10 = view + VIEW_POSE_OFFSET (+ VIEW_POSE_ALT_DELTA when *(view + VIEW_POSE_ALT_FLAG_OFFSET) != 0).
     // v10 layout = Vec3 position (floats 0..2) then a CryEngine Quat (v.x, v.y, v.z, w = floats 3..6).
-    constexpr uintptr_t FRAMEWORK_GETTER_STATIC_RVA = 0x430AA4; // sub_180430AA4 (framework singleton getter)
     constexpr uintptr_t FRAMEWORK_VIEW_OFFSET = 56;            // framework -> gameplay view subsystem
     constexpr uintptr_t VIEW_POSE_OFFSET = 44;                 // view subsystem -> look-ray pose (Vec3 + Quat)
     constexpr uintptr_t VIEW_POSE_ALT_DELTA = 0xD4;            // added to the pose offset when the alt-flag is set
@@ -461,12 +445,8 @@ namespace Constants
 
     // --- Memory Offsets ---
     // Global-context -> camera-manager pointer. The manager is the root the game-state detection
-    // walks to read the active camera (see OFFSET_ACTIVE_CAMERA below and game_state.cpp).
-    // KCD1 global context = *(module_base + GLOBAL_CONTEXT_STATIC_OFFSET).
-    // uintptr_t (not ptrdiff_t) to match the other module-relative fallback constants it sits beside in the
-    // anchor_address()-with-RVA-fallback consumers (e.g. INPUT_DISPATCH_STATIC_RVA), so the fallback add is
-    // uintptr_t + uintptr_t with no signed/unsigned mix.
-    constexpr uintptr_t GLOBAL_CONTEXT_STATIC_OFFSET = 0x34FFD10; // singleton getter return (qword_1834FFD10)
+    // walks to read the active camera (see OFFSET_ACTIVE_CAMERA below and game_state.cpp). The global-context
+    // slot itself is resolved at runtime by the AnchorId::Context cascade (game_interface.cpp).
     constexpr ptrdiff_t OFFSET_MANAGER_PTR_STORAGE = 0x38;        // Global context to camera manager
     // RTTI type-descriptor name of the camera manager, the self-heal anchor for OFFSET_MANAGER_PTR_STORAGE.
     constexpr const char *C_CAMERA_MANAGER_RTTI_NAME = ".?AVC_CameraManager@game@wh@@";

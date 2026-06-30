@@ -20,7 +20,7 @@ namespace TPVCamera
     /**
      * @brief Installs the overlay/apse hook that drives overlay_state().active.
      * @return true if the hook installed, false otherwise (overlay detection then disabled).
-     * @note KCD1 hooks the action-filter worker at module_base + ACTION_FILTER_WORKER_STATIC_RVA.
+     * @note KCD1 hooks the action-filter worker resolved at runtime by the AnchorId::OverlayHide cascade.
      */
     [[nodiscard]] bool initialize_ui_overlay_hooks();
 

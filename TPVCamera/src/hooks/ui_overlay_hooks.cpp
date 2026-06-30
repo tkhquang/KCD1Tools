@@ -11,7 +11,7 @@
  * map, dialog screen and codex, so the default SuppressTPVState="Overlay" hides the TPV offset in dialogue too.
  * The unit keeps the KCD2 file + initialize_ui_overlay_hooks() API and the overlay_state() output, so
  * game_state.cpp / camera_hook.cpp / tpv_camera.cpp are unchanged between the two builds; only the internal
- * hook mechanism differs (resolved via a static RVA, mirroring the menu/onaction hooks; 1.9.7 is frozen). The
+ * hook mechanism differs (resolved at runtime by the OverlayHide AOB cascade, mirroring the menu/onaction hooks). The
  * separate Dialogue game-state bit is still classified by active-camera RTTI (C_CameraDialog) in game_state.cpp.
  */
 
@@ -34,7 +34,7 @@
 namespace TPVCamera
 {
 
-    // Action-filter enable/disable worker sub_1804FCC0C (RVA ACTION_FILTER_WORKER_STATIC_RVA). enable_raw is a
+    // Action-filter enable/disable worker sub_1804FCC0C. enable_raw is a
     // 64-bit register slot whose low byte is the enable flag (!=0 enable, 0 disable); the upper bytes are
     // unused by the engine, so they are forwarded verbatim. name is the filter name (a null/empty name is the
     // engine "all filters" branch). The return value is propagated unchanged (EnableFilter/DisableFilter
@@ -153,12 +153,12 @@ namespace TPVCamera
             {
                 throw std::runtime_error("module base unknown");
             }
-            // OverlayHide carries the action-filter worker AOB cascade (k_actionFilterWorkerCandidates); the
-            // static RVA is the fail-closed fallback for a total cascade miss.
-            uintptr_t worker_addr = anchor_address(AnchorId::OverlayHide);
+            // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates); a
+            // total cascade miss fails closed.
+            const uintptr_t worker_addr = anchor_address(AnchorId::OverlayHide);
             if (worker_addr == 0)
             {
-                worker_addr = module_base + Constants::ACTION_FILTER_WORKER_STATIC_RVA;
+                throw std::runtime_error("OverlayHide cascade unresolved (action-filter worker)");
             }
 
             DMK::HookManager &hook_manager = DMK::HookManager::get_instance();
