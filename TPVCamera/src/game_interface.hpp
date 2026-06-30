@@ -14,9 +14,9 @@ namespace TPVCamera
 
     /**
      * @brief Stores the resolved global-context pointer for the game-state camera reads.
-     * @details KCD1 reaches the global context via a static RVA (module_base + GLOBAL_CONTEXT_STATIC_OFFSET),
-     *          not a RIP-relative anchor: 1.9.7 is a frozen build, so the static slot is authoritative. The
-     *          resolved storage slot is published to g_global_context_ptr_address for the game-state camera
+     * @details KCD1 reaches the global context through the .data slot resolved at runtime by the Context AOB
+     *          cascade; a total cascade miss fails closed. The resolved storage slot is published to
+     *          g_global_context_ptr_address for the game-state camera
      *          reads (game_state.cpp); without this call those reads find no state.
      * @return true if the module base is known and the context slot was published, false otherwise.
      * @note Call after the game module base/size is recorded in module_info().

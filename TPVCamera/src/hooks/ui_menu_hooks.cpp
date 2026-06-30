@@ -5,7 +5,7 @@
  * KCD2 hooked two separate vtable functions (MenuOpen / MenuClose) whose entry AOBs get 0 matches on KCD1.
  * KCD1 instead funnels every in-game-menu open/close through ONE toggle, sub_1805B84CC(this, char display)
  * -- the "DisplayIngameMenu" convergence (found via the C_UIMenuEvents registry). This hooks it and latches
- * display into is_game_menu_open(). Resolved via a static RVA (1.9.7 is frozen; mirrors the other KCD1 hooks).
+ * display into is_game_menu_open(). Resolved at runtime by the MenuOpen AOB cascade (mirrors the other hooks).
  * The API matches KCD2 so the call sites (game_state.cpp, tpv_camera.cpp) are unchanged between the builds.
  */
 
@@ -63,12 +63,12 @@ namespace TPVCamera
             {
                 throw std::runtime_error("module base unknown");
             }
-            // MenuOpen carries the menu open/close toggle AOB cascade (k_menuToggleCandidates); the static
-            // RVA is the fail-closed fallback for a total cascade miss.
-            uintptr_t toggle_addr = anchor_address(AnchorId::MenuOpen);
+            // MenuOpen is the menu open/close toggle runtime AOB cascade (k_menuToggleCandidates); a total
+            // cascade miss fails closed.
+            const uintptr_t toggle_addr = anchor_address(AnchorId::MenuOpen);
             if (toggle_addr == 0)
             {
-                toggle_addr = module_base + Constants::MENU_TOGGLE_STATIC_RVA;
+                throw std::runtime_error("MenuOpen cascade unresolved (menu toggle)");
             }
 
             DMK::HookManager &hook_manager = DMK::HookManager::get_instance();

@@ -18,7 +18,7 @@ namespace TPVCamera
         // A RipGlobal anchor wrapping a single cascade of code candidates. (RipGlobal is DMK's general
         // code/data cascade kind; Direct candidates resolve to a code address, which is exactly what an
         // inline-hook target needs.) An empty site marks an anchor KCD1 does not pattern-resolve (its
-        // consumer falls back to a static RVA / gEnv / vtable slot, or is stubbed); resolve_all_anchors
+        // consumer reaches the target via a gEnv member / vtable slot, or is stubbed); resolve_all_anchors
         // skips it and records 0.
         constexpr Anchor rip_global(std::string_view label, std::span<const AddrCandidate> site) noexcept
         {
@@ -43,6 +43,7 @@ namespace TPVCamera
             rip_global("MenuToggle", Aob::k_menuToggleCandidates),  // AnchorId::MenuOpen (cascade + RVA)
             rip_global("MenuClose", {}),                            // AnchorId::MenuClose (folded into MenuOpen)
             rip_global("GetObjectsInBox", {}),                      // AnchorId::GetObjectsInBox (vtable slot)
+            rip_global("CryActionFramework", Aob::k_cryActionFrameworkCandidates), // AnchorId::CryActionFramework (cascade + RVA fallback)
         }};
 
         std::array<std::uintptr_t, k_anchor_count> s_resolved_addresses{};
@@ -56,7 +57,7 @@ namespace TPVCamera
         // built explicitly from the scanned module.
         const DMK::Memory::ModuleRange range{module_base, module_base + module_size};
 
-        // Resolve only the anchors that carry a cascade; the rest stay 0 (static-RVA / vtable / stub
+        // Resolve only the anchors that carry a cascade; the rest stay 0 (gEnv / vtable / stub
         // consumers). A compact sub-table of the wired anchors is resolved in one parallel pass, then each
         // result is written back to its AnchorId slot.
         std::array<Anchor, k_anchor_count> wired{};
@@ -98,7 +99,7 @@ namespace TPVCamera
         const auto quality =
             DMK::Anchors::assess_quality(std::span<const DMK::Anchors::ResolvedAnchor>(report.data(), n));
         logger.info("Anchor resolution: {}/{} wired resolved, {} failed, {} unsupported (KCD1: other anchors use "
-                    "static RVA / vtable / stub)",
+                    "gEnv member / vtable slot / stub)",
                     quality.resolved, quality.total, quality.failed, quality.unsupported);
     }
 

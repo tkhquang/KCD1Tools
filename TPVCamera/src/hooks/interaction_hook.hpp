@@ -9,8 +9,8 @@
  * the rendered camera + crosshair for the duration of that one call, so the look-ray AND the candidate
  * projection both follow the screen centre, then restores the engine view.
  *
- * KCD1: implemented via static RVAs (wraps the selection sub_1803E51EC; resolves the view pose through the
- * framework getter sub_180430AA4); see interaction_hook.cpp. Gated by InteractFromCamera + cursor-hidden; a
+ * KCD1: wraps the selection sub_1803E51EC and resolves the view pose through the global-context slot (both
+ * resolved at runtime by AOB cascades); see interaction_hook.cpp. Gated by InteractFromCamera + cursor-hidden; a
  * no-op at the menu / in first person. The KCD2 on-screen reticle gate for InteractiveScene usables
  * (shrines/beds/doors) is not ported (its KCD1 analog is unresolved).
  */
@@ -23,7 +23,7 @@ namespace TPVCamera
     /**
      * @brief Installs the interaction look-ray redirect (the ray-query builder hook).
      * @details Best-effort: on failure the feature simply no-ops (interaction stays vanilla) and the rest of
-     *          the mod is unaffected. KCD1 resolves the targets via module_base + the *_STATIC_RVA constants.
+     *          the mod is unaffected. KCD1 resolves the targets at runtime via AOB cascades.
      * @return true if the look-ray builder hook was installed, false otherwise.
      */
     [[nodiscard]] bool initialize_interaction_hook();
