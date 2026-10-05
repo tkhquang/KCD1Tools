@@ -65,7 +65,7 @@ namespace TPVCamera
      *        brush-typed query when both slots read as the expected wrapper pair.
      * @details The typed query visits only brushes, which is what every consumer here keeps, instead of every render
      *          node in the box. Both queries are reached through the engine vtable, not an AOB anchor, so the slot
-     *          numbering is pinned by the two slot heads (ENGINE3D_TYPED_QUERY_HEAD / ENGINE3D_UNTYPED_QUERY_HEAD),
+     *          numbering is pinned by the two slot heads (Aob::k_engine3dTypedQueryHead / k_engine3dUntypedQueryHead),
      *          which also prove the typed query's argument layout. Both slots must lie in the game image. The
      *          decision is logged when it changes. Called outside any structured-exception frame, before the guarded
      *          queries.
@@ -88,8 +88,8 @@ namespace TPVCamera
 
         GetObjectsByTypeInBoxFn typed = nullptr;
         if (untyped_ok && typed_slot && s_game_module.contains(DMK::Address{*typed_slot}) &&
-            code_matches(*untyped_slot, Constants::ENGINE3D_UNTYPED_QUERY_HEAD) &&
-            code_matches(*typed_slot, Constants::ENGINE3D_TYPED_QUERY_HEAD))
+            code_matches(*untyped_slot, Aob::k_engine3dUntypedQueryHead) &&
+            code_matches(*typed_slot, Aob::k_engine3dTypedQueryHead))
         {
             typed = reinterpret_cast<GetObjectsByTypeInBoxFn>(*typed_slot);
         }
