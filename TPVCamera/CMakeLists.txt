@@ -45,25 +45,24 @@ endif()
 
 # --- DetourModKit Dependency ---
 # Preferred and default: the per-mod submodule at external/DetourModKit, pinned to
-# DetourModKit v3.8.2 (the same release the KCD2 TPVCamera targets). If it is not
+# DetourModKit v4.3.0 (the same release the KCD2 TPVCamera targets). If it is not
 # initialized, the build falls back to an on-disk sibling checkout (see below).
 # Override with -DKCD1_DMK_DIR=<path>.
 set(KCD1_DMK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/DetourModKit" CACHE PATH
   "Path to a DetourModKit source checkout")
 
 if(NOT EXISTS "${KCD1_DMK_DIR}/CMakeLists.txt")
-  # This mod targets the DetourModKit 3.8.x API (same as the KCD2 TPVCamera it was
-  # ported from: Anchors cascades, Bootstrap, Memory::seh_read, Rtti). The sibling
-  # TPVToggle submodule pins an older 2.0.0 API that is NOT source-compatible, so it
-  # is intentionally not used here. If the per-mod submodule at external/DetourModKit
-  # is not initialized, fall back to the on-disk KCD2Tools 3.8.x checkout.
+  # This mod targets the DetourModKit 4.3 API (Session, hook::HookStack, scan::Candidate ladders, rtti::HealScheduler).
+  # The sibling TPVToggle submodule pins an older API that is NOT source-compatible, so it is intentionally not
+  # used here. If the per-mod submodule at external/DetourModKit is not initialized, fall back to the on-disk
+  # KCD2Tools checkout, which pins the same release.
   set(_dmk_candidates
     "${CMAKE_CURRENT_SOURCE_DIR}/../../KCD2Tools/TPVCamera/external/DetourModKit"
   )
   foreach(_cand ${_dmk_candidates})
     if(EXISTS "${_cand}/CMakeLists.txt")
       set(KCD1_DMK_DIR "${_cand}")
-      message(STATUS "DetourModKit: using 3.8.x checkout at ${KCD1_DMK_DIR}")
+      message(STATUS "DetourModKit: using sibling checkout at ${KCD1_DMK_DIR}")
       break()
     endif()
   endforeach()
@@ -75,7 +74,25 @@ if(NOT EXISTS "${KCD1_DMK_DIR}/CMakeLists.txt")
 endif()
 
 if(NOT TARGET DetourModKit)
-  add_subdirectory("${KCD1_DMK_DIR}" "${CMAKE_BINARY_DIR}/_deps/DetourModKit-build")
+  # Zydis and Zycore declare an older minimum. Limit the policy override to the dependency tree.
+  block(SCOPE_FOR VARIABLES)
+    if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM OR CMAKE_POLICY_VERSION_MINIMUM VERSION_LESS 3.10)
+      set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+    endif()
+    add_subdirectory("${KCD1_DMK_DIR}" "${CMAKE_BINARY_DIR}/_deps/DetourModKit-build")
+
+    # /W0 maps to the Visual Studio warning-level property. /w remains an extra flag and conflicts with /W1.
+    foreach(_dependency_target safetyhook Zydis Zycore)
+      if(TARGET ${_dependency_target})
+        get_target_property(_dependency_alias ${_dependency_target} ALIASED_TARGET)
+        get_target_property(_dependency_options ${_dependency_target} COMPILE_OPTIONS)
+        if(NOT _dependency_alias AND _dependency_options)
+          list(TRANSFORM _dependency_options REPLACE ":/w>$" ":/W0>")
+          set_property(TARGET ${_dependency_target} PROPERTY COMPILE_OPTIONS "${_dependency_options}")
+        endif()
+      endif()
+    endforeach()
+  endblock()
 endif()
 if(NOT TARGET DetourModKit)
   message(FATAL_ERROR "DetourModKit target not created by subdirectory")
@@ -129,21 +146,24 @@ endif()
 
 # --- Build Options ---
 # OFF (default): one production ASI built from the logic + dllmain.cpp.
-# ON: a thin loader ASI plus a logic DLL it hot-reloads on Numpad 0 (see src/dev/).
-option(KCD1_TPVCAMERA_DEV_BUILD "Build the two-DLL hot-reload dev configuration (thin loader ASI + logic DLL)" OFF)
+# ON: the DetourModKit staged-reload pair (see src/dev/): a resident loader ASI plus a logic DLL it
+# replaces on Numpad 0 by loading a uniquely named copy of each rebuild.
+option(KCD1_TPVCAMERA_DEV_BUILD "Build the two-DLL hot-reload dev configuration (resident loader ASI + logic DLL)" OFF)
 set(KCD1_TPVCAMERA_GAME_DIR "" CACHE PATH
-  "Game Bin\\Win64 directory to deploy into (used by the dev build for hot-reload staging)")
+  "Game Bin\\Win64 directory to deploy into (the dev build deploys the loader and the logic DLL there)")
 
 # --- Common Sources (mod logic; the entry point is added per target) ---
 set(COMMON_SOURCES
   src/aob_resolver.cpp
   src/config.cpp
+  src/detour_gate.cpp
   src/game_interface.cpp
   src/game_state.cpp
   src/global_state.cpp
   src/offset_heal.cpp
   src/physics_raycast.cpp
   src/render_occlusion.cpp
+  src/rtti_types.cpp
   src/tpv_camera.cpp
   src/version.cpp
   src/hooks/camera_hook.cpp
@@ -168,7 +188,7 @@ function(configure_logic_target target)
   target_include_directories(${target} PRIVATE src)
   target_link_libraries(${target} PRIVATE
     DetourModKit imgui_lib nlohmann_json::nlohmann_json
-    psapi user32 kernel32 d3d11 dxgi gdi32 winmm)
+    user32 kernel32 d3d11 dxgi gdi32 winmm)
   target_compile_options(${target} PRIVATE
     /W4
     $<$<CONFIG:Release>:/O2>
@@ -208,24 +228,39 @@ if(NOT KCD1_TPVCAMERA_DEV_BUILD)
 
   message(STATUS "KCD1_TPVCamera (${PROJECT_VERSION}) -- production ASI build -> KCD1_TPVCamera.asi")
 else()
-  # --- Dev Build: a thin loader ASI plus a logic DLL it hot-reloads in place ---
+  # --- Dev Build: DetourModKit's staged-reload pair (docs/guides/hot-reload in DetourModKit) ---
 
-  # Thin loader ASI: loads the logic DLL and reloads it from staging/ on Numpad 0.
-  # Links only Win32 (no DetourModKit) so a rebuild never writes a file it holds open.
-  add_library(${PROJECT_NAME}-loader SHARED src/dev/loader.cpp)
-  target_link_libraries(${PROJECT_NAME}-loader PRIVATE kernel32 user32)
+  # Resident loader ASI: owns the reload control thread and the process-lifetime wheel host, and maps
+  # each logic generation from a uniquely named copy. It links the resident wheel host ONLY, never the
+  # full archive: hosting wheel capture in a module that is never unloaded is what lets the logic DLL
+  # keep mouse-wheel bindings and still unmap, because the permanent wheel keepalive is booked here.
+  add_library(${PROJECT_NAME}-loader SHARED src/dev/mod_loader.cpp)
+  target_compile_options(${PROJECT_NAME}-loader PRIVATE /W4)
+  target_include_directories(${PROJECT_NAME}-loader PRIVATE src)
+  target_link_libraries(${PROJECT_NAME}-loader PRIVATE DetourModKit::WheelHost kernel32 user32)
+
+  # Guard the property above. Linking the full archive here would give the loader its own DetourModKit
+  # instance, which is exactly the arrangement the library's unload proofs exclude.
+  get_target_property(_tpv_loader_links ${PROJECT_NAME}-loader LINK_LIBRARIES)
+  if(NOT _tpv_loader_links MATCHES "DetourModKit::WheelHost")
+    message(FATAL_ERROR "${PROJECT_NAME}-loader must link DetourModKit::WheelHost.")
+  endif()
+  if(_tpv_loader_links MATCHES "DetourModKit::DetourModKit" OR _tpv_loader_links MATCHES "(^|;)DetourModKit(;|$)")
+    message(FATAL_ERROR "${PROJECT_NAME}-loader must not link the full DetourModKit archive.")
+  endif()
   set_target_properties(${PROJECT_NAME}-loader PROPERTIES
     OUTPUT_NAME "KCD1_TPVCamera"
     SUFFIX ".asi"
     PREFIX ""
   )
 
-  # Logic DLL: the mod logic plus the exported Init/Shutdown the loader drives.
-  add_library(${PROJECT_NAME}-logic SHARED ${COMMON_SOURCES} src/dev/logic_exports.cpp)
+  # Logic DLL: the mod logic plus the Init / Shutdown / Revision exports the loader drives. It links the
+  # full archive exactly like the production ASI, so every reload exercises the production teardown.
+  add_library(${PROJECT_NAME}-logic SHARED ${COMMON_SOURCES} src/dev/mod_logic.cpp)
   configure_logic_target(${PROJECT_NAME}-logic)
   target_compile_definitions(${PROJECT_NAME}-logic PRIVATE KCD1_TPVCAMERA_DEV_BUILD)
   set_target_properties(${PROJECT_NAME}-logic PROPERTIES
-    OUTPUT_NAME "KCD1_TPVCamera_Logic"
+    OUTPUT_NAME "KCD1_TPVCamera.logic"
     PREFIX ""
   )
   # /Zi emits a PDB; /DEBUG /INCREMENTAL:NO keep each rebuild a clean, reloadable DLL.
@@ -233,7 +268,8 @@ else()
   target_link_options(${PROJECT_NAME}-logic PRIVATE /DEBUG /INCREMENTAL:NO)
 
   if(KCD1_TPVCAMERA_GAME_DIR)
-    # Loader deploys straight into the game directory (changes rarely; land it closed).
+    # The loader changes rarely and stays mapped for the game session, so it is expected to land while the
+    # game is closed.
     add_custom_command(TARGET ${PROJECT_NAME}-loader POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:${PROJECT_NAME}-loader>
@@ -241,24 +277,24 @@ else()
       COMMENT "Deploying loader ASI to ${KCD1_TPVCAMERA_GAME_DIR}"
     )
 
-    # Logic DLL (+PDB) deploys into staging/; the loader promotes it on startup and on
-    # each Numpad 0 reload, so the build never writes a file the running game holds open.
+    # The logic DLL (+PDB) deploys straight beside the loader. The loader never maps this file: each
+    # generation loads a uniquely named copy (KCD1_TPVCamera.genNNNN.logic.dll), so a rebuild can replace
+    # it while the game runs.
     add_custom_command(TARGET ${PROJECT_NAME}-logic POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${KCD1_TPVCAMERA_GAME_DIR}/staging"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:${PROJECT_NAME}-logic>
-        "${KCD1_TPVCAMERA_GAME_DIR}/staging/KCD1_TPVCamera_Logic.dll"
+        "${KCD1_TPVCAMERA_GAME_DIR}/KCD1_TPVCamera.logic.dll"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_PDB_FILE:${PROJECT_NAME}-logic>
-        "${KCD1_TPVCAMERA_GAME_DIR}/staging/KCD1_TPVCamera_Logic.pdb"
-      COMMENT "Deploying logic DLL+PDB to staging (loader promotes on startup / Numpad 0)"
+        "${KCD1_TPVCAMERA_GAME_DIR}/KCD1_TPVCamera.logic.pdb"
+      COMMENT "Deploying logic DLL+PDB beside the loader (Numpad 0 stages and loads a fresh copy)"
     )
   else()
     message(STATUS "KCD1_TPVCAMERA_GAME_DIR not set: dev build will not auto-deploy. "
                    "Set -DKCD1_TPVCAMERA_GAME_DIR=<game Bin/Win64> to enable hot-reload deploy.")
   endif()
 
-  message(STATUS "KCD1_TPVCamera (${PROJECT_VERSION}) -- DEV (two-DLL hot-reload) build")
-  message(STATUS "    - ${PROJECT_NAME}-loader -> KCD1_TPVCamera.asi (thin loader)")
-  message(STATUS "    - ${PROJECT_NAME}-logic  -> KCD1_TPVCamera_Logic.dll (mod logic)")
+  message(STATUS "KCD1_TPVCamera (${PROJECT_VERSION}) -- DEV (staged-reload pair) build")
+  message(STATUS "    - ${PROJECT_NAME}-loader -> KCD1_TPVCamera.asi (resident loader)")
+  message(STATUS "    - ${PROJECT_NAME}-logic  -> KCD1_TPVCamera.logic.dll (mod logic)")
 endif()

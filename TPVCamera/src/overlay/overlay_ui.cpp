@@ -239,7 +239,7 @@ namespace TPVCamera::Overlay
                     {
                         if (!store.rename(i, std::string(s_rename_buffer)))
                         {
-                            DMK::Logger::get_instance().warning(
+                            DMK::log().warning(
                                 "Overlay: rename of preset index {} rejected (empty/duplicate/built-in).", i);
                         }
                         cancel_rename();

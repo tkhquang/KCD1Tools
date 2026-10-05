@@ -26,7 +26,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "KCD1_TPVCAMERA_DEV_BUILD": "ON",
-        "KCD1_TPVCAMERA_GAME_DIR": "D:/Games/SteamLibrary/steamapps/common/KingdomComeDeliverance/Bin/Win64"
+        "KCD1_TPVCAMERA_GAME_DIR": "C:/Program Files (x86)/Steam/steamapps/common/KingdomComeDeliverance/Bin/Win64"
       }
     }
   ],

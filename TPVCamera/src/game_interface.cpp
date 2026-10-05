@@ -16,49 +16,40 @@
 
 #include <DetourModKit.hpp>
 
-#include <stdexcept>
+#include <cstddef>
+#include <cstdint>
 
-using DMK::Format::format_address;
+using DMK::format::format_address;
 
 namespace TPVCamera
 {
 
-    bool initialize_game_interface()
+    DMK::Result<void> initialize_game_interface()
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
+        logger.info("GameInterface: Initializing from the static global-context slot...");
 
-        try
+        if (module_info().base == 0)
         {
-            logger.info("GameInterface: Initializing from the static global-context slot...");
-
-            const std::uintptr_t module_base = module_info().base;
-            if (module_base == 0)
-            {
-                throw std::runtime_error("Module base not resolved before game-interface init");
-            }
-
-            // The global-context storage slot is a fixed .data location in the WHGame.dll image (the singleton
-            // getters return *qword_1834FFD10). The Context anchor resolves the slot ADDRESS from a getter's
-            // RIP-relative load (k_contextCandidates); resolution is runtime-only, so a total cascade miss fails
-            // closed here. Publish the slot ADDRESS (not the pointer it holds, which is null until a level
-            // loads); game_state.cpp dereferences it fresh each frame and validates the value.
-            const std::uintptr_t ctx_slot = anchor_address(AnchorId::Context);
-            if (ctx_slot == 0)
-            {
-                throw std::runtime_error("Context cascade unresolved (global-context slot)");
-            }
-
-            g_global_context_ptr_address.store(reinterpret_cast<std::byte *>(ctx_slot), std::memory_order_relaxed);
-
-            logger.info("GameInterface: Global context pointer storage at {}", format_address(ctx_slot));
-
-            return true;
+            logger.error("GameInterface: module base not resolved before game-interface init");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::InvalidArg, "game_interface/module"});
         }
-        catch (const std::exception &e)
+
+        // The global-context storage slot is a fixed .data location in the WHGame.dll image (the singleton
+        // getters return *qword_1834FFD10). The Context anchor resolves the slot ADDRESS from a getter's
+        // RIP-relative load (k_contextCandidates); resolution is runtime-only, so a total cascade miss fails
+        // closed here. Publish the slot ADDRESS (not the pointer it holds, which is null until a level
+        // loads); game_state.cpp dereferences it fresh each frame and validates the value.
+        const std::uintptr_t ctx_slot = anchor_address(AnchorId::Context);
+        if (ctx_slot == 0)
         {
-            logger.error("GameInterface: Initialization failed: {}", e.what());
-            return false;
+            logger.error("GameInterface: Context cascade unresolved (global-context slot)");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "game_interface/anchor"});
         }
+
+        g_global_context_ptr_address.store(reinterpret_cast<std::byte *>(ctx_slot), std::memory_order_relaxed);
+        logger.info("GameInterface: Global context pointer storage at {}", format_address(ctx_slot));
+        return {};
     }
 
     void cleanup_game_interface()

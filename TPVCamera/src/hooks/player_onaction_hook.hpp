@@ -16,6 +16,8 @@
 #ifndef TPVCAMERA_PLAYER_ONACTION_HOOK_HPP
 #define TPVCAMERA_PLAYER_ONACTION_HOOK_HPP
 
+#include <DetourModKit/error.hpp>
+
 #include <cstdint>
 
 namespace TPVCamera
@@ -23,12 +25,14 @@ namespace TPVCamera
 
     /**
      * @brief Installs the player OnAction / action-dispatcher hook from the pre-resolved anchor.
-     * @return true if the dispatcher was located and hooked. KCD1: always false (stubbed).
-     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address().
+     * @return An empty Result once the dispatcher is hooked, or the typed Error (NoMatch for an unresolved
+     *         anchor, otherwise the install / enable code).
+     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is owned
+     *       by the DetourGate, which retires it at shutdown.
      */
-    [[nodiscard]] bool initialize_player_onaction_hook();
+    [[nodiscard]] DMK::Result<void> initialize_player_onaction_hook();
 
-    /** @brief Whether the OnAction hook resolved (callers use the input signal only when true). KCD1: false. */
+    /** @brief Whether the OnAction hook resolved (callers use the input signal only when true). */
     [[nodiscard]] bool player_onaction_available();
 
     /**

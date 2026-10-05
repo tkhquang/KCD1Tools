@@ -18,12 +18,14 @@
 #include "constants.hpp"
 #include "global_state.hpp"
 #include "offset_heal.hpp"
+#include "rtti_types.hpp"
 #include "hooks/ui_menu_hooks.hpp"
 
 #include <DetourModKit.hpp>
 
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <string>
 
 namespace TPVCamera
@@ -57,7 +59,7 @@ namespace TPVCamera
             }
 
             uint32_t bits = 0;
-            const auto type_id = DMK::Memory::seh_read<int>(camera + Constants::OFFSET_CAMERA_TYPE_ID);
+            const auto type_id = DMK::memory::read<int>(DMK::Address{camera + Constants::OFFSET_CAMERA_TYPE_ID});
             s_dbg_camera_type = type_id ? *type_id : -1;
             if (type_id)
             {
@@ -83,10 +85,11 @@ namespace TPVCamera
         /**
          * @brief Resolves the active camera and classifies it, returning 0 on any failed read.
          * @details Dereferences the global-context slot to the context object first (so the self-heal can scan the
-         *          anchored base), then once the world is live heals the context member offsets one-shot, then walks
-         *          context -> camera manager (self-healed OFFSET_MANAGER_PTR_STORAGE) -> active camera
-         *          (OFFSET_ACTIVE_CAMERA) -> type id, each link SEH-guarded and screened as a plausible user-space
-         *          pointer. The manager is the same wh::game::C_CameraManager the game-state walk uses.
+         *          anchored base), then once the world is live publishes that base to the context-member heal
+         *          groups, then walks context -> camera manager (self-healed OFFSET_MANAGER_PTR_STORAGE) -> active
+         *          camera (OFFSET_ACTIVE_CAMERA) -> type id under the fault guard, each dereferenced link screened as
+         *          a plausible user-space pointer. The manager is the same wh::game::C_CameraManager the game-state
+         *          walk uses.
          */
         [[nodiscard]] uint32_t poll_active_camera_state() noexcept
         {
@@ -98,23 +101,28 @@ namespace TPVCamera
             // Resolve the context object first so the self-heal can run against it. Gating the heal on the world
             // being live (rather than on the manager slot being populated) keeps a camera-manager OFFSET drift
             // recoverable: the heal scans the anchored context base, never navigating through the offset it heals.
-            const auto context = DMK::Memory::seh_read<uintptr_t>(reinterpret_cast<uintptr_t>(context_slot));
-            if (!context || !DMK::Memory::plausible_userspace_ptr(*context))
+            const auto context = DMK::memory::read<uintptr_t>(DMK::Address{reinterpret_cast<uintptr_t>(context_slot)});
+            if (!context || !DMK::memory::is_plausible_ptr(DMK::Address{*context}))
             {
                 return 0;
             }
             if (game_world_ready().load(std::memory_order_relaxed))
             {
-                heal_context_offsets(*context);
+                note_context_base(*context);
             }
             // One guarded walk: context object -> camera manager (self-healed OFFSET_MANAGER_PTR_STORAGE) -> active
-            // camera (OFFSET_ACTIVE_CAMERA). seh_read_chain screens every intermediate link with
-            // plausible_userspace_ptr under a single fault guard; the terminal camera value it returns is not
-            // range-checked by the chain, so it is screened here before use.
-            const auto camera = DMK::Memory::seh_read_chain<uintptr_t>(
-                *context, {runtime_offsets().context_manager.load(std::memory_order_relaxed),
-                           Constants::OFFSET_ACTIVE_CAMERA});
-            if (!camera || !DMK::Memory::plausible_userspace_ptr(*camera))
+            // camera slot (OFFSET_ACTIVE_CAMERA). DMK::memory::walk screens every dereferenced link under a single
+            // fault guard and hands back the leaf ADDRESS; the camera pointer read from it is not range-checked by the
+            // walk, so it is screened here before use.
+            const std::array<std::ptrdiff_t, 2> camera_chain{offset_value(runtime_offsets().context_manager),
+                                                             Constants::OFFSET_ACTIVE_CAMERA};
+            const auto camera_slot = DMK::memory::walk(DMK::Address{*context}, camera_chain);
+            if (!camera_slot)
+            {
+                return 0;
+            }
+            const auto camera = DMK::memory::read<uintptr_t>(*camera_slot);
+            if (!camera || !DMK::memory::is_plausible_ptr(DMK::Address{*camera}))
             {
                 return 0;
             }
@@ -124,7 +132,9 @@ namespace TPVCamera
         /**
          * @brief Classifies an active-minigame vtable into its child GameState bit (0 when unrecognized).
          * @details Mirrors classify_active_camera: caches the last vtable so the steady state inside a minigame
-         *          is one pointer compare with no RTTI walk. Render-thread only, so the cache is a plain static.
+         *          is one pointer compare. A minigame SWITCH asks the cached class identities (rtti_types), so it
+         *          costs a pointer compare per row rather than an RTTI walk. Render-thread only, so the cache is a
+         *          plain static.
          * @param vtable Runtime vtable pointer of the active wh::playermodule::C_Minigame subclass.
          */
         [[nodiscard]] uint32_t classify_minigame_vtable(uintptr_t vtable) noexcept
@@ -137,11 +147,11 @@ namespace TPVCamera
             }
 
             uint32_t bit = 0;
-            for (const MinigameInfo &def : k_minigames)
+            for (std::size_t i = 0; i < k_minigames.size(); ++i)
             {
-                if (DMK::Rtti::vtable_is_type(vtable, def.rtti_name))
+                if (minigame_vtable_is(i, vtable))
                 {
-                    bit = state_bit(def.bit);
+                    bit = state_bit(k_minigames[i].bit);
                     break;
                 }
             }
@@ -174,18 +184,23 @@ namespace TPVCamera
             {
                 return 0;
             }
-            // Walk g_global_context -> C_PlayerModule -> std::map holder under one fault guard (each intermediate
-            // link screened by plausible_userspace_ptr). The map value the chain returns is screened here.
-            const auto map = DMK::Memory::seh_read_chain<uintptr_t>(
-                reinterpret_cast<uintptr_t>(context_slot),
-                {0, runtime_offsets().context_minigame_subsystem.load(std::memory_order_relaxed),
-                 Constants::OFFSET_MINIGAME_MAP});
-            if (!map || !DMK::Memory::plausible_userspace_ptr(*map))
+            // Walk g_global_context -> C_PlayerModule -> std::map holder slot under one fault guard (each
+            // dereferenced link screened by the walk's plausibility floor). DMK::memory::walk hands back the leaf
+            // ADDRESS; the map value read from it is screened here, because the walk does not range-check the leaf.
+            const std::array<std::ptrdiff_t, 3> map_chain{0, offset_value(runtime_offsets().context_minigame_subsystem),
+                                                          Constants::OFFSET_MINIGAME_MAP};
+            const auto map_slot = DMK::memory::walk(DMK::Address{reinterpret_cast<uintptr_t>(context_slot)}, map_chain);
+            if (!map_slot)
+            {
+                return 0;
+            }
+            const auto map = DMK::memory::read<uintptr_t>(*map_slot);
+            if (!map || !DMK::memory::is_plausible_ptr(DMK::Address{*map}))
             {
                 return 0;
             }
             // _Mysize == 0 means no active minigame: the cheap gate before walking the tree.
-            const auto size = DMK::Memory::seh_read<uint64_t>(*map + Constants::OFFSET_MINIGAME_MAP_SIZE);
+            const auto size = DMK::memory::read<uint64_t>(DMK::Address{*map + Constants::OFFSET_MINIGAME_MAP_SIZE});
             s_dbg_minigame_size = size ? static_cast<long long>(*size) : -1;
             if (!size || *size == 0)
             {
@@ -196,23 +211,25 @@ namespace TPVCamera
             // but KCD1 keeps a red-black tree (std::map): that list walk oscillates straight back to the sentinel
             // and then reads its garbage value, which is why only the umbrella bit (never a child) ever resolved.
             // Read _Left directly -- _Mysize > 0 here, so it is a real node (an empty tree links _Left to itself).
-            const auto sentinel = DMK::Memory::seh_read<uintptr_t>(*map);
-            if (!sentinel || !DMK::Memory::plausible_userspace_ptr(*sentinel))
+            const auto sentinel = DMK::memory::read<uintptr_t>(DMK::Address{*map});
+            if (!sentinel || !DMK::memory::is_plausible_ptr(DMK::Address{*sentinel}))
             {
                 return state_bit(GameState::Minigame); // size > 0 but tree unreadable: at least flag the umbrella
             }
-            const auto node = DMK::Memory::seh_read<uintptr_t>(*sentinel); // sentinel._Left = leftmost real node
-            if (!node || !DMK::Memory::plausible_userspace_ptr(*node))
+            const auto node =
+                DMK::memory::read<uintptr_t>(DMK::Address{*sentinel}); // sentinel._Left = leftmost real node
+            if (!node || !DMK::memory::is_plausible_ptr(DMK::Address{*node}))
             {
                 return state_bit(GameState::Minigame);
             }
-            const auto minigame = DMK::Memory::seh_read<uintptr_t>(*node + Constants::OFFSET_MINIGAME_NODE_VALUE);
-            if (!minigame || !DMK::Memory::plausible_userspace_ptr(*minigame))
+            const auto minigame =
+                DMK::memory::read<uintptr_t>(DMK::Address{*node + Constants::OFFSET_MINIGAME_NODE_VALUE});
+            if (!minigame || !DMK::memory::is_plausible_ptr(DMK::Address{*minigame}))
             {
                 return state_bit(GameState::Minigame);
             }
-            const auto vtable = DMK::Memory::seh_read<uintptr_t>(*minigame);
-            if (!vtable || !DMK::Memory::plausible_userspace_ptr(*vtable))
+            const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{*minigame});
+            if (!vtable || !DMK::memory::is_plausible_ptr(DMK::Address{*vtable}))
             {
                 return state_bit(GameState::Minigame);
             }
@@ -222,8 +239,8 @@ namespace TPVCamera
         /**
          * @brief Reads the player's current STANCE enum, validated by RTTI, or 0 on any failure.
          * @details C_ActorModel is a POINTER on C_Player (C_PLAYER_ACTOR_MODEL_OFFSET = 0x908), dereferenced and
-         *          its vtable validated against the C_ActorModel RTTI name (cached after the first read, so the
-         *          steady state is one pointer compare plus the stance read). A layout drift (a wrong vtable)
+         *          its vtable validated against the cached C_ActorModel class identity (rtti_types, so the steady
+         *          state is one pointer compare plus the stance read). A layout drift (a wrong vtable)
          *          yields 0 rather than a garbage read. The 4-byte current-stance enum at
          *          C_ACTOR_MODEL_STANCE_OFFSET = 0x1C8 is the SINGLE source for both crouch and mount on KCD1:
          *          0 = standing, 1 = lying, 2 = sitting, 3 = kneel, 4 = mounted (riding), 5 = crouching/sneaking.
@@ -231,31 +248,23 @@ namespace TPVCamera
          */
         [[nodiscard]] uint32_t poll_stance(uintptr_t c_player) noexcept
         {
-            const auto actor_model = DMK::Memory::seh_read<uintptr_t>(
-                c_player + runtime_offsets().c_player_actor_model.load(std::memory_order_relaxed));
-            if (!actor_model || !DMK::Memory::plausible_userspace_ptr(*actor_model))
+            const auto actor_model = DMK::memory::read<uintptr_t>(
+                DMK::Address{c_player + offset_value(runtime_offsets().c_player_actor_model)});
+            if (!actor_model || !DMK::memory::is_plausible_ptr(DMK::Address{*actor_model}))
             {
                 return 0u;
             }
-            const auto vtable = DMK::Memory::seh_read<uintptr_t>(*actor_model);
-            if (!vtable || !DMK::Memory::plausible_userspace_ptr(*vtable))
+            const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{*actor_model});
+            if (!vtable || !DMK::memory::is_plausible_ptr(DMK::Address{*vtable}))
             {
                 return 0u;
             }
-            static uintptr_t s_actor_model_vtable = 0;
-            if (s_actor_model_vtable == 0)
-            {
-                if (!DMK::Rtti::vtable_is_type(*vtable, Constants::C_ACTOR_MODEL_RTTI_NAME))
-                {
-                    return 0u;
-                }
-                s_actor_model_vtable = *vtable;
-            }
-            else if (*vtable != s_actor_model_vtable)
+            if (!vtable_is(GameClass::ActorModel, *vtable))
             {
                 return 0u;
             }
-            const auto stance = DMK::Memory::seh_read<uint32_t>(*actor_model + Constants::C_ACTOR_MODEL_STANCE_OFFSET);
+            const auto stance =
+                DMK::memory::read<uint32_t>(DMK::Address{*actor_model + Constants::C_ACTOR_MODEL_STANCE_OFFSET});
             return stance ? *stance : 0u;
         }
 
@@ -270,7 +279,7 @@ namespace TPVCamera
          */
         [[nodiscard]] uint32_t poll_aiming(uintptr_t c_player) noexcept
         {
-            const auto flag = DMK::Memory::seh_read<uint8_t>(c_player + Constants::OFFSET_AIMING_FLAG);
+            const auto flag = DMK::memory::read<uint8_t>(DMK::Address{c_player + Constants::OFFSET_AIMING_FLAG});
             return (flag && *flag == 0) ? state_bit(GameState::Aiming) : 0;
         }
 
@@ -370,7 +379,7 @@ namespace TPVCamera
 
     uint32_t parse_state_mask(std::string_view csv)
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
         uint32_t mask = 0;
 
         size_t start = 0;
@@ -463,10 +472,9 @@ namespace TPVCamera
         {
             s_dbg_last_mask = mask;
             s_dbg_last_stance = stance;
-            DMK::Logger::get_instance().trace(
-                "GameState: raw=0x{:X} stance={} camType={} mgMapSize={} menu={} overlay={}", mask, stance,
-                s_dbg_camera_type, s_dbg_minigame_size, is_game_menu_open() ? 1 : 0,
-                overlay_state().active.load(std::memory_order_relaxed) ? 1 : 0);
+            DMK::log().trace("GameState: raw=0x{:X} stance={} camType={} mgMapSize={} menu={} overlay={}", mask, stance,
+                             s_dbg_camera_type, s_dbg_minigame_size, is_game_menu_open() ? 1 : 0,
+                             overlay_state().active.load(std::memory_order_relaxed) ? 1 : 0);
         }
 
         return mask;

@@ -45,11 +45,11 @@ namespace TPVCamera
     static uintptr_t s_p3d_engine_slot_addr = 0;
     // Mapped range of the scanned game module, captured once. A freshly read p3DEngine must carry a vtable
     // inside this image or it is rejected before the indirect call (branch-only contains() test, no syscall).
-    static DMK::Memory::ModuleRange s_game_module{};
+    static DMK::Region s_game_module{};
 
     bool initialize_render_occlusion(uintptr_t module_base, size_t module_size, uintptr_t g_env)
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
 
         if (g_env == 0)
         {
@@ -58,11 +58,12 @@ namespace TPVCamera
         }
 
         s_p3d_engine_slot_addr = g_env + Constants::GENV_3DENGINE_OFFSET;
-        s_game_module = {module_base, module_base + module_size};
+        s_game_module = DMK::Region{DMK::Address{module_base}, module_size};
 
-        logger.info("RenderOcclusion: GetObjectsInBox via C3DEngine vtable slot {}, p3DEngine slot at {}",
-                    DMK::Format::format_address(static_cast<uintptr_t>(Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET)),
-                    DMK::Format::format_address(s_p3d_engine_slot_addr));
+        logger.info(
+            "RenderOcclusion: GetObjectsInBox via C3DEngine vtable slot {}, p3DEngine slot at {}",
+            DMK::format::format_address(static_cast<uintptr_t>(Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET)),
+            DMK::format::format_address(s_p3d_engine_slot_addr));
         return true;
     }
 
@@ -363,6 +364,7 @@ namespace TPVCamera
 
     std::optional<float> render_occlusion_limit(const Vector3 &pivot, const Vector3 &to_camera, float radius)
     {
+        DMK_PROFILE_SCOPE("camera.render_occlusion");
         if (s_p3d_engine_slot_addr == 0)
         {
             return std::nullopt;
@@ -402,17 +404,17 @@ namespace TPVCamera
 
             // Resolve p3DEngine fresh and screen it (set once the 3DEngine exists; must carry an in-image vtable),
             // then resolve GetObjectsInBox from the live C3DEngine vtable slot.
-            const auto p3d = DMK::Memory::seh_read<uintptr_t>(s_p3d_engine_slot_addr);
-            if (p3d && *p3d != 0 && DMK::Memory::plausible_userspace_ptr(*p3d))
+            const auto p3d = DMK::memory::read<uintptr_t>(DMK::Address{s_p3d_engine_slot_addr});
+            if (p3d && *p3d != 0 && DMK::memory::is_plausible_ptr(DMK::Address{*p3d}))
             {
-                const auto vtable = DMK::Memory::seh_read<uintptr_t>(*p3d);
-                if (vtable && DMK::Memory::plausible_userspace_ptr(*vtable) &&
-                    DMK::Memory::contains(s_game_module, *vtable))
+                const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{*p3d});
+                if (vtable && DMK::memory::is_plausible_ptr(DMK::Address{*vtable}) &&
+                    s_game_module.contains(DMK::Address{*vtable}))
                 {
-                    const auto fn_slot =
-                        DMK::Memory::seh_read<uintptr_t>(*vtable + Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET);
-                    if (fn_slot && DMK::Memory::plausible_userspace_ptr(*fn_slot) &&
-                        DMK::Memory::contains(s_game_module, *fn_slot))
+                    const auto fn_slot = DMK::memory::read<uintptr_t>(
+                        DMK::Address{*vtable + Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET});
+                    if (fn_slot && DMK::memory::is_plausible_ptr(DMK::Address{*fn_slot}) &&
+                        s_game_module.contains(DMK::Address{*fn_slot}))
                     {
                         const auto query = reinterpret_cast<GetObjectsInBoxFn>(*fn_slot);
 
@@ -425,8 +427,9 @@ namespace TPVCamera
                         bbox[3] = std::max(pivot.x, camera.x) + margin;
                         bbox[4] = std::max(pivot.y, camera.y) + margin;
                         bbox[5] = std::max(pivot.z, camera.z) + margin;
-                        block = nearest_sightline_block_guarded(reinterpret_cast<void *>(*p3d), query, bbox, pivot,
-                                                                camera, s_game_module.base, s_game_module.end, &hit);
+                        block =
+                            nearest_sightline_block_guarded(reinterpret_cast<void *>(*p3d), query, bbox, pivot, camera,
+                                                            s_game_module.base.raw(), s_game_module.end().raw(), &hit);
                     }
                 }
             }
@@ -438,17 +441,17 @@ namespace TPVCamera
             // Trace WHAT the clamp latched onto, so a false positive (a prop / wall chunk on the sightline
             // instead of a real canopy) is identifiable by name + size + position. Logged only on a re-query
             // that produced a REAL clamp (block < desired), so it neither spams every frame nor logs misses.
-            if (block < desired && DMK::Logger::get_instance().is_enabled(DMK::LogLevel::Trace))
+            if (block < desired && DMK::log().is_enabled(DMK::LogLevel::Trace))
             {
                 char name[256];
                 copy_brush_name(hit.statobj, name, static_cast<int>(sizeof(name)));
-                DMK::Logger::get_instance().trace(
-                    "RenderOcclusion HIT: cgf=\"{}\" node={} statobj={} blockDist={} of {} blockZ={} "
-                    "sizeXYZ=({}, {}, {}) bboxMin=({}, {}, {}) cam=({}, {}, {}) pivot=({}, {}, {})",
-                    name, DMK::Format::format_address(reinterpret_cast<uintptr_t>(hit.node)),
-                    DMK::Format::format_address(reinterpret_cast<uintptr_t>(hit.statobj)), block, desired, hit.roof_z,
-                    hit.max_x - hit.min_x, hit.max_y - hit.min_y, hit.max_z - hit.min_z, hit.min_x, hit.min_y,
-                    hit.min_z, camera.x, camera.y, camera.z, pivot.x, pivot.y, pivot.z);
+                DMK::log().trace("RenderOcclusion HIT: cgf=\"{}\" node={} statobj={} blockDist={} of {} blockZ={} "
+                                 "sizeXYZ=({}, {}, {}) bboxMin=({}, {}, {}) cam=({}, {}, {}) pivot=({}, {}, {})",
+                                 name, DMK::format::format_address(reinterpret_cast<uintptr_t>(hit.node)),
+                                 DMK::format::format_address(reinterpret_cast<uintptr_t>(hit.statobj)), block, desired,
+                                 hit.roof_z, hit.max_x - hit.min_x, hit.max_y - hit.min_y, hit.max_z - hit.min_z,
+                                 hit.min_x, hit.min_y, hit.min_z, camera.x, camera.y, camera.z, pivot.x, pivot.y,
+                                 pivot.z);
             }
         }
 

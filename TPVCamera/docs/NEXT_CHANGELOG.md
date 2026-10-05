@@ -1,5 +1,3 @@
 ## [Title for next release]
 
-- New feature
-- Bug fix
-- Improvement
+- Updated the bundled modding toolkit (DetourModKit) to v4.3.0 for extra stability and future compatibility

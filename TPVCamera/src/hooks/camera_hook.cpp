@@ -27,6 +27,7 @@
 #include "aob_resolver.hpp"
 #include "constants.hpp"
 #include "config.hpp"
+#include "detour_gate.hpp"
 #include "global_state.hpp"
 #include "game_state.hpp"
 #include "game_structures.hpp"
@@ -34,6 +35,7 @@
 #include "math_utils.hpp"
 #include "physics_raycast.hpp"
 #include "render_occlusion.hpp"
+#include "rtti_types.hpp"
 #include "hooks/ui_menu_hooks.hpp"
 #include "hooks/player_onaction_hook.hpp"
 #include "presets/preset_runtime.hpp"
@@ -43,13 +45,15 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <numbers>
 #include <optional>
-#include <stdexcept>
 #include <string>
 
 namespace TPVCamera
@@ -87,18 +91,34 @@ namespace TPVCamera
     // capture mouse-look deltas and freeze the player by not dispatching while orbiting.
     using InputDispatchFunc = void(__fastcall *)(uintptr_t controller, uintptr_t input_event, char flag);
 
-    static FrustumBuildFunc s_frustum_build_original = nullptr;
-    static SetHeadVisibilityFunc s_set_head_visibility_original = nullptr;
-    static InputDispatchFunc s_input_dispatch_original = nullptr;
+    // Trampoline slots, published by DetourGate::arm before each hook arms and read by the detours.
+    static std::atomic<FrustumBuildFunc> s_frustum_build_original{nullptr};
+    static std::atomic<SetHeadVisibilityFunc> s_set_head_visibility_original{nullptr};
+    static std::atomic<InputDispatchFunc> s_input_dispatch_original{nullptr};
+
+    /**
+     * @brief The zoom hold bindings resolved to BindingTokens for the per-frame query.
+     * @details Acquired on the control plane (refresh_zoom_binding_tokens: after the input engine starts and after
+     *          every INI reload, the only places their bindings reshape) and published whole, so the render thread
+     *          never resolves a binding name itself. A token left stale by a reshape reads "not held" (fail closed)
+     *          until the reload callback republishes, a window of a few milliseconds.
+     */
+    struct ZoomBindingTokens
+    {
+        DMK::input::BindingToken zoom_in;
+        DMK::input::BindingToken zoom_out;
+    };
+    static std::atomic<std::shared_ptr<const ZoomBindingTokens>> s_zoom_tokens;
+
+    // Teardown hand-off (release_camera_on_game_thread). The control thread raises s_release_requested; the next
+    // frustum-builder call on the render thread hands every per-frame override back to the engine, latches
+    // s_release_done, and from then on leaves the view to the game until the hooks are retired.
+    static std::atomic<bool> s_release_requested{false};
+    static std::atomic<bool> s_release_done{false};
 
     // Resolved SSystemGlobalEnvironment (g_env) base, set once at init (runtime AOB cascade; 0 if it does not
     // resolve). Reused by the player/animchar walks; p_physical_world is g_env + PHYSICAL_WORLD_OFFSET.
     static uintptr_t s_genv_runtime = 0;
-
-    // CView vtable address, cached lazily on the first frustum-builder camera whose embedding object
-    // passes the CView RTTI check. The steady-state game-view gate is then a single qword compare;
-    // using the RTTI type name (not a hardcoded address) keeps the gate working across game patches.
-    static uintptr_t s_cview_vtable_runtime = 0;
 
     // Latched from the head-visibility setter so the per-frame re-assert can drive the head
     // without waiting for the game to call the setter again (toggling the offset does not
@@ -246,7 +266,7 @@ namespace TPVCamera
      *          value is the CCryAction object pointer; it is null until the framework is constructed (0 is
      *          returned then and the caller retries next frame) and 0 is also returned if the cascade did not
      *          resolve. Render-thread safe: anchor_address() is a lock-free read of a value resolved once at
-     *          init, and the slot deref is SEH-guarded.
+     *          init, and the slot deref is a guarded read.
      */
     static uintptr_t resolve_cry_action() noexcept
     {
@@ -255,21 +275,22 @@ namespace TPVCamera
         {
             return 0;
         }
-        const auto cry_action = DMK::Memory::seh_read<uintptr_t>(fw_slot);
-        return (cry_action && DMK::Memory::plausible_userspace_ptr(*cry_action)) ? *cry_action : 0;
+        const auto cry_action = DMK::memory::read<uintptr_t>(DMK::Address{fw_slot});
+        return (cry_action && DMK::memory::is_plausible_ptr(DMK::Address{*cry_action})) ? *cry_action : 0;
     }
 
     /**
      * @brief Resolves the live C_Player via the CCryAction framework each frame (validated by its vtable); 0 on
      *        failure.
-     * @details Walks CCryAction (resolve_cry_action(): the g_pGameFramework slot, static offset fallback) ->
-     *          p_action_game -> C_Player, then
-     *          confirms C_Player by its main vtable. Resolving FRESH every frame -- rather than trusting a
+     * @details Walks CCryAction (resolve_cry_action(): the g_pGameFramework slot) -> p_action_game -> C_Player,
+     *          then confirms C_Player by its main vtable. Resolving FRESH every frame -- rather than trusting a
      *          mirrored pointer that goes null/stale across view transitions and reloads -- is what keeps the
-     *          move-detection and body-turn locked onto the CURRENT player. Always called from within an SEH
-     *          frame (the frustum detour / the body-turn wrapper), so a fault during the walk is contained.
+     *          move-detection and body-turn locked onto the CURRENT player. Every read is a DetourModKit guarded
+     *          read, so a stale link reports a miss instead of faulting. Each live base the walk resolves is
+     *          published to its self-heal group (note_*_base); the scheduler, ticked once per frame by the
+     *          frustum detour, owns when the syscall-heavy scans actually run.
      */
-    static uintptr_t resolve_c_player()
+    static uintptr_t resolve_c_player() noexcept
     {
         const ModuleInfo &mod = module_info();
         if (mod.base == 0)
@@ -284,71 +305,56 @@ namespace TPVCamera
         {
             return 0;
         }
-        // Heal the CCryAction -> CActionGame offset once (keyed on CActionGame RTTI) before reading through it:
-        // it is the root of the actor chain, so a layout shift here would silently break every walk below.
-        // Latches on success, so it is nominal until CActionGame is constructed, then fixed.
-        heal_framework_offset(cry_action);
+        // Publish the chain root for the CCryAction -> CActionGame heal group. The scheduler owns the cadence and
+        // the latch: its gate stays shut (silently) until the slot holds a constructed CActionGame, so the offset
+        // is nominal until then and fixed afterwards. A layout shift here would silently break every walk below,
+        // which is why it is the first group registered.
+        note_framework_base(cry_action);
         RuntimeOffsets &offsets = runtime_offsets();
 
-        const auto p_action_game = DMK::Memory::seh_read<uintptr_t>(
-            cry_action + offsets.ccryaction_actiongame.load(std::memory_order_relaxed));
-        if (!p_action_game || !DMK::Memory::plausible_userspace_ptr(*p_action_game))
+        const auto p_action_game =
+            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offset_value(offsets.ccryaction_actiongame)});
+        if (!p_action_game || !DMK::memory::is_plausible_ptr(DMK::Address{*p_action_game}))
         {
             return 0;
         }
+        note_action_game_base(*p_action_game);
 
         // Read the local actor through the self-healed local-actor offset, then confirm it is a real C_Player
         // by its vtable. C_Player is found THROUGH this offset, so the offset cannot be healed from a resolved
         // C_Player; instead, when the cached slot holds a populated object that is NOT a C_Player (the
-        // signature of a CActionGame layout drift), attempt a bounded recovery scan and re-read. The nominal
-        // slot is probed first inside the heal, so an undrifted build never scans.
-        auto player = DMK::Memory::seh_read<uintptr_t>(*p_action_game +
-                                                       offsets.cactiongame_local_actor.load(std::memory_order_relaxed));
-        const auto is_c_player = [](const std::optional<uintptr_t> &candidate)
+        // signature of a CActionGame layout drift), the local-actor heal group is asked to recover it.
+        auto player =
+            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offset_value(offsets.cactiongame_local_actor)});
+        const auto is_c_player = [](const DMK::Result<uintptr_t> &candidate) noexcept
         {
-            if (!candidate || !DMK::Memory::plausible_userspace_ptr(*candidate))
+            if (!candidate || !DMK::memory::is_plausible_ptr(DMK::Address{*candidate}))
             {
                 return false;
             }
-            const auto vt = DMK::Memory::seh_read<uintptr_t>(*candidate);
-            return vt.has_value() && DMK::Rtti::vtable_is_type(*vt, Constants::C_PLAYER_RTTI_NAME);
+            const auto vt = DMK::memory::read<uintptr_t>(DMK::Address{*candidate});
+            return vt.has_value() && vtable_is(GameClass::Player, *vt);
         };
-        bool player_valid = is_c_player(player);
-        if (!player_valid && player && DMK::Memory::plausible_userspace_ptr(*player))
+        const bool player_valid = is_c_player(player);
+        if (!player_valid && player && DMK::memory::is_plausible_ptr(DMK::Address{*player}))
         {
             // The cached slot holds a populated object that is NOT a C_Player: the signature of a CActionGame
-            // layout drift. Recover the offset by scanning CActionGame for the C_Player slot, then re-read and
-            // re-validate. A successful recovery updates the cache, so the read above succeeds on later frames
-            // and this branch stops being entered (the natural stop). The scan is RATE-LIMITED to a fixed frame
-            // interval rather than capped by a fixed number of attempts: the heal contract forbids scanning
-            // every frame (it is syscall-heavy), but a hard attempt cap could be exhausted by a slow save/level
-            // load, where the real player may not be seated until many seconds after this slot first reads
-            // populated-but-wrong, permanently disabling recovery before the player even exists. An interval
-            // never gives up, so it keeps retrying until the player appears; on a truly unrecoverable drift it
-            // settles into a cheap periodic scan, not a per-frame one. The first entered frame scans immediately
-            // (counter starts at 0), so an undrifted-with-real-drift build recovers on the first opportunity.
-            constexpr int k_local_actor_retry_interval_frames = 30; // about 0.5s at 60 FPS between scans
-            static int s_frames_until_retry = 0;
-            if (s_frames_until_retry > 0)
-            {
-                --s_frames_until_retry;
-            }
-            else
-            {
-                s_frames_until_retry = k_local_actor_retry_interval_frames;
-                const std::ptrdiff_t healed = heal_local_actor_offset(*p_action_game);
-                player = DMK::Memory::seh_read<uintptr_t>(*p_action_game + healed);
-                player_valid = is_c_player(player);
-            }
+            // layout drift, and ALSO the transient seen while the real player is still seating in during a
+            // load. Open the local-actor heal group's gate and let the scheduler recover the offset on its own
+            // cadence; it scans CActionGame for the C_Player slot and latches once it resolves. The read above
+            // then succeeds on a later frame and this branch stops being entered (the natural stop). The
+            // request is idempotent, so a frame that re-enters here simply re-asserts it: the scheduler, not
+            // this call site, owns the "do not scan every frame" rate limit and the never-give-up retry.
+            request_local_actor_recovery();
         }
         if (!player_valid)
         {
             return 0;
         }
 
-        // A real C_Player is in hand: heal its rooted offsets once (one-shot internally), so the per-frame aim
-        // and body-turn walks read the recovered offsets on a drifted build.
-        heal_player_offsets(*player);
+        // A real C_Player is in hand (vtable validated above): publish it for the player-rooted heal groups, so
+        // the per-frame aim and body-turn walks read the recovered offsets on a drifted build.
+        note_player_base(*player);
 
         // Log the resolved C_Player and the static CCryAction only when the player pointer CHANGES (once on
         // first resolve, and again after a reload / new player) so the address is available for external
@@ -358,9 +364,8 @@ namespace TPVCamera
             if (*player != s_logged_player)
             {
                 s_logged_player = *player;
-                DMK::Logger::get_instance().debug("C_Player resolved={} (CCryAction={})",
-                                                  DMK::Format::format_address(*player),
-                                                  DMK::Format::format_address(cry_action));
+                (void)DMK::log().try_log(DMK::LogLevel::Debug, "C_Player resolved={} (CCryAction={})",
+                                         DMK::format::format_address(*player), DMK::format::format_address(cry_action));
             }
         }
 
@@ -373,20 +378,26 @@ namespace TPVCamera
 
     /**
      * @brief Resolves the player look controller and drives the real aim while orbiting: eases the PITCH
-     *        toward level and/or sets the YAW (heading). Separated from the SEH wrapper so this frame
-     *        holds no unwinding objects.
-     * @details Walks the player look chain (CCryAction via resolve_cry_action() -> p_action_game -> C_Player -> look controller;
-     *          see constants.hpp) and validates C_Player by its vtable. The look quaternion the cameras read
-     *          is RE-DERIVED from the controller's scalar pitch every frame, so writing that scalar (not the
-     *          derived quat, which is overwritten) is what actually moves the eye and the character head. The
-     *          mod redirects the look input while orbiting, so the writes stick; on any failure it returns
-     *          without writing and the camera-side level blend still levels the view. CCryAction is resolved
-     *          build-agnostically via resolve_cry_action() (g_pGameFramework slot); the rest is a guarded walk.
+     *        toward level and/or sets the YAW (heading).
+     * @details Walks the player look chain (CCryAction via resolve_cry_action() -> p_action_game -> C_Player ->
+     *          look controller; see constants.hpp) and validates C_Player by its vtable. The look quaternion the
+     *          cameras read is RE-DERIVED from the controller's scalar pitch every frame, so writing that scalar
+     *          (not the derived quat, which is overwritten) is what actually moves the eye and the character
+     *          head. The mod redirects the look input while orbiting, so the writes stick; on any failure it
+     *          returns without writing and the camera-side level blend still levels the view.
+     *
+     *          Every read is a guarded read and every store goes through DMK::memory::write_in_place, the library's
+     *          per-frame data write: a guarded copy that changes NO page protection and fails closed with
+     *          WriteFaulted when the target is not already writable. That is the right primitive for a value
+     *          written every frame through a RESOLVED address (a pointer chain that can go stale between
+     *          frames), and it is why this function needs no SEH wrapper of its own: a stale chain reports a
+     *          fault instead of raising one. It is also an out-of-line library call, so the consume-once store
+     *          the engine reads on its own thread cannot be elided.
      * @param pitch_ease Per-frame fraction to move the look pitch toward level, in [0, 1] (0 = leave it).
      * @param set_yaw When true, the look yaw is set to yaw_value to align the heading to the camera.
      * @param yaw_value Target look yaw in radians (engine convention: forward = (-sin yaw, cos yaw)).
      */
-    static void apply_orbit_aim_control_impl(float pitch_ease, bool set_yaw, float yaw_value)
+    static void apply_orbit_aim_control(float pitch_ease, bool set_yaw, float yaw_value) noexcept
     {
         const ModuleInfo &mod = module_info();
         if (mod.base == 0)
@@ -401,49 +412,55 @@ namespace TPVCamera
         {
             return;
         }
-        // Heal the chain-root CCryAction -> CActionGame offset once (one-shot internally), as the resolver does.
-        heal_framework_offset(cry_action);
+        // Publish the chain root for its heal group, as the resolver does.
+        note_framework_base(cry_action);
 
-        const auto p_action_game = DMK::Memory::seh_read<uintptr_t>(
-            cry_action + runtime_offsets().ccryaction_actiongame.load(std::memory_order_relaxed));
-        if (!p_action_game || !DMK::Memory::plausible_userspace_ptr(*p_action_game))
+        const RuntimeOffsets &offsets = runtime_offsets();
+        const auto p_action_game =
+            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offset_value(offsets.ccryaction_actiongame)});
+        if (!p_action_game || !DMK::memory::is_plausible_ptr(DMK::Address{*p_action_game}))
         {
             return;
         }
-        const auto c_player = DMK::Memory::seh_read<uintptr_t>(
-            *p_action_game + runtime_offsets().cactiongame_local_actor.load(std::memory_order_relaxed));
-        if (!c_player || !DMK::Memory::plausible_userspace_ptr(*c_player))
+        const auto c_player =
+            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offset_value(offsets.cactiongame_local_actor)});
+        if (!c_player || !DMK::memory::is_plausible_ptr(DMK::Address{*c_player}))
         {
             return;
         }
         // Confirm this is really C_Player (its main vtable) before trusting the controller offset.
-        const auto vt = DMK::Memory::seh_read<uintptr_t>(*c_player);
-        if (!vt || !DMK::Rtti::vtable_is_type(*vt, Constants::C_PLAYER_RTTI_NAME))
+        const auto vt = DMK::memory::read<uintptr_t>(DMK::Address{*c_player});
+        if (!vt || !vtable_is(GameClass::Player, *vt))
         {
             return;
         }
-        const auto controller = DMK::Memory::seh_read<uintptr_t>(
-            *c_player + runtime_offsets().c_player_look_controller.load(std::memory_order_relaxed));
-        if (!controller || !DMK::Memory::plausible_userspace_ptr(*controller))
+        // This offset decides where a WRITE lands, so demand a Confirmed heal rather than accepting the retained
+        // nominal: on a genuinely drifted C_Player the store would land in whatever member now occupies the slot.
+        // A miss simply skips the aim control for the frame (fail closed); the camera-side level blend still
+        // levels the view.
+        const auto look_controller_offset = write_authorized_offset(offsets.c_player_look_controller);
+        if (!look_controller_offset)
+        {
+            return;
+        }
+        const auto controller = DMK::memory::read<uintptr_t>(DMK::Address{*c_player + *look_controller_offset});
+        if (!controller || !DMK::memory::is_plausible_ptr(DMK::Address{*controller}))
         {
             return;
         }
         // Ease the SCALAR pitch toward 0 (level). Both synchronized copies are written so any internal
         // current/target smoothing also settles at level. A sane pitch is within about +/- 1.6 rad; a
-        // wild or non-finite value means the layout drifted, so that write is skipped. The stores go
-        // through a volatile pointer: the engine consumes these scalars on its own thread, so volatile
-        // makes the consume-once write explicit and stops the compiler eliding or reordering it (the same
-        // foreign-write intent the body-turn active byte uses; this is a hardware-I/O-style boundary, not
-        // inter-thread synchronization of our own state).
+        // wild or non-finite value means the layout drifted, so that write is skipped.
         if (pitch_ease > 0.0f)
         {
-            const uintptr_t pitch_addr = *controller + Constants::LOOK_CONTROLLER_PITCH_OFFSET;
-            const auto pitch_value = DMK::Memory::seh_read<float>(pitch_addr);
+            const DMK::Address pitch_addr{*controller + Constants::LOOK_CONTROLLER_PITCH_OFFSET};
+            const auto pitch_value = DMK::memory::read<float>(pitch_addr);
             if (pitch_value && *pitch_value > -3.2f && *pitch_value < 3.2f)
             {
                 const float levelled = *pitch_value * (1.0f - pitch_ease);
-                *reinterpret_cast<volatile float *>(pitch_addr) = levelled;
-                *reinterpret_cast<volatile float *>(*controller + Constants::LOOK_CONTROLLER_PITCH2_OFFSET) = levelled;
+                (void)DMK::memory::write_in_place<float>(pitch_addr, levelled);
+                (void)DMK::memory::write_in_place<float>(
+                    DMK::Address{*controller + Constants::LOOK_CONTROLLER_PITCH2_OFFSET}, levelled);
             }
         }
 
@@ -456,21 +473,6 @@ namespace TPVCamera
     }
 
     /**
-     * @brief SEH wrapper for the player-aim control: a stale pointer or layout drift in the look chain
-     *        must never crash the game. On a fault the aim is simply left unchanged for the frame.
-     */
-    static void apply_orbit_aim_control(float pitch_ease, bool set_yaw, float yaw_value)
-    {
-        __try
-        {
-            apply_orbit_aim_control_impl(pitch_ease, set_yaw, yaw_value);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-    }
-
-    /**
      * @brief Forces the player BODY to face a world yaw, making movement+facing camera-relative.
      * @details The look controller (apply_orbit_aim_control) is aim-only: writing its yaw steers the
      *          movement frame but does not turn the body. The body heading is owned by the engine's
@@ -480,13 +482,12 @@ namespace TPVCamera
      *          rotation for the frame, replacing the animation-derived facing, then clears the active
      *          byte. It is consume-once, so this is called every frame while the heading is held.
      *
-     *          Resolution mirrors apply_orbit_aim_control_impl: static CCryAction -> p_action_game ->
-     *          C_Player (validated vtable) -> C_AnimatedHuman -> CAnimatedCharacter, validated by the
-     *          animchar vtable before any write. The quat is written before the active byte so the game
-     *          never observes active==1 with a torn/stale quat.
-     *          See constants.hpp (ANIMCHAR_*, C_PLAYER_ANIMATED_HUMAN_OFFSET) for the offsets.
+     *          Resolution mirrors apply_orbit_aim_control: CCryAction -> p_action_game -> C_Player (validated
+     *          vtable) -> C_AnimatedHuman -> CAnimatedCharacter, validated by the animchar vtable before any
+     *          write. The quat is written before the active byte so the game never observes active==1 with a
+     *          torn/stale quat. See constants.hpp (ANIMCHAR_*, C_PLAYER_ANIMATED_HUMAN_OFFSET) for the offsets.
      */
-    static void apply_orbit_body_turn_impl(float target_yaw)
+    static void apply_orbit_body_turn(float target_yaw) noexcept
     {
         const ModuleInfo &mod = module_info();
         const uintptr_t c_player = resolve_c_player();
@@ -495,84 +496,90 @@ namespace TPVCamera
             return;
         }
 
-        // C_Player -> C_AnimatedHuman (+0x2F8) -> CAnimatedCharacter (+0x20). Validate the animchar vtable
-        // before touching its override fields; a mismatch means the layout drifted, so skip this frame.
+        // C_Player -> C_AnimatedHuman (+0x2F8) -> CAnimatedCharacter (+0x20). Both offsets decide where a WRITE
+        // lands, so each must be a Confirmed heal rather than a retained nominal; on a drifted layout the quat
+        // would otherwise be stored over whatever member now occupies the slot. A miss skips the body turn for
+        // the frame (fail closed).
         const RuntimeOffsets &offsets = runtime_offsets();
-        const auto animated_human = DMK::Memory::seh_read<uintptr_t>(
-            c_player + offsets.c_player_animated_human.load(std::memory_order_relaxed));
-        if (!animated_human || !DMK::Memory::plausible_userspace_ptr(*animated_human))
-        {
-            return;
-        }
-        const auto anim_char = DMK::Memory::seh_read<uintptr_t>(
-            *animated_human + offsets.animated_human_animchar.load(std::memory_order_relaxed));
-        if (!anim_char || !DMK::Memory::plausible_userspace_ptr(*anim_char))
-        {
-            return;
-        }
-        const auto avt = DMK::Memory::seh_read<uintptr_t>(*anim_char);
-        if (!avt || !DMK::Rtti::vtable_is_type(*avt, Constants::ANIMATED_CHARACTER_RTTI_NAME))
+        const auto animated_human_offset = write_authorized_offset(offsets.c_player_animated_human);
+        const auto animchar_offset = write_authorized_offset(offsets.animated_human_animchar);
+        if (!animated_human_offset || !animchar_offset)
         {
             return;
         }
 
-        // Yaw-only world quat (XYZW): rotation about +Z by target_yaw == {0, 0, sin(y/2), cos(y/2)}.
+        // One guarded walk instead of a read-and-screen per hop: walk() reads each hop under the same fault
+        // guard, screens it against the plausibility floor, and reports the failing hop index on a miss.
+        const std::array<std::ptrdiff_t, 3> animchar_chain{*animated_human_offset, *animchar_offset, 0};
+        const auto anim_char = DMK::memory::walk(DMK::Address{c_player}, animchar_chain);
+        if (!anim_char || !DMK::memory::is_plausible_ptr(*anim_char))
+        {
+            return;
+        }
+        // Validate the animchar vtable before touching its override fields; a mismatch means the layout
+        // drifted, so skip this frame.
+        const auto avt = DMK::memory::read<uintptr_t>(*anim_char);
+        if (!avt || !vtable_is(GameClass::AnimatedCharacter, *avt))
+        {
+            return;
+        }
+
+        // Yaw-only world quat (XYZW): rotation about +Z by target_yaw == {0, 0, sin(y/2), cos(y/2)}. The four
+        // components are contiguous and written as ONE guarded store, so the quat cannot straddle a protection
+        // boundary mid-write and there is no per-component call. DMK::memory::write_in_place is the per-frame data
+        // write: guarded, no protection change, and it fails closed instead of faulting the host when the
+        // resolved chain has gone stale - which is why this function needs no SEH wrapper of its own.
         const float half = target_yaw * 0.5f;
-        const uintptr_t quat_addr = *anim_char + Constants::ANIMCHAR_OVERRIDE_ROT_QUAT_OFFSET;
-        *reinterpret_cast<float *>(quat_addr + Constants::QUAT_X_OFFSET) = 0.0f;
-        *reinterpret_cast<float *>(quat_addr + Constants::QUAT_Y_OFFSET) = 0.0f;
-        *reinterpret_cast<float *>(quat_addr + Constants::QUAT_Z_OFFSET) = std::sin(half);
-        *reinterpret_cast<float *>(quat_addr + Constants::QUAT_W_OFFSET) = std::cos(half);
+        const std::array<float, 4> quat{0.0f, 0.0f, std::sin(half), std::cos(half)};
+        static_assert(Constants::QUAT_X_OFFSET == 0 && Constants::QUAT_Y_OFFSET == 4 && Constants::QUAT_Z_OFFSET == 8 &&
+                          Constants::QUAT_W_OFFSET == 12,
+                      "The quat components must be contiguous XYZW floats for the single-store write.");
+        if (!DMK::memory::write_in_place<std::array<float, 4>>(
+                anim_char->offset(Constants::ANIMCHAR_OVERRIDE_ROT_QUAT_OFFSET), quat))
+        {
+            return;
+        }
         // Set the active byte LAST so the animated-character update (a separate consumer) never reads
-        // active==1 with a half-written quat. The release fence orders the quat stores before the active
+        // active==1 with a half-written quat. The release fence orders the quat store before the active
         // store explicitly rather than relying on the target's store-store ordering; on x86 it lowers to a
         // compiler barrier with no runtime cost.
         std::atomic_thread_fence(std::memory_order_release);
-        *reinterpret_cast<volatile unsigned char *>(*anim_char + Constants::ANIMCHAR_OVERRIDE_ROT_ACTIVE_OFFSET) = 1;
-    }
-
-    /**
-     * @brief SEH wrapper for the body-turn: a stale animated-character pointer or layout drift must
-     *        never crash the game. On a fault the body is simply left unchanged for the frame.
-     */
-    static void apply_orbit_body_turn(float target_yaw)
-    {
-        __try
-        {
-            apply_orbit_body_turn_impl(target_yaw);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
+        (void)DMK::memory::write_in_place<unsigned char>(
+            anim_char->offset(Constants::ANIMCHAR_OVERRIDE_ROT_ACTIVE_OFFSET), 1);
     }
 
     /**
      * @brief Writes the player's body-relative move input (C_PlayerInput +0x58 x, +0x5C y), validated by the
-     *        C_PlayerInput RTTI vtable. Keyboard movement is digital edge-events the engine holds internally;
+     *        C_PlayerInput class identity. Keyboard movement is digital edge-events the engine holds internally;
      *        writing this field each frame OVERRIDES the held keys, and because it is a FIELD write (not an xi_*
-     *        action) it does NOT flip the HUD device glyphs. Raw writes -- the SEH wrapper guards a stale pointer.
+     *        action) it does NOT flip the HUD device glyphs. Guarded reads and one guarded store, so a stale
+     *        C_PlayerInput reports a miss instead of faulting.
      */
-    static void write_player_input_move_impl(uintptr_t player_input, float x, float y)
+    static void write_player_input_move(uintptr_t player_input, float x, float y) noexcept
     {
         const ModuleInfo &mod = module_info();
-        if (mod.base == 0 || player_input == 0)
+        if (mod.base == 0 || player_input == 0 || !DMK::memory::is_plausible_ptr(DMK::Address{player_input}))
         {
             return;
         }
-        const uintptr_t vtable = *reinterpret_cast<uintptr_t *>(player_input);
-        if (!DMK::Rtti::vtable_is_type(vtable, Constants::C_PLAYERINPUT_RTTI_NAME))
+        const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{player_input});
+        if (!vtable || !vtable_is(GameClass::PlayerInput, *vtable))
         {
             return;
         }
         // Ensure this is the PLAYER's C_PlayerInput (its +0x10 backref is C_Player), not some other instance,
         // before writing its move field.
-        if (*reinterpret_cast<uintptr_t *>(player_input + Constants::C_PLAYERINPUT_PLAYER_BACKREF_OFFSET) !=
-            resolve_c_player())
+        const auto owner =
+            DMK::memory::read<uintptr_t>(DMK::Address{player_input + Constants::C_PLAYERINPUT_PLAYER_BACKREF_OFFSET});
+        if (!owner || *owner != resolve_c_player())
         {
             return;
         }
-        *reinterpret_cast<float *>(player_input + Constants::C_PLAYERINPUT_MOVE_X_OFFSET) = x;
-        *reinterpret_cast<float *>(player_input + Constants::C_PLAYERINPUT_MOVE_Y_OFFSET) = y;
+        static_assert(Constants::C_PLAYERINPUT_MOVE_Y_OFFSET == Constants::C_PLAYERINPUT_MOVE_X_OFFSET + 4,
+                      "The move input must be contiguous {x, y} floats for the single-store write.");
+        const std::array<float, 2> move{x, y};
+        (void)DMK::memory::write_in_place<std::array<float, 2>>(
+            DMK::Address{player_input + Constants::C_PLAYERINPUT_MOVE_X_OFFSET}, move);
     }
 
     /**
@@ -581,31 +588,24 @@ namespace TPVCamera
      *        direction and sprint engages (KCD drops sprint on non-forward input). The caller computes the vector
      *        per frame (pure-forward while turning, the real keys rotated by the eased facing while disengaging),
      *        so when inactive there is nothing to restore -- the engine drives the keyboard move input normally.
-     *        SEH-guarded: a stale C_PlayerInput must never crash.
      */
-    static void apply_keyboard_move_override(bool active, float x, float y)
+    static void apply_keyboard_move_override(bool active, float x, float y) noexcept
     {
         static bool s_prev = false;
         const uintptr_t player_input = player_onaction_player_input();
-        __try
+        if (active)
         {
-            if (active)
-            {
-                write_player_input_move_impl(player_input, x, y);
-            }
-            else if (s_prev)
-            {
-                // Falling edge: the override stopped this frame. Write the REAL keys (0,0 if released) ONCE so the
-                // move field is not stranded at the last override value -- otherwise the character never stops.
-                // After this the engine drives the keyboard move input normally.
-                float real_fwd = 0.0f;
-                float real_lat = 0.0f;
-                (void)player_onaction_keyboard_move_vector(real_fwd, real_lat);
-                write_player_input_move_impl(player_input, real_lat, real_fwd);
-            }
+            write_player_input_move(player_input, x, y);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        else if (s_prev)
         {
+            // Falling edge: the override stopped this frame. Write the REAL keys (0,0 if released) ONCE so the
+            // move field is not stranded at the last override value -- otherwise the character never stops.
+            // After this the engine drives the keyboard move input normally.
+            float real_fwd = 0.0f;
+            float real_lat = 0.0f;
+            (void)player_onaction_keyboard_move_vector(real_fwd, real_lat);
+            write_player_input_move(player_input, real_lat, real_fwd);
         }
         s_prev = active;
     }
@@ -632,15 +632,22 @@ namespace TPVCamera
 
         // Follow distance = configured base (hot-reloadable INI FollowDistance, re-read every
         // frame so an edit applies live) plus the accumulated zoom offset from the hold
-        // keys (queried lock-free, render thread safe), clamped to the configured window.
-        const DMK::InputManager &input = DMK::InputManager::get_instance();
+        // keys, clamped to the configured window. The holds are queried through the BindingTokens the control
+        // plane publishes (refresh_zoom_binding_tokens), the library's per-frame form of the query; before the
+        // first publish the name-based query stands in.
+        const DMK::input::Input &input = DMK::input::Input::instance();
+        const std::shared_ptr<const ZoomBindingTokens> zoom_tokens = s_zoom_tokens.load(std::memory_order_acquire);
+        const bool zoom_in_held =
+            zoom_tokens ? input.is_active(zoom_tokens->zoom_in) : input.is_active(k_zoom_in_binding);
+        const bool zoom_out_held =
+            zoom_tokens ? input.is_active(zoom_tokens->zoom_out) : input.is_active(k_zoom_out_binding);
         float zoom_offset = cam.zoom_offset.load(std::memory_order_relaxed);
         const float zoom_step = cfg.zoom_step.load(std::memory_order_relaxed);
-        if (input.is_binding_active(k_zoom_in_binding))
+        if (zoom_in_held)
         {
             zoom_offset -= zoom_step * delta_time; // zoom in pulls the camera closer
         }
-        if (input.is_binding_active(k_zoom_out_binding))
+        if (zoom_out_held)
         {
             zoom_offset += zoom_step * delta_time;
         }
@@ -656,14 +663,15 @@ namespace TPVCamera
         // than the matrix columns keeps the basis idempotent across the frustum builder's same-frame
         // rebuilds (we overwrite the matrix, never the pose, so the pose stays the clean eye input).
         // The matrix to offset is the camera's 3x4 at offset 0 (cview + SVIEWPARAMS_VIEWMATRIX_OFFSET).
-        // The eye pose is read through seh_read (memcpy semantics into a trivially-copyable Vector3 /
-        // Quaternion): it screens the source against the low-address floor and a wrap guard, swallows an
-        // access fault via its own SEH frame, and avoids the type-pun UB of a placement reinterpret_cast
-        // read, so a stale/torn cview fails closed here rather than depending solely on the outer detour
-        // SEH frame.
-        const auto eye_position_read = DMK::Memory::seh_read<Vector3>(cview + Constants::SVIEWPARAMS_POSITION_OFFSET);
+        // The eye pose is read through DMK::memory::read (memcpy semantics into a representation-safe Vector3 /
+        // Quaternion): it screens the source against the user-mode window and a wrap guard, reports an
+        // access fault as an Error from its own guard, and avoids the type-pun UB of a placement
+        // reinterpret_cast read, so a stale/torn cview fails closed here rather than depending solely on the
+        // outer detour SEH frame.
+        const auto eye_position_read =
+            DMK::memory::read<Vector3>(DMK::Address{cview + Constants::SVIEWPARAMS_POSITION_OFFSET});
         const auto eye_rotation_read =
-            DMK::Memory::seh_read<Quaternion>(cview + Constants::SVIEWPARAMS_ROTATION_OFFSET);
+            DMK::memory::read<Quaternion>(DMK::Address{cview + Constants::SVIEWPARAMS_ROTATION_OFFSET});
         if (!eye_position_read || !eye_rotation_read)
         {
             return; // CView pose read faulted; leave the view untouched this frame
@@ -689,7 +697,7 @@ namespace TPVCamera
         {
             const float fov_target_degrees = cfg.fov.load(std::memory_order_relaxed);
             const float desired_fov =
-                (fov_target_degrees > 0.0f) ? DMK::Math::degrees_to_radians(fov_target_degrees) : game_fov;
+                (fov_target_degrees > 0.0f) ? DMK::math::degrees_to_radians(fov_target_degrees) : game_fov;
             const float speed = cfg.preset_blend_speed.load(std::memory_order_relaxed);
             if (!cam.fov_ease_valid) // first engaged frame after a first-person gap: snap, no ease across the gap
             {
@@ -756,17 +764,17 @@ namespace TPVCamera
             uintptr_t entity_addr = 0;
             if (c_player != 0)
             {
-                const auto ent = DMK::Memory::seh_read<uintptr_t>(
-                    c_player + runtime_offsets().c_player_entity.load(std::memory_order_relaxed));
-                if (ent && DMK::Memory::plausible_userspace_ptr(*ent))
+                const auto ent = DMK::memory::read<uintptr_t>(
+                    DMK::Address{c_player + offset_value(runtime_offsets().c_player_entity)});
+                if (ent && DMK::memory::is_plausible_ptr(DMK::Address{*ent}))
                 {
                     entity_addr = *ent;
                 }
             }
-            if (entity_addr != 0 && DMK::Memory::plausible_userspace_ptr(entity_addr))
+            if (entity_addr != 0 && DMK::memory::is_plausible_ptr(DMK::Address{entity_addr}))
             {
-                const auto world_matrix = DMK::Memory::seh_read<GameStructures::Matrix34f>(
-                    entity_addr + Constants::OFFSET_ENTITY_WORLD_MATRIX_MEMBER);
+                const auto world_matrix = DMK::memory::read<GameStructures::Matrix34f>(
+                    DMK::Address{entity_addr + Constants::OFFSET_ENTITY_WORLD_MATRIX_MEMBER});
                 if (world_matrix)
                 {
                     body_origin = Vector3{world_matrix->m[0][3], world_matrix->m[1][3], world_matrix->m[2][3]};
@@ -919,7 +927,7 @@ namespace TPVCamera
             }
             const float user_orbit_since_deg = steer_smooth ? cam.orbit_steer_smooth : raw_user_since_deg;
             orbit_yaw_deg = std::remainder(
-                DMK::Math::radians_to_degrees(cam.orbit_target_yaw - char_forward_yaw) + user_orbit_since_deg, 360.0f);
+                DMK::math::radians_to_degrees(cam.orbit_target_yaw - char_forward_yaw) + user_orbit_since_deg, 360.0f);
 
             // Settle-hold lifecycle: while holding, watch the eye-look slew and END the hold once the look has
             // been still for k_orbit_settle_still_frames frames AND past the minimum hold (so a brief still BEFORE
@@ -930,7 +938,7 @@ namespace TPVCamera
             if (settle_orbit)
             {
                 const float slew_deg = std::fabs(std::remainder(
-                    DMK::Math::radians_to_degrees(char_forward_yaw - cam.orbit_settle_look_prev), 360.0f));
+                    DMK::math::radians_to_degrees(char_forward_yaw - cam.orbit_settle_look_prev), 360.0f));
                 cam.orbit_settle_look_prev = char_forward_yaw;
                 cam.orbit_settle_elapsed += delta_time;
                 const float slew_rate = (delta_time > 1e-5f) ? (slew_deg / delta_time) : 0.0f;
@@ -1101,7 +1109,7 @@ namespace TPVCamera
             if (follow_yaw < -0.05f || follow_yaw > 0.05f || follow_pitch < -0.05f || follow_pitch > 0.05f)
             {
                 Vector3 off = camera_position - pivot;
-                const float yaw = DMK::Math::degrees_to_radians(follow_yaw);
+                const float yaw = DMK::math::degrees_to_radians(follow_yaw);
                 const float cy = std::cos(yaw);
                 const float sy = std::sin(yaw);
                 auto yaw_about_z = [cy, sy](const Vector3 &v)
@@ -1109,7 +1117,7 @@ namespace TPVCamera
                 off = yaw_about_z(off);
                 look_forward = yaw_about_z(look_forward);
 
-                const float pitch = DMK::Math::degrees_to_radians(follow_pitch);
+                const float pitch = DMK::math::degrees_to_radians(follow_pitch);
                 if (pitch < -1e-5f || pitch > 1e-5f)
                 {
                     const float azimuth = std::atan2(off.y, off.x);
@@ -1187,8 +1195,8 @@ namespace TPVCamera
             }
             const float base_elevation = std::asin(std::clamp(offset0.z / radius, -1.0f, 1.0f));
             const float elevation =
-                std::clamp(base_elevation + DMK::Math::degrees_to_radians(render_pitch_deg), -1.45f, 1.45f);
-            const float yaw_delta = DMK::Math::degrees_to_radians(render_yaw_deg);
+                std::clamp(base_elevation + DMK::math::degrees_to_radians(render_pitch_deg), -1.45f, 1.45f);
+            const float yaw_delta = DMK::math::degrees_to_radians(render_yaw_deg);
             const float pitch_delta = elevation - base_elevation;
 
             // Yaw about world up (Z): applied to both the offset and the look so they swing together.
@@ -1268,7 +1276,7 @@ namespace TPVCamera
                     // points at game-driven movement (finishing-move / combat footwork) being mistaken for intent.
                     // state is the debounced GameState mask (see game_state.hpp) so we can tell whether a combat /
                     // aiming / cinematic state was active when the body-turn engaged.
-                    DMK::Logger::get_instance().trace(
+                    DMK::log().trace(
                         "Orbit: move-orbit START (body-turn engaging) -- move_magnitude={:.2f}, continuous_align={}, "
                         "state_mask=0x{:X}",
                         move_magnitude, cfg.orbit_continuous_align.load(std::memory_order_relaxed),
@@ -1278,7 +1286,7 @@ namespace TPVCamera
                 {
                     // Unarmed (no release seen since orbit engaged) yet reading as movement: a stranded latch.
                     // Suppress the body-turn re-trip and log it once -- the diagnostic for the post-combat case.
-                    DMK::Logger::get_instance().trace(
+                    DMK::log().trace(
                         "Orbit: suppressed a stale move re-trip (magnitude {:.2f}, no release observed since orbit "
                         "engaged; likely a movement latch stranded by a combat action-map swap)",
                         move_magnitude);
@@ -1312,8 +1320,7 @@ namespace TPVCamera
                     // No captured heading: nothing was decoupled, so bake the current angle (legacy behaviour).
                     cam.orbit_yaw.store(orbit_yaw_deg, std::memory_order_relaxed);
                 }
-                DMK::Logger::get_instance().trace(
-                    "Orbit: move-orbit STOP (settle hold begun) -- move_magnitude={:.2f}", move_magnitude);
+                DMK::log().trace("Orbit: move-orbit STOP (settle hold begun) -- move_magnitude={:.2f}", move_magnitude);
             }
             cam.orbit_moving = moving;
         }
@@ -1335,7 +1342,7 @@ namespace TPVCamera
         if (do_align)
         {
             const float eye_forward_yaw = std::atan2(-forward.x, forward.y);
-            cam.orbit_target_yaw = eye_forward_yaw + DMK::Math::degrees_to_radians(orbit_yaw_deg);
+            cam.orbit_target_yaw = eye_forward_yaw + DMK::math::degrees_to_radians(orbit_yaw_deg);
             cam.orbit_target_valid = true;
             // Snapshot the orbit input so further orbiting while moving is measured from here. We do NOT
             // reset the orbit to 0: the world-stable derivation above holds the camera in place while the
@@ -1373,7 +1380,7 @@ namespace TPVCamera
                 (orbit_smoothing > 1e-4f && cam.orbit_steer_valid)
                     ? cam.orbit_steer_smooth
                     : (cam.orbit_yaw.load(std::memory_order_relaxed) - cam.orbit_yaw_at_capture_deg);
-            body_target_yaw = cam.orbit_target_yaw + DMK::Math::degrees_to_radians(user_orbit_since_deg);
+            body_target_yaw = cam.orbit_target_yaw + DMK::math::degrees_to_radians(user_orbit_since_deg);
         }
         if (orbit_held && (pitch_ease > 0.0f || hold_yaw))
         {
@@ -1394,11 +1401,11 @@ namespace TPVCamera
             s_body_turn_engaged = body_turn_active;
             if (body_turn_active)
             {
-                DMK::Logger::get_instance().trace("Camera: orbit body-turn ENGAGED (moving; heading locked to camera)");
+                DMK::log().trace("Camera: orbit body-turn ENGAGED (moving; heading locked to camera)");
             }
             else
             {
-                DMK::Logger::get_instance().trace("Camera: orbit body-turn released");
+                DMK::log().trace("Camera: orbit body-turn released");
             }
         }
         bool orbit_force_forward = false;
@@ -1473,7 +1480,7 @@ namespace TPVCamera
                         static int s_sprint_trace = 0;
                         if ((s_sprint_trace++ % 15) == 0)
                         {
-                            DMK::Logger::get_instance().trace(
+                            DMK::log().trace(
                                 "Orbit: sprint follow-stick -- fwd={:.2f} lat={:.2f} angle={:.1f}deg full_turn={} "
                                 "force_fwd={}",
                                 move_fwd, move_lat, input_angle * 57.2957795f, full_turn, orbit_force_forward);
@@ -1509,7 +1516,7 @@ namespace TPVCamera
                         static int s_kbd_trace = 0;
                         if ((s_kbd_trace++ % 15) == 0)
                         {
-                            DMK::Logger::get_instance().trace(
+                            DMK::log().trace(
                                 "Orbit: keyboard turn-and-run -- fwd={:.2f} lat={:.2f} angle={:.1f}deg full_turn={}",
                                 move_fwd, move_lat, input_angle * 57.2957795f, full_turn);
                         }
@@ -1693,7 +1700,7 @@ namespace TPVCamera
                     static float s_phys_dist = -1.0f;
                     const float dd = blocked ? (hit->m_distance - s_phys_dist) : 0.0f;
                     const bool moved = (dd > 0.1f) || (dd < -0.1f);
-                    const bool trace_on = DMK::Logger::get_instance().is_enabled(DMK::LogLevel::Trace);
+                    const bool trace_on = DMK::log().is_enabled(DMK::LogLevel::Trace);
                     if (trace_on && blocked && (blocked != s_phys_blocked || moved))
                     {
                         // The FAN is the collision AUTHORITY: it carries the real collider + surface normal.
@@ -1704,12 +1711,11 @@ namespace TPVCamera
                         const Vector3 &hn = id_hit.m_normal;
                         const int hit_terrain = id_hit.m_terrain;
                         const uintptr_t collider = id_hit.m_collider;
-                        DMK::Logger::get_instance().trace(
-                            "PhysicsCollision HIT: src={} bTerrain={} dist={} of {} cov={} collider={:#x} "
-                            "point=({}, {}, {}) normal=({}, {}, {}) cam=({}, {}, {}) pivot=({}, {}, {})",
-                            from_sphere ? "sphere" : "fan", hit_terrain, hit->m_distance, desired_distance, blocked_cov,
-                            collider, hp.x, hp.y, hp.z, hn.x, hn.y, hn.z, camera_position.x, camera_position.y,
-                            camera_position.z, pivot.x, pivot.y, pivot.z);
+                        DMK::log().trace("PhysicsCollision HIT: src={} bTerrain={} dist={} of {} cov={} collider={:#x} "
+                                         "point=({}, {}, {}) normal=({}, {}, {}) cam=({}, {}, {}) pivot=({}, {}, {})",
+                                         from_sphere ? "sphere" : "fan", hit_terrain, hit->m_distance, desired_distance,
+                                         blocked_cov, collider, hp.x, hp.y, hp.z, hn.x, hn.y, hn.z, camera_position.x,
+                                         camera_position.y, camera_position.z, pivot.x, pivot.y, pivot.z);
                     }
                     s_phys_blocked = blocked;
                     if (blocked)
@@ -1907,10 +1913,9 @@ namespace TPVCamera
      */
     static void call_head_visibility(uintptr_t entity, bool hide_head)
     {
-        if (s_set_head_visibility_original)
+        if (const SetHeadVisibilityFunc original = s_set_head_visibility_original.load(std::memory_order_acquire))
         {
-            s_set_head_visibility_original(entity, hide_head,
-                                           static_cast<char>(s_head_flags.load(std::memory_order_relaxed)));
+            original(entity, hide_head, static_cast<char>(s_head_flags.load(std::memory_order_relaxed)));
         }
     }
 
@@ -1928,11 +1933,12 @@ namespace TPVCamera
     static void reassert_head_visibility(bool active)
     {
         const uintptr_t entity = s_head_entity.load(std::memory_order_relaxed);
-        if (entity != 0 && DMK::Memory::plausible_userspace_ptr(entity))
+        if (entity != 0 && DMK::memory::is_plausible_ptr(DMK::Address{entity}))
         {
             if (active)
             {
-                const auto hide_flag = DMK::Memory::seh_read<uint8_t>(entity + Constants::OFFSET_ENTITY_HIDE_HEAD_FLAG);
+                const auto hide_flag =
+                    DMK::memory::read<uint8_t>(DMK::Address{entity + Constants::OFFSET_ENTITY_HIDE_HEAD_FLAG});
                 if (hide_flag && *hide_flag != 0)
                 {
                     call_head_visibility(entity, false);
@@ -2050,9 +2056,9 @@ namespace TPVCamera
             // exit it cannot re-trip the body-turn with the keys released (the post-combat self-rotation). Logged
             // with the cleared magnitude so the trace shows whether the latch WAS actually stranded.
             const float stranded = player_onaction_reset();
-            DMK::Logger::get_instance().trace("Orbit: exclude-state entered; cleared move-latch (had magnitude "
-                                              "{:.2f}{})",
-                                              stranded, stranded > k_orbit_move_input_stop ? ", WAS STRANDED" : "");
+            DMK::log().trace("Orbit: exclude-state entered; cleared move-latch (had magnitude "
+                             "{:.2f}{})",
+                             stranded, stranded > k_orbit_move_input_stop ? ", WAS STRANDED" : "");
             // If free-look was on, turn it off and remember to restore it.
             s_suspended_orbit = cam.orbit_active.load(std::memory_order_relaxed);
             if (s_suspended_orbit)
@@ -2083,6 +2089,29 @@ namespace TPVCamera
      */
     static void detour_frustum_build_impl(uintptr_t camera)
     {
+        // Named timing scope for the whole per-frame camera body. Compiles to nothing unless the build sets
+        // DMK_ENABLE_PROFILING, and the collision/occlusion queries carry their own nested scopes, so a
+        // profiling build attributes a frame spike to a specific query instead of "the camera hook".
+        DMK_PROFILE_SCOPE("camera.frustum_build");
+
+        // Teardown: the control thread asked for the per-frame overrides back. Do it HERE, on the render thread
+        // the engine itself drives them on, so the move field and the head-visibility setter are never touched
+        // concurrently with the engine; then leave the view to the game until the hooks are retired.
+        if (s_release_requested.load(std::memory_order_acquire))
+        {
+            if (!s_release_done.load(std::memory_order_relaxed))
+            {
+                // Stop mirroring the offset first, so the head-visibility and input detours pass the game's own
+                // values through from now on.
+                s_offset_active.store(false, std::memory_order_relaxed);
+                apply_keyboard_move_override(false, 0.0f, 0.0f);
+                reassert_head_visibility(false); // restores the game's intended head state once, if it was forced
+                interaction_aim_pose().invalidate();
+                s_release_done.store(true, std::memory_order_release);
+            }
+            return;
+        }
+
         CameraState &cam = camera_state();
         LiveSettings &cfg = settings();
 
@@ -2105,6 +2134,9 @@ namespace TPVCamera
             if (!game_world_ready().load(std::memory_order_relaxed))
             {
                 resolve_c_player();
+                // The probe publishes the chain bases its walk reaches, so let the self-heal scheduler act on
+                // them while the world loads in (the game-view path below ticks it once the offset engages).
+                offset_heal_tick();
             }
             // Offset disengaged: the orbit cannot be capturing, and the cursor flag is only refreshed on
             // the game-view path below, so clear it here to keep it from latching true across the gap.
@@ -2115,34 +2147,31 @@ namespace TPVCamera
         // The camera is embedded in its CView at SVIEWPARAMS_VIEWMATRIX_OFFSET, so the CView is that
         // far below the camera. Confirm it by checking the CView vtable: shadow/reflection/portal
         // cameras handed to the same builder are not embedded in a CView and fail this guard.
-        if (!DMK::Memory::plausible_userspace_ptr(camera))
+        if (!DMK::memory::is_plausible_ptr(DMK::Address{camera}))
         {
             return;
         }
         const uintptr_t cview = camera - Constants::SVIEWPARAMS_VIEWMATRIX_OFFSET;
-        const auto vtable = DMK::Memory::seh_read<uintptr_t>(cview);
-        if (!vtable || !DMK::Memory::plausible_userspace_ptr(*vtable))
+        const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{cview});
+        if (!vtable || !DMK::memory::is_plausible_ptr(DMK::Address{*vtable}))
         {
             return;
         }
-        // Identify the CView by RTTI on the first hit and cache its vtable address, so the
-        // steady-state gate is a single qword compare. Using the RTTI type name rather than a
-        // hardcoded vtable address keeps this resilient across game patches.
-        if (s_cview_vtable_runtime != 0)
-        {
-            if (*vtable != s_cview_vtable_runtime)
-            {
-                return;
-            }
-        }
-        else if (DMK::Rtti::vtable_is_type(*vtable, Constants::CVIEW_RTTI_NAME))
-        {
-            s_cview_vtable_runtime = *vtable;
-        }
-        else
+        // Identify the CView through its cached class identity (rtti_types), so the steady-state gate is a single
+        // qword compare against the primary vtable resolved once at init. Using the RTTI type name rather than a
+        // hardcoded vtable address keeps this resilient across game patches, and the identity's image-generation
+        // stamp keeps it honest across a remap.
+        if (!vtable_is(GameClass::View, *vtable))
         {
             return;
         }
+
+        // Advance the self-heal scheduler once per game-view frame, before anything reads a healed offset. This
+        // is the mod's render-thread heartbeat: every un-latched group whose gate passes and whose retry interval
+        // is due runs its scan here, and a group that has resolved is not scanned again. Ticking behind the CView
+        // gate (not per frustum call) keeps the interval in real frames, since shadow and reflection cameras run
+        // the same builder several times a frame.
+        offset_heal_tick();
 
         // Game-view camera: take the single per-frame delta and resolve the player once here, then
         // reuse both in the matrix offset below so neither is computed twice per frame. The game state
@@ -2168,9 +2197,9 @@ namespace TPVCamera
         // Publish whether the game is showing the OS cursor (a UI is up) so the free-look input gate can
         // freeze the orbit while menus / loot / trade / dialogue are open. The hardware-mouse reference
         // counter (g_env -> p_hardware_mouse -> + count) reads > 0 whenever any UI requests the cursor.
-        // Every link is screened (seh_resolve_chain + seh_read), and any failed link -- or the feature
-        // being disabled -- publishes false, so a layout miss or a load degrades to normal orbit rather
-        // than a stuck-frozen one. Read here on the render thread; the input thread only reads the
+        // Every link is screened (one guarded DMK::memory::walk to the counter, then a guarded read), and any failed
+        // link -- or the feature being disabled -- publishes false, so a layout miss or a load degrades to
+        // normal orbit rather than a stuck-frozen one. Read here on the render thread; the input thread only reads the
         // published flag (same producer/consumer split as game_state_mask, so no new cross-thread race).
         // Non-game-view frustum frames (shadow/reflection) skip this publish, but cannot strand the orbit
         // frozen: s_offset_active is co-published on this same game-view path and the input gate tests it
@@ -2178,11 +2207,12 @@ namespace TPVCamera
         bool cursor_shown = false;
         if (cfg.freeze_orbit_on_cursor.load(std::memory_order_relaxed) && s_genv_runtime != 0)
         {
-            const auto count_addr = DMK::Memory::seh_resolve_chain(
-                s_genv_runtime, {Constants::GENV_HARDWARE_MOUSE_OFFSET, Constants::HARDWARE_MOUSE_CURSOR_COUNT_OFFSET});
+            const std::array<std::ptrdiff_t, 2> cursor_chain{Constants::GENV_HARDWARE_MOUSE_OFFSET,
+                                                             Constants::HARDWARE_MOUSE_CURSOR_COUNT_OFFSET};
+            const auto count_addr = DMK::memory::walk(DMK::Address{s_genv_runtime}, cursor_chain);
             if (count_addr)
             {
-                const auto count = DMK::Memory::seh_read<int32_t>(*count_addr);
+                const auto count = DMK::memory::read<int32_t>(*count_addr);
                 cursor_shown = count.has_value() && *count > 0;
             }
         }
@@ -2229,8 +2259,8 @@ namespace TPVCamera
                 const float stranded = player_onaction_reset();
                 if (stranded > k_orbit_move_input_stop)
                 {
-                    DMK::Logger::get_instance().trace(
-                        "Orbit: TPV disengaged; cleared a stranded move-latch (magnitude {:.2f})", stranded);
+                    DMK::log().trace("Orbit: TPV disengaged; cleared a stranded move-latch (magnitude {:.2f})",
+                                     stranded);
                 }
                 s_orbit_was_engaged = false;
             }
@@ -2264,13 +2294,12 @@ namespace TPVCamera
     }
 
     /**
-     * @brief SEH wrapper for the per-frame frustum-builder detour.
-     * @details The matrix offset runs BEFORE the original, which then computes the cull planes from
-     *          the offset matrix, so geometry culling matches the rendered third-person view. A
-     *          layout drift degrades the offset to a no-op; the original always runs and its return
-     *          value is forwarded so the frustum is still built whether or not the offset applied.
+     * @brief SEH frame around the per-frame camera body.
+     * @details Split from the detour because a __try frame cannot share a function with the detour's Pass (an
+     *          object with a destructor, MSVC C2712). It runs only inside that Pass, so the in-flight counter
+     *          covers it.
      */
-    static uintptr_t __fastcall detour_frustum_build(uintptr_t camera)
+    TPV_DETOUR static void guarded_frustum_offset(uintptr_t camera) noexcept
     {
         __try
         {
@@ -2280,7 +2309,52 @@ namespace TPVCamera
         {
             // Swallow: an outdated offset or layout must never crash the game.
         }
-        return s_frustum_build_original ? s_frustum_build_original(camera) : 0;
+    }
+
+    /**
+     * @brief Per-frame frustum-builder detour.
+     * @details The matrix offset runs BEFORE the original, which then computes the cull planes from
+     *          the offset matrix, so geometry culling matches the rendered third-person view. A
+     *          layout drift degrades the offset to a no-op; the original always runs and its return
+     *          value is forwarded so the frustum is still built whether or not the offset applied.
+     */
+    TPV_DETOUR static uintptr_t __fastcall detour_frustum_build(uintptr_t camera) noexcept
+    {
+        const DetourGate::Pass pass;
+        guarded_frustum_offset(camera);
+        const FrustumBuildFunc original = s_frustum_build_original.load(std::memory_order_acquire);
+        return original ? original(camera) : 0;
+    }
+
+    /**
+     * @brief Head-visibility body under an SEH frame: latch the call, mirror the offset state, run the original.
+     * @details Split from the detour for the same C2712 reason as guarded_frustum_offset; it runs only inside the
+     *          detour's Pass.
+     */
+    TPV_DETOUR static void guarded_set_head_visibility(SetHeadVisibilityFunc original, uintptr_t entity, bool hide_head,
+                                                       char flags) noexcept
+    {
+        __try
+        {
+            // Latch the player entity, the flags, and the game's intended hide value so
+            // the per-frame re-assert can keep the head shown while the offset is active
+            // and restore the game's value when it turns off. This is the player because
+            // the setter only toggles the FirstPersonView rig.
+            s_head_entity.store(entity, std::memory_order_relaxed);
+            s_head_flags.store(static_cast<uint8_t>(flags), std::memory_order_relaxed);
+            s_game_intended_hide_head.store(hide_head, std::memory_order_relaxed);
+
+            // Mirror the head to the offset's effective active state (published by the frustum
+            // detour) rather than the raw toggle, so a forced-FPV/TPV state shows or hides the head
+            // to match the view the player actually sees.
+            const bool active = s_offset_active.load(std::memory_order_relaxed);
+            const bool final_hide_head = active ? false : hide_head;
+            original(entity, final_hide_head, flags);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // Swallow: a layout change in the head setter must never crash the game.
+        }
     }
 
     /**
@@ -2290,31 +2364,12 @@ namespace TPVCamera
      *          so the player is not headless from behind; otherwise pass the game's
      *          intended value through unchanged.
      */
-    static void __fastcall detour_set_head_visibility(uintptr_t entity, bool hide_head, char flags)
+    TPV_DETOUR static void __fastcall detour_set_head_visibility(uintptr_t entity, bool hide_head, char flags) noexcept
     {
-        __try
+        const DetourGate::Pass pass;
+        if (const SetHeadVisibilityFunc original = s_set_head_visibility_original.load(std::memory_order_acquire))
         {
-            if (s_set_head_visibility_original)
-            {
-                // Latch the player entity, the flags, and the game's intended hide value so
-                // the per-frame re-assert can keep the head shown while the offset is active
-                // and restore the game's value when it turns off. This is the player because
-                // the setter only toggles the FirstPersonView rig.
-                s_head_entity.store(entity, std::memory_order_relaxed);
-                s_head_flags.store(static_cast<uint8_t>(flags), std::memory_order_relaxed);
-                s_game_intended_hide_head.store(hide_head, std::memory_order_relaxed);
-
-                // Mirror the head to the offset's effective active state (published by the frustum
-                // detour) rather than the raw toggle, so a forced-FPV/TPV state shows or hides the head
-                // to match the view the player actually sees.
-                const bool active = s_offset_active.load(std::memory_order_relaxed);
-                const bool final_hide_head = active ? false : hide_head;
-                s_set_head_visibility_original(entity, final_hide_head, flags);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            // Swallow: a layout change in the head setter must never crash the game.
+            guarded_set_head_visibility(original, entity, hide_head, flags);
         }
     }
 
@@ -2347,7 +2402,7 @@ namespace TPVCamera
         {
             return false;
         }
-        if (input_event == 0 || !DMK::Memory::plausible_userspace_ptr(input_event))
+        if (input_event == 0 || !DMK::memory::is_plausible_ptr(DMK::Address{input_event}))
         {
             return false;
         }
@@ -2413,23 +2468,37 @@ namespace TPVCamera
     }
 
     /**
-     * @brief Input-dispatcher detour. Swallows events while free-looking, else passes through.
+     * @brief SEH frame around the free-look capture decision; a fault falls back to normal dispatch.
+     * @details Split from the detour for the same C2712 reason as guarded_frustum_offset; it runs only inside the
+     *          detour's Pass.
      */
-    static void __fastcall detour_input_dispatch(uintptr_t controller, uintptr_t input_event, char flag)
+    TPV_DETOUR static bool guarded_orbit_capture(uintptr_t input_event) noexcept
     {
-        bool block = false;
         __try
         {
-            block = orbit_capture_and_decide(input_event);
+            return orbit_capture_and_decide(input_event);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            block = false; // on any fault, fall back to normal dispatch
+            return false; // on any fault, fall back to normal dispatch
         }
+    }
 
-        if (!block && s_input_dispatch_original)
+    /**
+     * @brief Input-dispatcher detour. Swallows events while free-looking, else passes through.
+     */
+    TPV_DETOUR static void __fastcall detour_input_dispatch(uintptr_t controller, uintptr_t input_event,
+                                                            char flag) noexcept
+    {
+        const DetourGate::Pass pass;
+        const bool block = guarded_orbit_capture(input_event);
+        if (block)
         {
-            s_input_dispatch_original(controller, input_event, flag);
+            return;
+        }
+        if (const InputDispatchFunc original = s_input_dispatch_original.load(std::memory_order_acquire))
+        {
+            original(controller, input_event, flag);
         }
     }
 
@@ -2444,14 +2513,14 @@ namespace TPVCamera
      */
     static uintptr_t resolve_genv()
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
 
         // The Genv anchor resolves the g_env base from a lea/mov [rip+g_env] reference site (resolved up front
         // by resolve_all_anchors()); the result is screened as a plausible pointer.
         const uintptr_t resolved = anchor_address(AnchorId::Genv);
-        if (resolved != 0 && DMK::Memory::plausible_userspace_ptr(resolved))
+        if (resolved != 0 && DMK::memory::is_plausible_ptr(DMK::Address{resolved}))
         {
-            logger.info("Camera: g_env resolved via AOB at {}", DMK::Format::format_address(resolved));
+            logger.info("Camera: g_env resolved via AOB at {}", DMK::format::format_address(resolved));
             return resolved;
         }
 
@@ -2459,9 +2528,9 @@ namespace TPVCamera
         return 0;
     }
 
-    bool initialize_camera(uintptr_t module_base, size_t module_size)
+    DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size)
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
 
         // Start in first-person (offset off) so the game looks normal on load; the view
         // hotkeys toggle/force the third-person offset on. The hooks below fast-path out
@@ -2470,8 +2539,8 @@ namespace TPVCamera
         cam.applying.store(false);
         cam.zoom_offset.store(0.0f);
 
-        // Resolve g_env once (patch-resilient runtime AOB). The CView vtable is identified lazily by RTTI on
-        // the first game-view camera, so nothing is resolved here.
+        // Resolve g_env once (patch-resilient runtime AOB). The CView class identity is resolved by
+        // init_game_types(), so nothing else is resolved here.
         s_genv_runtime = resolve_genv();
 
         // Resolve the engine ray helper for collision + aim convergence. Best-effort: on a miss
@@ -2483,81 +2552,126 @@ namespace TPVCamera
         // roof render clamp, so the result is intentionally discarded.
         (void)initialize_render_occlusion(module_base, module_size, s_genv_runtime);
 
+        // The default hook::Options prologue policy is Fail: refuse an entry that leads with a breakpoint byte
+        // (a cascade mis-resolution or a foreign int3 stub). A sibling mod's E9 jump-hook decodes as a
+        // relocatable branch rather than a refusal, so layering still works. Every hook is owned by the
+        // DetourGate, which retires it at shutdown only after proving its game callers quiescent.
+
+        // Hook the camera frustum builder -- the matrix-offset point; without it the feature does nothing, so
+        // its Error propagates verbatim. The module-scoped cascade resolves to the function entry inside the game
+        // image or returns 0, so no separate bounds check is needed here.
+        const uintptr_t frustum_addr = anchor_address(AnchorId::Frustum);
+        if (frustum_addr == 0)
+        {
+            logger.error("Camera: frustum builder cascade unresolved");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "camera_hook/frustum"});
+        }
+        DMK_TRY(frustum_hook, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "CameraFrustumBuild",
+                                                                            .target = DMK::Address{frustum_addr}},
+                                                   &detour_frustum_build));
+        DMK_TRY_VOID(DetourGate::arm(std::move(frustum_hook), s_frustum_build_original));
+
+        // The head-visibility hook is best-effort: if it fails the camera still works,
+        // the player just appears headless from behind, so a miss is a warning.
+        const uintptr_t head_addr = anchor_address(AnchorId::HeadVisibility);
+        if (head_addr == 0)
+        {
+            logger.warning("Camera: Head visibility cascade unresolved; player may appear headless from behind");
+        }
+        else if (auto head_hook = DMK::hook::inline_at(
+                     DMK::hook::InlineRequest{.name = "SetHeadVisibility", .target = DMK::Address{head_addr}},
+                     &detour_set_head_visibility);
+                 !head_hook)
+        {
+            logger.warning("Camera: Head visibility hook failed ({}); player may appear headless from behind",
+                           head_hook.error().message());
+        }
+        else if (auto armed = DetourGate::arm(std::move(*head_hook), s_set_head_visibility_original); !armed)
+        {
+            logger.warning("Camera: Head visibility hook did not arm ({}); player may appear headless from behind",
+                           armed.error().message());
+        }
+
+        // The input-dispatcher hook powers free-look orbit. Best-effort: a miss only disables orbit, the
+        // offset camera still works. The detour is inert until the orbit key is held, so it is harmless when
+        // free-look is unused. InputDispatch is a runtime AOB cascade (k_inputDispatchCandidates).
+        const uintptr_t input_addr = anchor_address(AnchorId::InputDispatch);
+        if (input_addr == 0)
+        {
+            logger.warning("Camera: Input dispatcher cascade unresolved; free-look orbit unavailable");
+        }
+        else if (auto input_hook = DMK::hook::inline_at(
+                     DMK::hook::InlineRequest{.name = "CameraInputDispatch", .target = DMK::Address{input_addr}},
+                     &detour_input_dispatch);
+                 !input_hook)
+        {
+            logger.warning("Camera: Input dispatcher hook failed ({}); free-look orbit unavailable",
+                           input_hook.error().message());
+        }
+        else if (auto armed = DetourGate::arm(std::move(*input_hook), s_input_dispatch_original); !armed)
+        {
+            logger.warning("Camera: Input dispatcher hook did not arm ({}); free-look orbit unavailable",
+                           armed.error().message());
+        }
+
+        logger.info("Camera: Third-person camera hooks installed");
+        return {};
+    }
+
+    void refresh_zoom_binding_tokens() noexcept
+    {
         try
         {
-            DMK::HookManager &hook_manager = DMK::HookManager::get_instance();
-
-            // Fail closed if a resolved entry leads with a call/breakpoint byte (a cascade mis-resolution or
-            // a foreign int3 stub); a sibling mod's E9 jump-hook does not trip this, so layering still works.
-            const DMK::HookConfig hook_config{.prologue_policy = DMK::InlineProloguePolicy::Fail};
-
-            // Hook the camera frustum builder -- the matrix-offset point; without it the feature
-            // does nothing. The module-scoped cascade resolves to the function entry inside the game
-            // image or returns 0, so no separate bounds check is needed here.
-            const uintptr_t frustum_addr = anchor_address(AnchorId::Frustum);
-            if (frustum_addr == 0)
-            {
-                throw std::runtime_error("Failed to resolve frustum builder cascade");
-            }
-            auto frustum_result = hook_manager.create_inline_hook(
-                "CameraFrustumBuild", frustum_addr, reinterpret_cast<void *>(detour_frustum_build),
-                reinterpret_cast<void **>(&s_frustum_build_original), hook_config);
-
-            if (!frustum_result.has_value())
-            {
-                throw std::runtime_error("Failed to create frustum builder hook: " +
-                                         std::string(DMK::Hook::error_to_string(frustum_result.error())));
-            }
-
-            // The head-visibility hook is best-effort: if it fails the camera still works,
-            // the player just appears headless from behind, so a miss is a warning.
-            const uintptr_t head_addr = anchor_address(AnchorId::HeadVisibility);
-            if (head_addr == 0)
-            {
-                logger.warning("Camera: Head visibility cascade unresolved; player may appear headless from behind");
-            }
-            else
-            {
-                auto head_result = hook_manager.create_inline_hook(
-                    "SetHeadVisibility", head_addr, reinterpret_cast<void *>(detour_set_head_visibility),
-                    reinterpret_cast<void **>(&s_set_head_visibility_original), hook_config);
-
-                if (!head_result.has_value())
-                {
-                    logger.warning("Camera: Head visibility hook failed ({}); player may appear headless from behind",
-                                   DMK::Hook::error_to_string(head_result.error()));
-                }
-            }
-
-            // The input-dispatcher hook powers free-look orbit. Best-effort: a miss only disables orbit, the
-            // offset camera still works. The detour is inert until the orbit key is held, so it is harmless when
-            // free-look is unused. InputDispatch is a runtime AOB cascade (k_inputDispatchCandidates).
-            const uintptr_t input_addr = anchor_address(AnchorId::InputDispatch);
-            if (input_addr == 0)
-            {
-                logger.warning("Camera: Input dispatcher cascade unresolved; free-look orbit unavailable");
-            }
-            else
-            {
-                auto input_result = hook_manager.create_inline_hook(
-                    "CameraInputDispatch", input_addr, reinterpret_cast<void *>(detour_input_dispatch),
-                    reinterpret_cast<void **>(&s_input_dispatch_original), hook_config);
-
-                if (!input_result.has_value())
-                {
-                    logger.warning("Camera: Input dispatcher hook failed ({}); free-look orbit unavailable",
-                                   DMK::Hook::error_to_string(input_result.error()));
-                }
-            }
-
-            logger.info("Camera: Third-person camera hooks installed");
-            return true;
+            const DMK::input::Input &input = DMK::input::Input::instance();
+            s_zoom_tokens.store(std::make_shared<const ZoomBindingTokens>(ZoomBindingTokens{
+                                    .zoom_in = input.acquire_token(k_zoom_in_binding),
+                                    .zoom_out = input.acquire_token(k_zoom_out_binding),
+                                }),
+                                std::memory_order_release);
         }
-        catch (const std::exception &e)
+        catch (...)
         {
-            logger.error("Camera: Initialization failed: {}", e.what());
-            return false;
+            // An allocation failure leaves no tokens published, so the render thread falls back to the name-based
+            // query rather than reading a stale pair.
+            s_zoom_tokens.store(nullptr, std::memory_order_release);
         }
+    }
+
+    void release_zoom_binding_tokens() noexcept
+    {
+        s_zoom_tokens.store(nullptr, std::memory_order_release);
+    }
+
+    bool release_camera_on_game_thread(std::chrono::milliseconds budget) noexcept
+    {
+        s_release_requested.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        while (!s_release_done.load(std::memory_order_acquire))
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                return false;
+            }
+            Sleep(1);
+        }
+        return true;
+    }
+
+    void release_camera_overrides() noexcept
+    {
+        if (s_release_done.load(std::memory_order_acquire))
+        {
+            return;
+        }
+        // Fallback for a render thread that ran no frame within the hand-off budget (a load screen, a minimized
+        // game). The keyboard turn-and-run override writes C_PlayerInput's move field every frame while it is
+        // active and relies on the frustum detour's falling edge to hand the field back to the held keys; with
+        // the detours retired there is no later frame, so run that falling edge here once (a no-op when the
+        // override was not active). The head-visibility restore needs the engine's setter on its own thread, so
+        // it is left to the engine's next transition. The body-turn and look-pitch writes are consume-once /
+        // re-derived by the engine each frame, so they leave nothing behind.
+        apply_keyboard_move_override(false, 0.0f, 0.0f);
+        s_release_done.store(true, std::memory_order_release);
     }
 
 } // namespace TPVCamera

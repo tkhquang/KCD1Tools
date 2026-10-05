@@ -18,6 +18,7 @@
 #include "ui_overlay_hooks.hpp"
 #include "aob_resolver.hpp"
 #include "constants.hpp"
+#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
@@ -27,8 +28,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <stdexcept>
-#include <string>
 #include <string_view>
 
 namespace TPVCamera
@@ -42,7 +41,7 @@ namespace TPVCamera
     using ActionFilterWorkerFunc = void *(__fastcall *)(void *mgr, const char *name, std::int64_t enable_raw,
                                                         unsigned int a4, char a5);
 
-    static ActionFilterWorkerFunc s_worker_original = nullptr;
+    static std::atomic<ActionFilterWorkerFunc> s_worker_original{nullptr};
 
     // Apse filters whose held state means "a blocking apse/UI screen is up". One refcount per filter, written
     // on the input/main thread by the detour and read by publish_overlay; relaxed atomics suffice (a one-frame
@@ -82,7 +81,7 @@ namespace TPVCamera
         // Null/empty name = the engine "all filters" branch (enable/disable every filter at once). On a
         // disable-all, clear our refcounts so the overlay does not latch; an enable-all never raises an apse
         // screen, so it is ignored (treating it as "everything up" would falsely report overlay in gameplay).
-        if (name == nullptr || !DMK::Memory::plausible_userspace_ptr(reinterpret_cast<uintptr_t>(name)) ||
+        if (name == nullptr || !DMK::memory::is_plausible_ptr(DMK::Address{reinterpret_cast<uintptr_t>(name)}) ||
             name[0] == '\0')
         {
             if (!enable)
@@ -121,66 +120,55 @@ namespace TPVCamera
     }
 
     /**
-     * @brief Action-filter worker detour: latch the apse overlay state, then always forward to the original so
-     *        the engine's filter handling is untouched. A fault while reading the event is swallowed and the
-     *        original still runs (its return value is propagated unchanged).
+     * @brief Applies one filter event under a structured-exception guard.
+     * @details Split from the detour because a __try frame cannot share a function with the detour's Pass (an
+     *          object with a destructor, MSVC C2712). A fault while reading the engine-owned name is swallowed.
      */
-    static void *__fastcall action_filter_worker_detour(void *mgr, const char *name, std::int64_t enable_raw,
-                                                        unsigned int a4, char a5)
+    TPV_DETOUR static void guarded_update_overlay(const char *name, bool enable) noexcept
     {
         __try
         {
-            update_overlay_from_filter(name, (enable_raw & 0xFF) != 0);
+            update_overlay_from_filter(name, enable);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
-        return s_worker_original ? s_worker_original(mgr, name, enable_raw, a4, a5) : nullptr;
     }
 
-    bool initialize_ui_overlay_hooks()
+    /**
+     * @brief Action-filter worker detour: latch the apse overlay state, then always forward to the original so
+     *        the engine's filter handling is untouched. A fault while reading the event is swallowed and the
+     *        original still runs (its return value is propagated unchanged).
+     */
+    TPV_DETOUR static void *__fastcall action_filter_worker_detour(void *mgr, const char *name, std::int64_t enable_raw,
+                                                                   unsigned int a4, char a5) noexcept
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        const DetourGate::Pass pass;
+        guarded_update_overlay(name, (enable_raw & 0xFF) != 0);
+        const ActionFilterWorkerFunc original = s_worker_original.load(std::memory_order_acquire);
+        return original ? original(mgr, name, enable_raw, a4, a5) : nullptr;
+    }
 
-        // Fail closed if the resolved entry leads with a call/breakpoint byte; a sibling mod's E9 jump-hook
-        // does not trip this gate, so layering still works.
-        const DMK::HookConfig hook_config{.prologue_policy = DMK::InlineProloguePolicy::Fail};
-
-        try
+    DMK::Result<void> initialize_ui_overlay_hooks()
+    {
+        // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates, plus its
+        // call-site rung); a total cascade miss fails closed. The default hook::Options prologue policy is Fail
+        // (refuse a breakpoint first byte); a sibling mod's E9 jump-hook does not trip it, so layering still works.
+        const uintptr_t worker_addr = anchor_address(AnchorId::OverlayHide);
+        if (worker_addr == 0)
         {
-            const uintptr_t module_base = module_info().base;
-            if (module_base == 0)
-            {
-                throw std::runtime_error("module base unknown");
-            }
-            // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates); a
-            // total cascade miss fails closed.
-            const uintptr_t worker_addr = anchor_address(AnchorId::OverlayHide);
-            if (worker_addr == 0)
-            {
-                throw std::runtime_error("OverlayHide cascade unresolved (action-filter worker)");
-            }
-
-            DMK::HookManager &hook_manager = DMK::HookManager::get_instance();
-            auto result = hook_manager.create_inline_hook(
-                "ActionFilterWorker", worker_addr, reinterpret_cast<void *>(action_filter_worker_detour),
-                reinterpret_cast<void **>(&s_worker_original), hook_config);
-
-            if (!result.has_value())
-            {
-                throw std::runtime_error("Failed to create action-filter worker hook: " +
-                                         std::string(DMK::Hook::error_to_string(result.error())));
-            }
-
-            logger.info("UIOverlayHook: hooked action-filter worker at {} (overlay/apse detection enabled)",
-                        DMK::Format::format_address(worker_addr));
-            return true;
+            DMK::log().error("UIOverlayHook: OverlayHide cascade unresolved (action-filter worker)");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "ui_overlay_hooks/anchor"});
         }
-        catch (const std::exception &e)
-        {
-            logger.error("UIOverlayHook: Initialization failed: {}", e.what());
-            return false;
-        }
+
+        DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "ActionFilterWorker",
+                                                                         .target = DMK::Address{worker_addr}},
+                                                &action_filter_worker_detour));
+        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_worker_original));
+
+        DMK::log().info("UIOverlayHook: hooked action-filter worker at {} (overlay/apse detection enabled)",
+                        DMK::format::format_address(worker_addr));
+        return {};
     }
 
 } // namespace TPVCamera

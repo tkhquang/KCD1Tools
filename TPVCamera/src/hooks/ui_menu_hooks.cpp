@@ -11,13 +11,11 @@
 
 #include "ui_menu_hooks.hpp"
 #include "aob_resolver.hpp"
-#include "constants.hpp"
-#include "global_state.hpp"
+#include "detour_gate.hpp"
 
 #include <DetourModKit.hpp>
 
 #include <atomic>
-#include <stdexcept>
 
 namespace TPVCamera
 {
@@ -25,7 +23,7 @@ namespace TPVCamera
     // wh::guimodule in-game menu toggle: void(this, char display). display = 1 opens the menu, 0 closes it.
     using MenuToggleFunc = void(__fastcall *)(void *this_ptr, char display);
 
-    static MenuToggleFunc s_menu_toggle_original = nullptr;
+    static std::atomic<MenuToggleFunc> s_menu_toggle_original{nullptr};
     static std::atomic<bool> s_is_menu_open(false);
 
     /**
@@ -35,62 +33,44 @@ namespace TPVCamera
      *          guard so the engine function runs exactly once. The toggle itself no-ops on an unchanged state,
      *          but `display` is the requested state either way, so the latch always tracks the menu.
      */
-    static void __fastcall menu_toggle_detour(void *this_ptr, char display)
+    TPV_DETOUR static void __fastcall menu_toggle_detour(void *this_ptr, char display) noexcept
     {
+        const DetourGate::Pass pass;
         const bool open = display != 0;
-        (void)DMK::Logger::get_instance().log_noexcept(
-            DMK::LogLevel::Debug, open ? "UIMenuHook: in-game menu opening" : "UIMenuHook: in-game menu closing");
+        (void)DMK::log().log_noexcept(DMK::LogLevel::Debug,
+                                      open ? "UIMenuHook: in-game menu opening" : "UIMenuHook: in-game menu closing");
         s_is_menu_open.store(open, std::memory_order_relaxed);
 
-        if (s_menu_toggle_original)
+        if (const MenuToggleFunc original = s_menu_toggle_original.load(std::memory_order_acquire))
         {
-            s_menu_toggle_original(this_ptr, display);
+            original(this_ptr, display);
         }
     }
 
-    bool initialize_ui_menu_hooks()
+    DMK::Result<void> initialize_ui_menu_hooks()
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
-
-        // Fail closed if the resolved entry leads with a call/breakpoint byte; a sibling mod's E9 jump-hook
-        // does not trip this gate, so layering still works.
-        const DMK::HookConfig hook_config{.prologue_policy = DMK::InlineProloguePolicy::Fail};
-
-        try
+        // MenuOpen is the menu open/close toggle runtime AOB cascade (k_menuToggleCandidates, plus its call-site
+        // rung); a total cascade miss fails closed. The default hook::Options prologue policy is Fail: refuse
+        // the install when the resolved entry leads with a breakpoint byte. A sibling mod's E9 jump hook decodes
+        // as a relocatable branch rather than a refusal, so layering still works.
+        const uintptr_t toggle_addr = anchor_address(AnchorId::MenuOpen);
+        if (toggle_addr == 0)
         {
-            const uintptr_t module_base = module_info().base;
-            if (module_base == 0)
-            {
-                throw std::runtime_error("module base unknown");
-            }
-            // MenuOpen is the menu open/close toggle runtime AOB cascade (k_menuToggleCandidates); a total
-            // cascade miss fails closed.
-            const uintptr_t toggle_addr = anchor_address(AnchorId::MenuOpen);
-            if (toggle_addr == 0)
-            {
-                throw std::runtime_error("MenuOpen cascade unresolved (menu toggle)");
-            }
-
-            DMK::HookManager &hook_manager = DMK::HookManager::get_instance();
-            auto result = hook_manager.create_inline_hook(
-                "MenuToggle", toggle_addr, reinterpret_cast<void *>(menu_toggle_detour),
-                reinterpret_cast<void **>(&s_menu_toggle_original), hook_config);
-
-            if (!result.has_value())
-            {
-                throw std::runtime_error("Failed to create menu toggle hook: " +
-                                         std::string(DMK::Hook::error_to_string(result.error())));
-            }
-
-            logger.info("UIMenuHook: hooked in-game menu toggle at {} (menu detection enabled)",
-                        DMK::Format::format_address(toggle_addr));
-            return true;
+            DMK::log().error("UIMenuHook: MenuOpen cascade unresolved (menu toggle)");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "ui_menu_hooks/anchor"});
         }
-        catch (const std::exception &e)
-        {
-            logger.error("UIMenuHook: Initialization failed: {}", e.what());
-            return false;
-        }
+
+        // Every failure below propagates the library's own Error rather than a stringified exception, so the
+        // caller keeps the typed ErrorCode. TargetAlreadyHookedByThisKit means drop our own handle, while
+        // TargetAlreadyHookedByAnotherModule means a sibling mod owns the target.
+        DMK_TRY(installed, DMK::hook::inline_at(
+                               DMK::hook::InlineRequest{.name = "MenuToggle", .target = DMK::Address{toggle_addr}},
+                               &menu_toggle_detour));
+        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_menu_toggle_original));
+
+        DMK::log().info("UIMenuHook: hooked in-game menu toggle at {} (menu detection enabled)",
+                        DMK::format::format_address(toggle_addr));
+        return {};
     }
 
     bool is_game_menu_open() noexcept
