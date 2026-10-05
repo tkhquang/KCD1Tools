@@ -51,9 +51,9 @@ namespace TPVCamera
 
     /**
      * @brief Resolves the zoom hold bindings to BindingTokens and publishes them for the per-frame query.
-     * @details BindingToken acquisition is control-plane work, and a token goes stale whenever its binding
-     *          reshapes (an INI rebind or a consume-flag change), so call this after the input engine starts and
-     *          again after every INI reload. Until the first publish the detour uses the name-based query.
+     * @details BindingToken acquisition is control-plane work. A token goes stale whenever its binding reshapes
+     *          (an INI rebind or a consume-flag change), so call this after the input engine starts and again
+     *          after every INI reload. Until the first publish the detour uses the name-based query.
      * @note Setup/control-plane only: it allocates. Never call it from a detour or an input callback.
      */
     void refresh_zoom_binding_tokens() noexcept;

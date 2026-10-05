@@ -169,8 +169,8 @@ namespace TPVCamera
     // so a long frame is not a break. Without the movement detour the break falls back to wall-clock time: more than
     // k_turn_decision_break_ms since s_turn_decision_tick.
     // The look counts as resting while the gap stays within k_turn_rest_drift of its value when the rest began. While
-    // he is not turning only the look changes the gap, and a cumulative bound (not a per-frame rate) keeps a slow pan
-    // from counting as rest. A turn that sets the game's spin latch is refused for that frame (see
+    // his body holds still only the look changes the gap, and a cumulative bound (not a per-frame rate) means a slow
+    // pan never counts as rest. A turn that sets the game's spin latch is refused for that frame (see
     // would_set_spin_latch). One frame later the game holds the new sign, and the turn can start. The action's field
     // offsets the hook reads are resolved from the game's code at install and written before the hook arms.
     constexpr float k_turn_finish_angle = 0.07f; // rad (4 deg)
@@ -1023,7 +1023,7 @@ namespace TPVCamera
         // Follow distance = configured base (hot-reloadable INI FollowDistance, re-read every
         // frame so an edit applies live) plus the accumulated zoom offset from the hold
         // keys, clamped to the configured window. The holds are queried through the BindingTokens the control
-        // plane publishes (refresh_zoom_binding_tokens), the library's per-frame form of the query; before the
+        // plane publishes (refresh_zoom_binding_tokens), the library's per-frame form of the query. Before the
         // first publish the name-based query stands in.
         const DMK::input::Input &input = DMK::input::Input::instance();
         const std::shared_ptr<const ZoomBindingTokens> zoom_tokens = s_zoom_tokens.load(std::memory_order_acquire);
@@ -4128,7 +4128,7 @@ namespace TPVCamera
         catch (...)
         {
             // An allocation failure leaves no tokens published, so the render thread falls back to the name-based
-            // query rather than reading a stale pair.
+            // query and never reads a stale pair.
             s_zoom_tokens.store(nullptr, std::memory_order_release);
         }
     }
