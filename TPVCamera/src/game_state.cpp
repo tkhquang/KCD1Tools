@@ -9,8 +9,8 @@
  * umbrella and its child come from the C_PlayerModule active-minigame map (so first-person minigames such
  * as reading are detected, not just the dice camera). Mount and crouch come from the player's stance.
  *
- * KCD1 differences vs KCD2: there is no Aiming state (the missile-weapon aim flag was not reverse-
- * engineered for 1.9.7) and no Cart stance; the minigame container is a std::map (not the KCD2 intrusive
+ * KCD1 differences vs KCD2: Aiming comes from a ranged-aim flag on C_Player (KCD1 has no embedded missile
+ * controller) and there is no Cart stance; the minigame container is a std::map (not the KCD2 intrusive
  * list); the active camera is identified by its type id (not RTTI on combat/dialog vtables).
  */
 
@@ -210,7 +210,7 @@ namespace TPVCamera
             // single-player) = sentinel._Left @ +0x00. NOTE: the KCD2 port walked a circular intrusive LIST here,
             // but KCD1 keeps a red-black tree (std::map): that list walk oscillates straight back to the sentinel
             // and then reads its garbage value, which is why only the umbrella bit (never a child) ever resolved.
-            // Read _Left directly -- _Mysize > 0 here, so it is a real node (an empty tree links _Left to itself).
+            // Read _Left directly - _Mysize > 0 here, so it is a real node (an empty tree links _Left to itself).
             const auto sentinel = DMK::memory::read<uintptr_t>(DMK::Address{*map});
             if (!sentinel || !DMK::memory::is_plausible_ptr(DMK::Address{*sentinel}))
             {

@@ -43,8 +43,11 @@ namespace TPVCamera
     {
         /// Workers joined, every hook caller proven quiescent, and every hook backend reclaimed.
         Retired,
-        /// A hook could not be disabled, or a game thread was still inside or entering a detour. The hooks stay
-        /// installed (disabled where possible) and their trampolines alive. A later shutdown() retries.
+        /**
+         * @brief A hook could not be disabled, or a game thread was still inside or entering a detour.
+         * @details The hooks stay installed (disabled where possible) and their trampolines alive. A later
+         *          shutdown() retries.
+         */
         CallersActive,
         /// A mod worker did not join and keeps its module reference. Latched.
         WorkerRetained,

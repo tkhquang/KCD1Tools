@@ -1,6 +1,6 @@
 /**
  * @file detour_gate.cpp
- * @brief Hook ownership, newest-first disable, and the in-flight + thread-sweep quiescence proof.
+ * @brief Newest-first disable and the in-flight + thread-sweep quiescence proof over the mod's hook stack.
  */
 
 #include "detour_gate.hpp"
@@ -14,29 +14,28 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <stdexcept>
 #include <string_view>
-#include <vector>
 
 namespace TPVCamera::DetourGate
 {
     namespace
     {
-        /// Upper bound on owned hooks. Reserved up front so the handles HookStack hands back never move.
+        // Upper bound on recorded hooks. The first arm() reserves this much HookStack capacity, so no later push
+        // reallocates: HookStack::push is a vector push_back, and a push within reserved capacity leaves every
+        // earlier element in place, which is what keeps the recorded Hook pointers valid until retire() clears the
+        // stack. The mod's fixed hook set stays far below it.
         constexpr std::size_t k_capacity = 32;
 
-        /// The name MSVC gives the TPV_DETOUR section in the image (IMAGE_SIZEOF_SHORT_NAME bytes, NUL padded).
-        constexpr std::array<char, IMAGE_SIZEOF_SHORT_NAME> k_section_name = {'.', 't', 'p', 'v', 'd', 'e', 't', '\0'};
+        // Every hook arm() pushed, in push order, for the newest-first disable pass HookStack does not expose.
+        // Built and cleared on the setup thread only.
+        std::array<DMK::hook::Hook *, k_capacity> s_records{};
+        std::size_t s_record_count = 0;
 
-        // Every game-thread hook, owned newest-first for teardown, plus the same handles in install order for
-        // the newest-first disable pass HookStack does not expose. Built and torn down on the setup thread only.
-        DMK::hook::HookStack s_stack;
-        std::vector<DMK::hook::Hook *> s_order;
-
-        // The range the sweep inspects: the TPV_DETOUR section, or this whole image when the section cannot be
-        // located (a conservative superset: it can only add false blockers, never miss a detour).
-        DMK::Region s_detour_code{};
+        // The range the sweep inspects: this whole image. Every detour body, the leaves its prologue can call, and
+        // any incremental-link thunk in front of it live here. DetourModKit's own threads (the input poller, the
+        // log writer) also run code in this image, so one caught mid-step is a transient blocker the retry loop
+        // absorbs; it can never hide a thread that is entering a detour.
+        DMK::Region s_image{};
 
         // Bytes from each trampoline's start that count as "on the way into a detour". DetourModKit does not expose
         // a trampoline's size; the E9 layout is the relocated prologue (well under 64 bytes for a 5-byte patch)
@@ -44,44 +43,13 @@ namespace TPVCamera::DetourGate
         // covers it with margin. A wider window can only add false blockers, never miss a thread.
         constexpr std::size_t k_trampoline_window = 128;
 
-        // The trampoline of every owned hook, recorded at adopt() time. A thread on a trampoline's FF 25 jump has
-        // left the restored target but not yet reached the detour section, so the sweep must see it.
+        // The trampoline of every recorded inline hook. A thread on a trampoline's FF 25 jump has left the
+        // restored target but not yet reached the detour, so the sweep must see it.
         std::array<DMK::Region, k_capacity> s_trampolines{};
         std::size_t s_trampoline_count = 0;
 
         // Latches the first backend retention across retries: a retained route keeps its detour reachable.
         bool s_restore_failed = false;
-
-        /// Finds the TPV_DETOUR section in this image's own (always mapped) PE headers.
-        [[nodiscard]] DMK::Region find_detour_section(const DMK::Region &image) noexcept
-        {
-            if (!image.base || image.size < sizeof(IMAGE_DOS_HEADER))
-            {
-                return {};
-            }
-            const auto *bytes = image.base.ptr<const std::byte>();
-            const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(bytes);
-            if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
-                static_cast<std::size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > image.size)
-            {
-                return {};
-            }
-            const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(bytes + dos->e_lfanew);
-            if (nt->Signature != IMAGE_NT_SIGNATURE)
-            {
-                return {};
-            }
-            const IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
-            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
-            {
-                if (std::memcmp(section->Name, k_section_name.data(), k_section_name.size()) == 0 &&
-                    section->VirtualAddress + section->Misc.VirtualSize <= image.size)
-                {
-                    return image.sub(section->VirtualAddress, section->Misc.VirtualSize);
-                }
-            }
-            return {};
-        }
 
         /// The thread found inside the detour code, for the refusal log line.
         struct Blocker
@@ -98,10 +66,10 @@ namespace TPVCamera::DetourGate
             return _InterlockedCompareExchange(&detail::g_inflight, 0, 0);
         }
 
-        /// True when @p ip is on the way into, or inside, a detour: in the detour section or in a recorded trampoline.
+        /// True when @p ip is on the way into, or inside, a detour: in this image or in a recorded trampoline.
         [[nodiscard]] bool in_detour_path(std::uintptr_t ip) noexcept
         {
-            if (s_detour_code.contains(DMK::Address{ip}))
+            if (s_image.contains(DMK::Address{ip}))
             {
                 return true;
             }
@@ -117,9 +85,9 @@ namespace TPVCamera::DetourGate
 
         /**
          * @brief Suspends every other thread of the process in turn and checks it is not on its way into a detour.
-         * @return True when no thread's instruction pointer lies in the detour section or a recorded trampoline, and
-         *         no thread's top-of-stack return address lies in the detour section. A thread that cannot be
-         *         inspected counts as inside (fail closed).
+         * @return True when no thread's instruction pointer lies in this image or a recorded trampoline, and no
+         *         thread's top-of-stack return address lies in this image. A thread that cannot be inspected counts
+         *         as inside (fail closed).
          * @details Nothing between SuspendThread and ResumeThread allocates, locks, or logs: GetThreadContext is a
          *          syscall and the stack-top read is DetourModKit's guarded read, so a suspended thread holding the
          *          heap or loader lock cannot deadlock the sweep. The top-of-stack check catches a thread inside a
@@ -183,7 +151,7 @@ namespace TPVCamera::DetourGate
                     if (!inside)
                     {
                         const auto return_address = DMK::memory::read<std::uintptr_t>(DMK::Address{context.Rsp});
-                        inside = return_address.has_value() && s_detour_code.contains(DMK::Address{*return_address});
+                        inside = return_address.has_value() && s_image.contains(DMK::Address{*return_address});
                     }
                 }
                 const bool resumed =
@@ -248,61 +216,60 @@ namespace TPVCamera::DetourGate
         }
     } // namespace
 
-    void bind_detour_section() noexcept
+    DMK::Result<DMK::hook::Hook *> detail::adopt(DMK::hook::HookStack &hooks, DMK::hook::Hook hook)
     {
-        if (s_detour_code.size != 0)
+        if (s_record_count == 0)
         {
-            return;
+            hooks.reserve(k_capacity);
+            s_image = DMK::Region::own();
         }
-        const DMK::Region image = DMK::Region::own();
-        s_detour_code = find_detour_section(image);
-        if (s_detour_code.size == 0)
+        if (s_record_count >= k_capacity || hooks.size() >= k_capacity)
         {
-            s_detour_code = image;
-            DMK::log().warning("DetourGate: {} section not found; the quiescence sweep inspects the whole image",
-                               std::string_view(k_section_name.data()));
+            // Never reached by this mod's fixed hook set. A push past the reserved capacity would move every
+            // recorded hook, so the hook is refused (and destroyed unarmed) instead.
+            return std::unexpected(DMK::Error{DMK::ErrorCode::OutOfMemory, "DetourGate::adopt"});
         }
-    }
-
-    DMK::hook::Hook &adopt(DMK::hook::Hook hook)
-    {
-        if (s_order.empty())
-        {
-            s_stack.reserve(k_capacity);
-            s_order.reserve(k_capacity);
-        }
-        if (s_order.size() >= k_capacity)
-        {
-            // Never reached by this mod's fixed hook set; a growth here would move every handle s_order points at.
-            throw std::length_error("DetourGate: hook capacity exceeded");
-        }
-        DMK::hook::Hook &held = s_stack.push(std::move(hook));
-        s_order.push_back(&held);
+        DMK::hook::Hook &held = hooks.push(std::move(hook));
+        s_records[s_record_count++] = &held;
         if (const auto trampoline = held.original<void (*)()>(); trampoline != nullptr)
         {
             s_trampolines[s_trampoline_count++] = DMK::Region{DMK::Address{trampoline}, k_trampoline_window};
         }
-        return held;
+        return &held;
     }
 
-    Retirement retire(std::chrono::milliseconds budget) noexcept
+    DMK::Result<void> arm(DMK::hook::HookStack &hooks, DMK::hook::Hook hook)
+    {
+        DMK_TRY(held, detail::adopt(hooks, std::move(hook)));
+        return held->enable();
+    }
+
+    Retirement retire(DMK::hook::HookStack &hooks, std::chrono::milliseconds budget) noexcept
     {
         if (s_restore_failed)
         {
             return Retirement::RestoreFailed;
         }
-        if (s_order.empty())
+        if (s_record_count == 0)
         {
             return Retirement::Clean;
         }
         DMK::Logger &logger = DMK::log();
+        if (s_image.size == 0)
+        {
+            // Without this image's range the sweep could not see a thread inside a detour body, so the proof cannot
+            // hold: keep the hooks and the image (fail closed).
+            logger.error("DetourGate: this image's range is unknown; the hooks stay installed and the image must stay "
+                         "mapped");
+            return Retirement::CallersActive;
+        }
 
         // Disarm newest-first, the only order a layered target accepts. A disabled hook restores the target bytes
         // but keeps its trampoline, so a detour already running can still chain to its original.
         bool all_disabled = true;
-        for (auto it = s_order.rbegin(); it != s_order.rend(); ++it)
+        for (std::size_t i = s_record_count; i-- > 0;)
         {
-            DMK::hook::Hook &hook = **it;
+            DMK::hook::Hook &hook = *s_records[i];
             if (!hook.is_enabled())
             {
                 continue;
@@ -330,9 +297,9 @@ namespace TPVCamera::DetourGate
         // target bytes it cannot witness) is retained and booked as a HookManager leak; the delta reports it.
         namespace diag = DMK::diagnostics;
         const std::size_t leaks_before = diag::intentional_leak_count(diag::LeakSubsystem::HookManager);
-        s_order.clear();
+        s_record_count = 0;
         s_trampoline_count = 0;
-        s_stack.clear();
+        hooks.clear();
         if (diag::intentional_leak_count(diag::LeakSubsystem::HookManager) != leaks_before)
         {
             s_restore_failed = true;
@@ -354,10 +321,5 @@ namespace TPVCamera::DetourGate
             return "RestoreFailed";
         }
         return "Unknown";
-    }
-
-    std::size_t hook_count() noexcept
-    {
-        return s_order.size();
     }
 } // namespace TPVCamera::DetourGate

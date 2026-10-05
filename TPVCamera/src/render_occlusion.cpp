@@ -14,6 +14,7 @@
  */
 
 #include "render_occlusion.hpp"
+#include "aob_resolver.hpp"
 #include "constants.hpp"
 
 #include <DetourModKit.hpp>
@@ -22,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 namespace TPVCamera
@@ -31,6 +33,10 @@ namespace TPVCamera
     // bbox is six floats (min.xyz, max.xyz); p_out == null returns the count only, else it memcpys the FULL
     // list with no cap, so the count is read first and the buffer sized to fit (capped at RENDER_OCCLUSION_MAX_NODES).
     using GetObjectsInBoxFn = std::uint32_t(__fastcall *)(void *p3d_engine, const float *bbox, void **out_list);
+    // C3DEngine::GetObjectsByTypeInBox(this, EERType type, const AABB* bbox, IRenderNode** p_out) -> count (see
+    // constants.hpp).
+    using GetObjectsByTypeInBoxFn = std::uint32_t(__fastcall *)(void *p3d_engine, std::uint32_t type, const float *bbox,
+                                                                void **out_list);
     // IRenderNode::GetRenderNodeType (vtable slot 7 / +0x38) -> EERType (EERTYPE_BRUSH == 1).
     using GetRenderNodeTypeFn = int(__fastcall *)(void *node);
     // IRenderMesh::GetPosPtr(int& stride, uint flags, int offset) -> uint8* to the engine-decoded float3 CPU
@@ -47,6 +53,101 @@ namespace TPVCamera
     // inside this image or it is rejected before the indirect call (branch-only contains() test, no syscall).
     static DMK::Region s_game_module{};
 
+    // The octree queries, read from the live engine vtable by refresh_brush_query(): the untyped GetObjectsInBox, and
+    // the brush-typed query when that vtable has the expected layout (else null). s_brush_query_vtable is the engine
+    // vtable the decision was made for, so it is re-made only when the engine object changes. Render-thread only.
+    static GetObjectsInBoxFn s_get_objects_in_box = nullptr;
+    static GetObjectsByTypeInBoxFn s_get_objects_by_type_in_box = nullptr;
+    static uintptr_t s_brush_query_vtable = 0;
+
+    /**
+     * @brief Selects the octree queries for the engine vtable @p p3d_vtable: GetObjectsInBox from its slot, and the
+     *        brush-typed query when both slots read as the expected wrapper pair.
+     * @details The typed query visits only brushes, which is what every consumer here keeps, instead of every render
+     *          node in the box. Both queries are reached through the engine vtable, not an AOB anchor, so the slot
+     *          numbering is pinned by the two slot heads (ENGINE3D_TYPED_QUERY_HEAD / ENGINE3D_UNTYPED_QUERY_HEAD),
+     *          which also prove the typed query's argument layout. Both slots must lie in the game image. The
+     *          decision is logged when it changes. Called outside any structured-exception frame, before the guarded
+     *          queries.
+     * @param p3d_vtable The vtable of the engine object read this call (in-image, screened by the caller).
+     */
+    static void refresh_brush_query(uintptr_t p3d_vtable)
+    {
+        if (p3d_vtable == s_brush_query_vtable)
+        {
+            return;
+        }
+        s_brush_query_vtable = p3d_vtable;
+
+        const auto untyped_slot = DMK::memory::read<uintptr_t>(
+            DMK::Address{p3d_vtable + Constants::ENGINE3D_VTABLE_GET_OBJECTS_IN_BOX_OFFSET});
+        const auto typed_slot = DMK::memory::read<uintptr_t>(
+            DMK::Address{p3d_vtable + Constants::ENGINE3D_VTABLE_GET_OBJECTS_BY_TYPE_IN_BOX_OFFSET});
+        const bool untyped_ok = untyped_slot && s_game_module.contains(DMK::Address{*untyped_slot});
+        s_get_objects_in_box = untyped_ok ? reinterpret_cast<GetObjectsInBoxFn>(*untyped_slot) : nullptr;
+
+        GetObjectsByTypeInBoxFn typed = nullptr;
+        if (untyped_ok && typed_slot && s_game_module.contains(DMK::Address{*typed_slot}) &&
+            code_matches(*untyped_slot, Constants::ENGINE3D_UNTYPED_QUERY_HEAD) &&
+            code_matches(*typed_slot, Constants::ENGINE3D_TYPED_QUERY_HEAD))
+        {
+            typed = reinterpret_cast<GetObjectsByTypeInBoxFn>(*typed_slot);
+        }
+        s_get_objects_by_type_in_box = typed;
+
+        if (typed != nullptr)
+        {
+            (void)DMK::log().try_log(DMK::LogLevel::Debug,
+                                     "RenderOcclusion: brush queries through GetObjectsByTypeInBox {}",
+                                     DMK::format::format_address(reinterpret_cast<uintptr_t>(typed)));
+        }
+        else if (!untyped_ok)
+        {
+            (void)DMK::log().try_log(DMK::LogLevel::Warning,
+                                     "RenderOcclusion: the GetObjectsInBox slot of engine vtable {} is not in the game "
+                                     "image; render occlusion disabled",
+                                     DMK::format::format_address(p3d_vtable));
+        }
+        else
+        {
+            (void)DMK::log().try_log(DMK::LogLevel::Warning,
+                                     "RenderOcclusion: GetObjectsByTypeInBox is not next to GetObjectsInBox in the "
+                                     "engine vtable; brush queries filter the full octree query instead");
+        }
+    }
+
+    /**
+     * @brief Fills @p nodes with the render nodes in @p bbox that can be brushes and returns how many it wrote.
+     * @details The brush-typed query when refresh_brush_query() selected it, else the untyped one (whose other node
+     *          types the caller's own EERTYPE_BRUSH filter drops). Both copy their full result without a
+     *          size limit, so the count is taken first and the list is filled only when it fits with
+     *          RENDER_OCCLUSION_NODE_SLACK to spare, covering nodes registered between the two calls. The return is
+     *          the FILL call's count (a node removed in between must not leave a stale slot in range), bounded by
+     *          the buffer. POD-only: called inside the caller's structured-exception frame, which contains a fault.
+     * @param p3d The engine object.
+     * @param bbox Query box {min.xyz, max.xyz}.
+     * @param nodes Buffer of RENDER_OCCLUSION_MAX_NODES entries.
+     * @return The number of entries written, 0 when the box is empty or holds more candidates than fit.
+     */
+    static std::uint32_t query_brush_nodes(void *p3d, const float *bbox, void **nodes) noexcept
+    {
+        constexpr auto k_capacity = static_cast<std::uint32_t>(Constants::RENDER_OCCLUSION_MAX_NODES);
+        constexpr auto k_fit =
+            static_cast<std::uint32_t>(Constants::RENDER_OCCLUSION_MAX_NODES - Constants::RENDER_OCCLUSION_NODE_SLACK);
+        const GetObjectsByTypeInBoxFn typed = s_get_objects_by_type_in_box;
+        const auto brush_type = static_cast<std::uint32_t>(Constants::EERTYPE_BRUSH);
+
+        const std::uint32_t count =
+            (typed != nullptr) ? typed(p3d, brush_type, bbox, nullptr) : s_get_objects_in_box(p3d, bbox, nullptr);
+        if (count == 0 || count > k_fit)
+        {
+            return 0;
+        }
+        const std::uint32_t copied =
+            (typed != nullptr) ? typed(p3d, brush_type, bbox, nodes) : s_get_objects_in_box(p3d, bbox, nodes);
+        return (copied < k_capacity) ? copied : k_capacity;
+    }
+
     bool initialize_render_occlusion(uintptr_t module_base, size_t module_size, uintptr_t g_env)
     {
         DMK::Logger &logger = DMK::log();
@@ -62,7 +163,7 @@ namespace TPVCamera
 
         logger.info(
             "RenderOcclusion: GetObjectsInBox via C3DEngine vtable slot {}, p3DEngine slot at {}",
-            DMK::format::format_address(static_cast<uintptr_t>(Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET)),
+            DMK::format::format_address(static_cast<uintptr_t>(Constants::ENGINE3D_VTABLE_GET_OBJECTS_IN_BOX_OFFSET)),
             DMK::format::format_address(s_p3d_engine_slot_addr));
         return true;
     }
@@ -127,7 +228,7 @@ namespace TPVCamera
      * @details node is the CBrush. Walks node -> IStatObj -> IRenderMesh, reads the engine-decoded float3 CPU
      *          position cache (GetPosPtr / FSL_READ), transforms each vertex to world by the brush Matrix34, and
      *          returns the SMALLEST distance d along the pivot->camera arm at which a cloth vertex comes within
-     *          RENDER_OCCLUSION_COLUMN_RADIUS of the sightline -- i.e. the camera at distance d would just begin to
+     *          RENDER_OCCLUSION_COLUMN_RADIUS of the sightline - i.e. the camera at distance d would just begin to
      *          see cloth between itself and the character. An analytic ray-march of the view ray against the cloth
      *          point cloud (each vertex stands in for the surface; the tube radius covers the gaps and doubles as
      *          the standoff). It naturally ignores the tent's vertical walls / skirts: once the camera is below the
@@ -212,7 +313,7 @@ namespace TPVCamera
             {
                 // The cloth is within colr of the pivot itself: the CHARACTER is in / touching it (e.g. standing
                 // amid hanging laundry), not occluded by it from a distance. No camera pull-in helps, so it is
-                // NOT an occluder -- otherwise the camera would collapse onto the character (the blockDist=0 bug).
+                // NOT an occluder - otherwise the camera would collapse onto the character (the blockDist=0 bug).
                 continue;
             }
             ++hits;
@@ -230,9 +331,8 @@ namespace TPVCamera
      *        the SMALLEST clear distance along the pivot->camera arm over every brush whose cloth lies on the
      *        sightline (k_cloth_unavailable when none do). Fills @p out_hit with the binding brush's identity.
      */
-    static float nearest_sightline_block_guarded(void *p3d, GetObjectsInBoxFn query, const float *bbox, Vector3 pivot,
-                                                 Vector3 camera, uintptr_t mod_lo, uintptr_t mod_hi,
-                                                 RoofHitInfo *out_hit) noexcept
+    static float nearest_sightline_block_guarded(void *p3d, const float *bbox, Vector3 pivot, Vector3 camera,
+                                                 uintptr_t mod_lo, uintptr_t mod_hi, RoofHitInfo *out_hit) noexcept
     {
         float best_dist = k_cloth_unavailable;
         __try
@@ -247,14 +347,12 @@ namespace TPVCamera
             dir.y /= arm_len;
             dir.z /= arm_len;
 
-            const std::uint32_t count = query(p3d, bbox, nullptr);
-            if (count == 0 || count > static_cast<std::uint32_t>(Constants::RENDER_OCCLUSION_MAX_NODES))
+            void *nodes[Constants::RENDER_OCCLUSION_MAX_NODES];
+            const std::uint32_t count = query_brush_nodes(p3d, bbox, nodes);
+            if (count == 0)
             {
                 return k_cloth_unavailable;
             }
-
-            void *nodes[Constants::RENDER_OCCLUSION_MAX_NODES];
-            query(p3d, bbox, nodes);
 
             const float colr = Constants::RENDER_OCCLUSION_COLUMN_RADIUS;
             const float los_min_x = (pivot.x < camera.x ? pivot.x : camera.x) - colr;
@@ -269,15 +367,12 @@ namespace TPVCamera
                 {
                     continue;
                 }
-                // KCD2 skips ERF_HIDDEN nodes here (GetObjectsInBox is a spatial, not a visibility, query so it
-                // returns hidden placements). KCD1's true IRenderNode::m_dwRndFlags offset is NOT yet reversed:
-                // the field at RENDERNODE_RNDFLAGS_OFFSET (0x34) is a render-STATE dword whose bit 8 is SET on
-                // many VISIBLE brushes, so gating on it would wrongly skip real canopies BEFORE the ray-march.
-                // Until the real offset is found the visibility gate is omitted (a single, documented divergence
-                // from KCD2): the per-vertex ray-march below only clamps on cloth ACTUALLY on the sightline
-                // (>= RENDER_OCCLUSION_MIN_COLUMN_VERTS verts in the tube), which in every observed case already
-                // rejects the conditional rag / laundry placements ERF_HIDDEN was meant to catch.
-                // TODO(kcd1): reverse m_dwRndFlags and restore `if (rnd_flags & ERF_HIDDEN) continue;` for parity.
+                // No ERF_HIDDEN gate here, unlike KCD2. GetObjectsInBox is a spatial query, not a visibility one, so
+                // it returns hidden placements too, but KCD1's IRenderNode::m_dwRndFlags offset is unknown: the dword
+                // at +0x34 is a render-state word whose bit 8 is SET on many VISIBLE brushes, so gating on it would
+                // skip real canopies before the ray-march. The per-vertex ray-march below clamps only on cloth
+                // actually on the sightline (at least RENDER_OCCLUSION_MIN_COLUMN_VERTS vertices in the tube), which
+                // in every observed case rejects the conditional rag and laundry placements that gate exists for.
 
                 void **vt = *reinterpret_cast<void ***>(node);
                 const auto vtaddr = reinterpret_cast<uintptr_t>(vt);
@@ -293,8 +388,8 @@ namespace TPVCamera
                 }
 
                 // KCD1 reads the cached world AABB directly (+0xAC / +0xB8) for the cheap size +
-                // footprint pre-reject; KCD2 calls IRenderNode::GetBBox() for the same world AABB. Equivalent data
-                // -- the per-VERTEX ray-march below (not the AABB) decides occlusion, so this is only a coarse gate.
+                // footprint pre-reject; KCD2 calls IRenderNode::GetBBox() for the same world AABB. Equivalent data:
+                // the per-VERTEX ray-march below (not the AABB) decides occlusion, so this is only a coarse gate.
                 auto *bytes = reinterpret_cast<std::byte *>(node);
                 const float *bmin = reinterpret_cast<const float *>(bytes + Constants::CBRUSH_AABB_MIN_OFFSET);
                 const float *bmax = reinterpret_cast<const float *>(bytes + Constants::CBRUSH_AABB_MAX_OFFSET);
@@ -315,7 +410,7 @@ namespace TPVCamera
                 }
                 // NOTE: no brush-level "overhead" (min_z > pivot.z) gate here. Tent / awning brushes whose
                 // posts and skirts reach the ground have a bbox bottom BELOW the pivot, yet their canopy cloth
-                // hangs above it -- a coarse bbox test wrongly rejected exactly the brushes that cover the view.
+                // hangs above it - a coarse bbox test wrongly rejected exactly the brushes that cover the view.
                 // Occlusion is decided per VERTEX in cloth_sightline_block_distance (only cloth on the
                 // pivot->camera sightline counts), so the ground under the character is naturally excluded.
 
@@ -379,7 +474,7 @@ namespace TPVCamera
 
         // Overhead-only fast reject: a render-only roof can occlude the sightline only when the camera sits ABOVE
         // the pivot (a look-down raises it over the character). When the camera is at or below the pivot the
-        // pivot->camera sightline only descends, so no overhead brush can lie on it -- skip the whole octree query.
+        // pivot->camera sightline only descends, so no overhead brush can lie on it - skip the whole octree query.
         // This removes the render-octree cost from level and upward looks, which is most of normal play.
         if (camera.z <= pivot.z)
         {
@@ -403,7 +498,7 @@ namespace TPVCamera
             RoofHitInfo hit{};
 
             // Resolve p3DEngine fresh and screen it (set once the 3DEngine exists; must carry an in-image vtable),
-            // then resolve GetObjectsInBox from the live C3DEngine vtable slot.
+            // then select the octree queries from the live C3DEngine vtable (refresh_brush_query).
             const auto p3d = DMK::memory::read<uintptr_t>(DMK::Address{s_p3d_engine_slot_addr});
             if (p3d && *p3d != 0 && DMK::memory::is_plausible_ptr(DMK::Address{*p3d}))
             {
@@ -411,13 +506,9 @@ namespace TPVCamera
                 if (vtable && DMK::memory::is_plausible_ptr(DMK::Address{*vtable}) &&
                     s_game_module.contains(DMK::Address{*vtable}))
                 {
-                    const auto fn_slot = DMK::memory::read<uintptr_t>(
-                        DMK::Address{*vtable + Constants::C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET});
-                    if (fn_slot && DMK::memory::is_plausible_ptr(DMK::Address{*fn_slot}) &&
-                        s_game_module.contains(DMK::Address{*fn_slot}))
+                    refresh_brush_query(*vtable);
+                    if (s_get_objects_in_box != nullptr)
                     {
-                        const auto query = reinterpret_cast<GetObjectsInBoxFn>(*fn_slot);
-
                         // Query box bounding the pivot->camera arm, expanded by the standoff.
                         const float margin = radius + 0.05f;
                         float bbox[6];
@@ -428,7 +519,7 @@ namespace TPVCamera
                         bbox[4] = std::max(pivot.y, camera.y) + margin;
                         bbox[5] = std::max(pivot.z, camera.z) + margin;
                         block =
-                            nearest_sightline_block_guarded(reinterpret_cast<void *>(*p3d), query, bbox, pivot, camera,
+                            nearest_sightline_block_guarded(reinterpret_cast<void *>(*p3d), bbox, pivot, camera,
                                                             s_game_module.base.raw(), s_game_module.end().raw(), &hit);
                     }
                 }

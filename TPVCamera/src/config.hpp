@@ -25,7 +25,7 @@ namespace TPVCamera
     struct LiveSettings
     {
         // Preset-owned framing: the render-thread preset resolver OVERWRITES these every active frame
-        // (apply_to_live) and the frustum-builder detour reads them. They are NOT INI settings -- they
+        // (apply_to_live) and the frustum-builder detour reads them. They are NOT INI settings - they
         // live in the presets JSON and are tuned in the overlay. The factory default VALUES live in
         // CameraPreset (camera_preset.hpp, equal to the built-in DEFAULT preset); settings() seeds these
         // atomics from a default-constructed CameraPreset at startup, so they are only value-initialized
@@ -84,7 +84,7 @@ namespace TPVCamera
         // (CameraProbeSize). OFF by default (opt-in): the camera then collides plainly on the nearest solid world
         // surface (no coverage measurement, no lateral probe); turn it ON for the see-through behaviour. Render
         // occlusion is INDEPENDENT of this (its own use_render_occlusion toggle below).
-        // NOTE (KCD1): the coverage raster + lateral probe are NOT ported (not reversed for 1.9.7); these fields
+        // NOTE (KCD1): the coverage raster + lateral probe are NOT ported (not reversed for KCD1); these fields
         // are kept for INI/preset parity but the RWI-only collision path ignores them.
         std::atomic<bool> use_coverage_collision{false};
         // Swept-sphere collision via PrimitiveWorldIntersection: the sphere's contact distance is
@@ -94,15 +94,20 @@ namespace TPVCamera
         // with the fan's world surface (the fan stays the collision authority; the sphere only smooths it).
         std::atomic<bool> use_sphere_collision{true}; // swept sphere (PWI) smoothing vs RWI fan alone
         std::atomic<float> collision_radius{0.15f};   // swept-sphere radius = standoff from surfaces, meters
-        // Coverage gate (KCD1: kept for parity, not consulted -- see use_coverage_collision).
+        // Coverage gate (KCD1: kept for parity, not consulted - see use_coverage_collision).
         std::atomic<float> collision_coverage_threshold{0.8f};
-        // Lateral / frustum clearance (KCD1: kept for parity, not consulted -- see use_coverage_collision).
+        // Lateral / frustum clearance (KCD1: kept for parity, not consulted - see use_coverage_collision).
         std::atomic<float> camera_probe_size{0.3f};
         // Render occlusion: also collide the camera with render-only geometry (tent / awning canopy cloth,
         // overhead brushes) that carries no ray-collidable physics, by querying the 3DEngine render octree
         // (GetObjectsInBox) along the pivot->camera arm and clamping below an overhead brush. Always-live INI
         // setting (not preset-owned), INDEPENDENT of use_coverage_collision; no-ops if the octree is unresolved.
         std::atomic<bool> use_render_occlusion{false};
+        // First-person fallback: when collision leaves the camera less than this many meters from the pivot (a low
+        // lintel in a doorway, a wall right behind), it would sit inside the player's head. Instead it eases onto the
+        // real eye and the head is hidden by the game's own first-person rig, until the camera has this much room
+        // plus a small margin again. 0 = OFF. Live-editable.
+        std::atomic<float> head_clearance{0.35f};
 
         // State-driven camera policy (see game_state.hpp). Each mask is a GameState bit set parsed
         // from a comma-separated INI token list, read on the per-frame detour and the input thread.
@@ -125,9 +130,15 @@ namespace TPVCamera
         // the debounced game-state mask. Default seeded from the INI (Overlay).
         std::atomic<uint32_t> suppress_tpv_mask{0};
 
+        // States in which the native turn-in-place animation is switched off (the body is locked to the look again,
+        // as in first person). A continuous gate like suppress_tpv_mask, NOT gated by enable_state_behavior. Default
+        // seeded from the INI (the states whose own camera or script drives the body: combat, mounts, dialogue,
+        // minigames, aiming, and the scripted stances).
+        std::atomic<uint32_t> native_turn_exclude_mask{0};
+
         // Preset manager (see presets/). Presets are always active: the render-thread resolver selects a
-        // camera preset by the debounced game state (DEFAULT/COMBAT/MOUNT/STEALTH) -- or by the overlay's
-        // editing pin -- and eases the preset-owned framing fields above toward it each active frame,
+        // camera preset by the debounced game state (DEFAULT/COMBAT/MOUNT/STEALTH) - or by the overlay's
+        // editing pin - and eases the preset-owned framing fields above toward it each active frame,
         // OVERWRITING them. Those framing fields are NOT INI settings; they live in the presets JSON
         // (created automatically from embedded defaults, see presets/default_presets.hpp) and are tuned
         // in the overlay. preset_blend_speed is the exponential ease rate (higher = snappier; <= 0 snaps
@@ -145,6 +156,32 @@ namespace TPVCamera
         // toward the target view over this many seconds (smoothstepped) so toggling and UI
         // suppression slide instead of snapping; 0 = instant switch.
         std::atomic<float> view_transition_duration{0.0f};
+
+        // Camera stability (always-live, NOT preset-owned). The third-person rig (camera = pivot - forward *
+        // distance) amplifies any rotation of the basis into a position swing; the EyeHeight body anchor removes
+        // the POSITIONAL bob, these remove the ROTATIONAL component the engine bakes into the eye quat during
+        // animations (head-bob and weapon-sway rotation, combat / hit / landing view-shake). StableAimBasis
+        // builds the rig basis from the player's clean look-controller aim quat instead of that shaking eye quat
+        // (the look carries none of it and equals the eye at rest), falling back to the eye quat if the look
+        // chain cannot be resolved. AimBasisSmoothing then low-passes the result (0 = off; higher = smoother but
+        // slightly laggier aim). Both default ON. (The look briefly diverges from the rendered view during some
+        // scripted animations such as climbing, so a small residual shift can remain there; this is preferred
+        // over the much larger general view-shake that follow-the-eye would otherwise reintroduce.)
+        std::atomic<bool> stable_aim_basis{true};
+        std::atomic<float> aim_basis_smoothing{0.3f};
+
+        // Native turn-in-place animation (always-live, NOT preset-owned). The mod keeps the game in first person,
+        // where the body is locked to the look and never plays its turn animations. While the third-person view is
+        // engaged this reports "third person" to the free-roam locomotion action only, so the body lags the look until
+        // it leads by native_turn_angle and then turns with the game's own turn-in-place animations until it faces the
+        // look. The turn's steps are kept on the spot, so the camera does not move during or after the turn.
+        std::atomic<bool> native_turn_animation{true};
+        // How far (degrees) the look can lead the body before a turn starts; the game's own value is 35. Every turn
+        // then continues until the body faces the look. Clamped to 10..90.
+        std::atomic<float> native_turn_angle{35.0f};
+        // Seconds the camera must rest before the body also turns to face a smaller lead (more than 12 degrees but less
+        // than native_turn_angle). 0 = only turn past native_turn_angle.
+        std::atomic<float> native_turn_settle_delay{0.8f};
 
         // Start-of-session auto-enable flags, read ONCE during init(). Disabled by default.
         std::atomic<bool> auto_enable_tpv{false};   // enter third-person automatically on game start

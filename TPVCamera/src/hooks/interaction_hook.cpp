@@ -11,7 +11,7 @@
  *          A ray-only redirect (rewriting just the ray-query builder sub_1803E5B1C) is UNSAFE on KCD1: the
  *          selection reads v10 downstream IN ADDITION to the ray it builds, so redirecting only the ray leaves a
  *          camera-ray + eye-view mismatch that crashes the candidate evaluation (KCD2 avoided this by rewriting
- *          an interactor-OWNED origin/dir field shared by the whole selection -- KCD1 has no such field). So this
+ *          an interactor-OWNED origin/dir field shared by the whole selection - KCD1 has no such field). So this
  *          instead wraps the WHOLE selection: it transiently overwrites the framework view pose v10 (position +
  *          orientation) with the render camera + crosshair, runs the original selection (its ray AND its
  *          projection are now both camera-consistent), then restores v10. The look direction is computed inside
@@ -19,7 +19,7 @@
  *          Quat::SetRotationVDir convention (CryEngine Cry_Quat.h) to guarantee it matches.
  *
  *          Gated on cursor-hidden (the main menu renders a camera with a RESOLVED player, so c_player / aim-pose
- *          validity do NOT distinguish it -- only the OS cursor does), InteractFromCamera, and a valid published
+ *          validity do NOT distinguish it - only the OS cursor does), InteractFromCamera, and a valid published
  *          aim pose. Every v10 access is a DetourModKit guarded read/write; v10 is restored on every path.
  *          Resolved at runtime via AOB cascades.
  */
@@ -51,7 +51,7 @@ namespace TPVCamera
                                                       uintptr_t out2, int mode);
         std::atomic<SelectionFunc> s_selection_original{nullptr};
 
-        // --- diagnostics (game thread only; atomic for the trace line) ---
+        // diagnostics (game thread only; atomic for the trace line)
         std::atomic<unsigned long long> s_redirects{0};
         const char *s_last_reason = "none";
         std::chrono::steady_clock::time_point s_last_log{};
@@ -199,8 +199,8 @@ namespace TPVCamera
          * @brief Selection detour: wrap sub_1803E51EC, overwriting v10 with the camera+crosshair pose for the
          *        duration of the call so the ray AND the candidate projection are both camera-consistent.
          */
-        TPV_DETOUR uintptr_t __fastcall selection_detour(uintptr_t interactor, uintptr_t out, uintptr_t flag,
-                                                         uintptr_t out2, int mode) noexcept
+        uintptr_t __fastcall selection_detour(uintptr_t interactor, uintptr_t out, uintptr_t flag, uintptr_t out2,
+                                              int mode) noexcept
         {
             const DetourGate::Pass pass;
             const SelectionFunc original = s_selection_original.load(std::memory_order_acquire);
@@ -212,7 +212,7 @@ namespace TPVCamera
             // Stay inert outside active gameplay. interaction_aim_pose().is_valid() is true ONLY while the TPV
             // offset is actually applied; every UI/menu state (main menu, in-game menu, inventory, map, dialogue)
             // raises an Overlay action filter that suppresses the offset (SuppressTPVState=Overlay), which
-            // invalidates the pose -- so this single check excludes all of them, no separate cursor gate needed.
+            // invalidates the pose - so this single check excludes all of them, no separate cursor gate needed.
             if (!settings().interact_from_camera.load(std::memory_order_relaxed) ||
                 !interaction_aim_pose().is_valid())
             {
@@ -265,7 +265,7 @@ namespace TPVCamera
 
     } // namespace
 
-    DMK::Result<void> initialize_interaction_hook()
+    DMK::Result<void> initialize_interaction_hook(DMK::hook::HookStack &hooks)
     {
         // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates); a total cascade miss fails
         // closed. The default hook::Options prologue policy is Fail (refuse a breakpoint first byte); a sibling
@@ -280,7 +280,7 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "InteractionSelection",
                                                                          .target = DMK::Address{hook_addr}},
                                                 &selection_detour));
-        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_selection_original));
+        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_selection_original));
 
         DMK::log().info("InteractionHook: hooked interactor selection at {} (view-consistent camera-space "
                         "interaction enabled)",

@@ -7,7 +7,7 @@
  * orbit move-detection key on it instead of body-position speed, so the camera-relative heading is not
  * falsely released when a wall arrests the body.
  *
- * KCD1: the action dispatcher's profiler string is stripped from retail 1.9.7, so it was located via the
+ * KCD1: the action dispatcher's profiler string is stripped from the retail build, so it was located via the
  * surviving "OnAction" Lua string (sub_1801FF740) and hooked (see the .cpp). Besides the move-intent MAGNITUDE
  * (orbit move-detection), it also latches the SIGNED move vector and the sprint-held state so the orbit
  * "follow the stick" sprint can face the body at the actual move direction (KCD1 sprint is forward-only in the
@@ -17,6 +17,7 @@
 #define TPVCAMERA_PLAYER_ONACTION_HOOK_HPP
 
 #include <DetourModKit/error.hpp>
+#include <DetourModKit/hook.hpp>
 
 #include <cstdint>
 
@@ -27,10 +28,10 @@ namespace TPVCamera
      * @brief Installs the player OnAction / action-dispatcher hook from the pre-resolved anchor.
      * @return An empty Result once the dispatcher is hooked, or the typed Error (NoMatch for an unresolved
      *         anchor, otherwise the install / enable code).
-     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is owned
-     *       by the DetourGate, which retires it at shutdown.
+     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is pushed
+     *       onto @p hooks, which shutdown() retires through the DetourGate.
      */
-    [[nodiscard]] DMK::Result<void> initialize_player_onaction_hook();
+    [[nodiscard]] DMK::Result<void> initialize_player_onaction_hook(DMK::hook::HookStack &hooks);
 
     /** @brief Whether the OnAction hook resolved (callers use the input signal only when true). */
     [[nodiscard]] bool player_onaction_available();
@@ -72,7 +73,7 @@ namespace TPVCamera
      *          would sprint AWAY from the camera. While this is set (and sprint is actually held) the dispatcher
      *          detour forwards the forward axis (xi_movey/movement_y) as full forward and the lateral axis
      *          (xi_movex/movement_x) as zero, so the forced-forward sprint runs along the faced (stick)
-     *          direction. The SIGNED latch keeps the REAL stick (so the body-turn angle is unaffected -- no
+     *          direction. The SIGNED latch keeps the REAL stick (so the body-turn angle is unaffected - no
      *          feedback); only the value forwarded to the engine is collapsed. The camera detour clears this
      *          every frame the redirect is inactive, and player_onaction_reset() clears it on orbit-off, so it
      *          cannot strand; the sprint-held gate in the detour is a further failsafe. KCD1 only.

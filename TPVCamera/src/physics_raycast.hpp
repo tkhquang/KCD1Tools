@@ -11,7 +11,7 @@
  *
  * KCD1 ports the RWI thin-ray + ray-fan AND the PWI swept-sphere (sphere_world_sweep). The
  * KCD2 silhouette-coverage raster (character_occluded_fraction and the static-brush /
- * collider-footprint helpers) is NOT ported. The PWI SPWIParams layout is the KCD1 1.9.7 fork's
+ * collider-footprint helpers) is NOT ported. The PWI SPWIParams layout is the KCD1 fork's
  * (identical to KCD2; see constants.hpp). Every engine call is SEH-guarded.
  */
 #ifndef TPVCAMERA_PHYSICS_RAYCAST_HPP
@@ -40,8 +40,10 @@ namespace TPVCamera
         Vector3 m_normal{};
         /// IPhysicalEntity* of the entity hit (ray path only).
         uintptr_t m_collider{0};
-        /// Non-zero when the hit is the global TERRAIN heightmap (ray_hit.bTerrain); 0 for brushes. The
-        /// engine's own ground flag -- used to always block the terrain (no under-world clip).
+        /**
+         * @brief Non-zero when the hit is the global TERRAIN heightmap (ray_hit.bTerrain); 0 for brushes.
+         * @details The engine's own ground flag, used to always block the terrain (no under-world clip).
+         */
         int m_terrain{0};
     };
 
@@ -76,8 +78,8 @@ namespace TPVCamera
      * @brief Multi-ray "fan" approximation of a swept sphere, built on RayWorldIntersection.
      * @details Casts the centre ray plus four rays offset perpendicular to the sweep by @p radius (a square
      *          tube of half-width radius) and returns the NEAREST hit across all five. This approximates a
-     *          swept sphere's edge-catching -- so the camera distance does not pump as a single thin ray grazes
-     *          edges -- while keeping the CORRECT object-type filtering: RWI takes @p objtypes as a plain
+     *          swept sphere's edge-catching - so the camera distance does not pump as a single thin ray grazes
+     *          edges - while keeping the CORRECT object-type filtering: RWI takes @p objtypes as a plain
      *          function argument (honoured). KCD1 has no PWI sphere path, so the fan is the only swept primitive.
      * @param origin Sweep start (the camera pivot), world space.
      * @param sweep Sweep vector (pivot -> camera); its length is the max distance (not normalized).
