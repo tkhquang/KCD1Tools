@@ -42,8 +42,8 @@ namespace TPVCamera
     // IRenderMesh::GetPosPtr(int& stride, uint flags, int offset) -> uint8* to the engine-decoded float3 CPU
     // position cache (vtable slot, see constants). KCD1 slot 43: returns the cache and sets
     // *stride = 12 (float3); FSL_READ (0x01) takes the cache-decode/build path.
-    using GetPosPtrFn =
-        std::uint8_t *(__fastcall *)(void *render_mesh, int *out_stride, unsigned int flags, int offset);
+    using GetPosPtrFn = std::uint8_t *(__fastcall *)(void *render_mesh, int *out_stride, unsigned int flags,
+                                                     int offset);
 
     // Address of the p3DEngine global (a g_env member). Read fresh per query: it is set once the 3DEngine
     // is created and is screened before use; deriving it from the patch-resilient g_env base avoids a
@@ -88,8 +88,10 @@ namespace TPVCamera
 
         GetObjectsByTypeInBoxFn typed = nullptr;
         if (untyped_ok && typed_slot && s_game_module.contains(DMK::Address{*typed_slot}) &&
-            code_matches(*untyped_slot, Aob::k_engine3dUntypedQueryHead) &&
-            code_matches(*typed_slot, Aob::k_engine3dTypedQueryHead))
+            code_window_matches(*untyped_slot, Aob::k_engine3dUntypedQueryHead,
+                                Aob::k_engine3dUntypedQueryHead.max_match_length(), s_game_module) &&
+            code_window_matches(*typed_slot, Aob::k_engine3dTypedQueryHead,
+                                Aob::k_engine3dTypedQueryHead.max_match_length(), s_game_module))
         {
             typed = reinterpret_cast<GetObjectsByTypeInBoxFn>(*typed_slot);
         }
@@ -237,8 +239,8 @@ namespace TPVCamera
      *          unreadable or fewer than RENDER_OCCLUSION_MIN_COLUMN_VERTS vertices lie on the sightline. POD-only
      *          (runs in the caller's SEH frame).
      */
-    static float cloth_sightline_block_distance(void *node, Vector3 pivot, Vector3 dir, float arm_len,
-                                                uintptr_t mod_lo, uintptr_t mod_hi)
+    static float cloth_sightline_block_distance(void *node, Vector3 pivot, Vector3 dir, float arm_len, uintptr_t mod_lo,
+                                                uintptr_t mod_hi)
     {
         auto *bytes = reinterpret_cast<std::byte *>(node);
         void *statobj = *reinterpret_cast<void **>(bytes + Constants::CBRUSH_STATOBJ_OFFSET);
@@ -403,8 +405,8 @@ namespace TPVCamera
                 }
 
                 // Skip world / terrain (merged static cells, building shells): only compact props are roofs.
-                if (sx > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE || sy > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE ||
-                    sz > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE)
+                if (sx > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE ||
+                    sy > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE || sz > Constants::RENDER_OCCLUSION_MAX_BRUSH_SIZE)
                 {
                     continue;
                 }

@@ -14,8 +14,9 @@
 #ifndef TPVCAMERA_UI_OVERLAY_HOOKS_HPP
 #define TPVCAMERA_UI_OVERLAY_HOOKS_HPP
 
+#include "hook_set.hpp"
+
 #include <DetourModKit/error.hpp>
-#include <DetourModKit/hook.hpp>
 
 namespace TPVCamera
 {
@@ -23,10 +24,11 @@ namespace TPVCamera
     /**
      * @brief Installs the overlay/apse hook that drives overlay_state().active.
      * @return An empty Result once the hook is armed, or the typed Error (overlay detection then disabled).
-     * @note KCD1 hooks the action-filter worker resolved at runtime by the AnchorId::OverlayHide cascade. The hook
-     *       is pushed onto @p hooks, which shutdown() retires through the DetourGate.
+     * @param hooks The mod's hook set. Each handle is stored before its arm.
+     * @note KCD1 hooks the action-filter worker that the AnchorId::OverlayHide cascade resolves, read through the
+     *       OverlayState gate.
      */
-    [[nodiscard]] DMK::Result<void> initialize_ui_overlay_hooks(DMK::hook::HookStack &hooks);
+    [[nodiscard]] DMK::Result<void> initialize_ui_overlay_hooks(HookSet &hooks);
 
 } // namespace TPVCamera
 

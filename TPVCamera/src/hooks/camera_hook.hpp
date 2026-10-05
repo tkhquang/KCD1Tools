@@ -14,8 +14,9 @@
 #ifndef TPVCAMERA_CAMERA_HOOK_HPP
 #define TPVCAMERA_CAMERA_HOOK_HPP
 
+#include "hook_set.hpp"
+
 #include <DetourModKit/error.hpp>
-#include <DetourModKit/hook.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -40,15 +41,13 @@ namespace TPVCamera
      *          the first-person rig keeps the player head while the offset is active, and
      *          the input dispatcher for free-look orbit. The detours fast-path out while
      *          the offset is toggled off, so they are harmless when the view is first-person.
-     *          Every hook goes onto @p hooks, which shutdown() retires through the DetourGate.
      * @param module_base Base address of the target game module.
      * @param module_size Size of the target game module in bytes.
-     * @param hooks The mod's hook stack; every installed hook is pushed onto it.
+     * @param hooks The mod's hook set. Each handle is stored before its arm.
      * @return An empty Result once the frustum hook is armed (the best-effort head/input hooks only warn), or
      *         the frustum hook's typed Error, which init() surfaces unchanged.
      */
-    [[nodiscard]] DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size,
-                                                      DMK::hook::HookStack &hooks);
+    [[nodiscard]] DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size, HookSet &hooks);
 
     /**
      * @brief Resolves the zoom hold bindings to BindingTokens and publishes them for the per-frame query.
@@ -70,7 +69,7 @@ namespace TPVCamera
      *          field and the game's intended head visibility, and switches the native turn animation off (the
      *          camera-changed event, so an idle locomotion action drops its LockBodyTurn reference), all on the render
      *          thread the engine drives them on. It then leaves the view to the game until the hooks are retired.
-     *          Call at teardown, before the DetourGate retires the hooks.
+     *          Call at teardown, before the hooks retire.
      * @param budget Bound on the wait for the render thread to run that frame.
      * @return True once the render thread acknowledged; false when no frame ran within @p budget.
      * @note Setup/control-plane only: it waits.
@@ -80,8 +79,8 @@ namespace TPVCamera
     /**
      * @brief Fallback for release_camera_on_game_thread() when the render thread ran no frame in time.
      * @details Hands the keyboard move field back from the calling thread. A no-op once the render thread released
-     *          the overrides. Call only after the DetourGate proved the detours quiescent: it touches state the
-     *          render thread owns while the detours can run.
+     *          the overrides. Call only after HookSet::retire() returned Retired: it touches state the render thread
+     *          owns while the detours can run.
      */
     void release_camera_overrides() noexcept;
 

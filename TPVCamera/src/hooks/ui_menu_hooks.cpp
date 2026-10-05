@@ -11,7 +11,6 @@
 
 #include "ui_menu_hooks.hpp"
 #include "aob_resolver.hpp"
-#include "detour_gate.hpp"
 
 #include <DetourModKit.hpp>
 
@@ -35,7 +34,7 @@ namespace TPVCamera
      */
     static void __fastcall menu_toggle_detour(void *this_ptr, char display) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         const bool open = display != 0;
         (void)DMK::log().log_noexcept(DMK::LogLevel::Debug,
                                       open ? "UIMenuHook: in-game menu opening" : "UIMenuHook: in-game menu closing");
@@ -47,13 +46,13 @@ namespace TPVCamera
         }
     }
 
-    DMK::Result<void> initialize_ui_menu_hooks(DMK::hook::HookStack &hooks)
+    DMK::Result<void> initialize_ui_menu_hooks(HookSet &hooks)
     {
-        // MenuOpen is the menu open/close toggle runtime AOB cascade (k_menuToggleCandidates, plus its call-site
-        // rung); a total cascade miss fails closed. The default hook::Options prologue policy is Fail: refuse
-        // the install when the resolved entry leads with a breakpoint byte. A sibling mod's E9 jump hook decodes
-        // as a relocatable branch rather than a refusal, so layering still works.
-        const uintptr_t toggle_addr = anchor_address(AnchorId::MenuOpen);
+        // MenuOpen is the menu open/close toggle runtime AOB cascade (k_menuToggleCandidates), read through the
+        // MenuState gate. The default hook::Options prologue policy is Fail: refuse the install when the resolved
+        // entry leads with a breakpoint byte. A sibling mod's E9 jump hook decodes as a relocatable branch rather
+        // than a refusal, so layering still works.
+        const uintptr_t toggle_addr = gated_anchor_address(Feature::MenuState, AnchorId::MenuOpen);
         if (toggle_addr == 0)
         {
             DMK::log().error("UIMenuHook: MenuOpen cascade unresolved (menu toggle)");
@@ -66,7 +65,10 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(
                                DMK::hook::InlineRequest{.name = "MenuToggle", .target = DMK::Address{toggle_addr}},
                                &menu_toggle_detour));
-        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_menu_toggle_original));
+        // Publish the trampoline and store the handle BEFORE enable() arms the patch, so the set owns a hook whose arm
+        // fails with the patch live.
+        s_menu_toggle_original.store(installed.original<MenuToggleFunc>(), std::memory_order_release);
+        DMK_TRY_VOID(hooks.push(std::move(installed)).enable());
 
         DMK::log().info("UIMenuHook: hooked in-game menu toggle at {} (menu detection enabled)",
                         DMK::format::format_address(toggle_addr));

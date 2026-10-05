@@ -48,6 +48,14 @@ namespace Constants
         return std::string(MOD_NAME) + PRESETS_FILE_SUFFIX;
     }
 
+    // The signature file beside the ASI: optional repairs of the built-in signatures, merged over them by label.
+    constexpr const char *SIGNATURE_FILE_SUFFIX = ".signatures.ini";
+    // The [Advanced] ExportSignatures output: every built-in signature with its captured baselines.
+    constexpr const char *SIGNATURE_EXPORT_SUFFIX = ".signatures.captured.ini";
+    // The signature-contract epoch a signature file must declare. Bump it only when an in-code change makes older
+    // signature files incompatible (a renamed label, a dropped signature). A file for another epoch is ignored.
+    constexpr std::uint32_t SIGNATURE_REVISION = 1;
+
     /** @brief Log file name passed to the DetourModKit Session through ModInfo (string-view-safe literal). */
     constexpr const char *LOG_FILE_NAME = "KCD1_TPVCamera.log";
     /** @brief Per-PID instance-mutex prefix so duplicate ASI loads bail cleanly. */
@@ -95,10 +103,11 @@ namespace Constants
     constexpr ptrdiff_t CCRYACTION_ACTIONGAME_OFFSET = 0x78; // [KCD2 +0x88]
     // RTTI type-descriptor name of CActionGame, the self-heal anchor for CCRYACTION_ACTIONGAME_OFFSET.
     constexpr const char *CACTIONGAME_RTTI_NAME = ".?AVCActionGame@@";
-    constexpr ptrdiff_t CACTIONGAME_LOCAL_ACTOR_OFFSET = 0xA00;  // [KCD2 +0xA40]
-    constexpr ptrdiff_t C_PLAYER_LOOK_CONTROLLER_OFFSET = 0x4C0; // [KCD2 +0x238]; ptr, lazy-init, +0 = C_Player back-ptr
-    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH_OFFSET = 0x8;      // scalar look pitch (radians, 0 = level)
-    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH2_OFFSET = 0x48;    // synchronized pitch copy (returned by GetLookPitch)
+    constexpr ptrdiff_t CACTIONGAME_LOCAL_ACTOR_OFFSET = 0xA00; // [KCD2 +0xA40]
+    constexpr ptrdiff_t C_PLAYER_LOOK_CONTROLLER_OFFSET =
+        0x4C0;                                                // [KCD2 +0x238]; ptr, lazy-init, +0 = C_Player back-ptr
+    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH_OFFSET = 0x8;   // scalar look pitch (radians, 0 = level)
+    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH2_OFFSET = 0x48; // synchronized pitch copy (returned by GetLookPitch)
     // Scalar look yaw (radians; horizontal forward = (-sin yaw, cos yaw)). Read only, so its synchronized copy at
     // +0x44 is left to the engine.
     constexpr ptrdiff_t LOOK_CONTROLLER_YAW_OFFSET = 0x10;
@@ -442,10 +451,10 @@ namespace Constants
     //   view = *(framework + FRAMEWORK_VIEW_OFFSET);
     //   v10 = view + VIEW_POSE_OFFSET (+ VIEW_POSE_ALT_DELTA when *(view + VIEW_POSE_ALT_FLAG_OFFSET) != 0).
     // v10 layout = Vec3 position (floats 0..2) then a CryEngine Quat (v.x, v.y, v.z, w = floats 3..6).
-    constexpr uintptr_t FRAMEWORK_VIEW_OFFSET = 56;            // framework -> gameplay view subsystem
-    constexpr uintptr_t VIEW_POSE_OFFSET = 44;                 // view subsystem -> look-ray pose (Vec3 + Quat)
-    constexpr uintptr_t VIEW_POSE_ALT_DELTA = 0xD4;            // added to the pose offset when the alt-flag is set
-    constexpr uintptr_t VIEW_POSE_ALT_FLAG_OFFSET = 24;        // byte selecting the alternate pose slot
+    constexpr uintptr_t FRAMEWORK_VIEW_OFFSET = 56;     // framework -> gameplay view subsystem
+    constexpr uintptr_t VIEW_POSE_OFFSET = 44;          // view subsystem -> look-ray pose (Vec3 + Quat)
+    constexpr uintptr_t VIEW_POSE_ALT_DELTA = 0xD4;     // added to the pose offset when the alt-flag is set
+    constexpr uintptr_t VIEW_POSE_ALT_FLAG_OFFSET = 24; // byte selecting the alternate pose slot
 
     // Look-axis event ids (SInputEvent.keyId / EKeyId, KCD-renumbered) matched on the analog look channel
     // together with MOUSE_INPUT_TYPE_ID below (which is actually EInputState::eIS_Changed, NOT a device
@@ -462,7 +471,7 @@ namespace Constants
     // Global-context -> camera-manager pointer. The manager is the root the game-state detection
     // walks to read the active camera (see OFFSET_ACTIVE_CAMERA below and game_state.cpp). The global-context
     // slot itself is resolved at runtime by the AnchorId::Context cascade (game_interface.cpp).
-    constexpr ptrdiff_t OFFSET_MANAGER_PTR_STORAGE = 0x38;        // Global context to camera manager
+    constexpr ptrdiff_t OFFSET_MANAGER_PTR_STORAGE = 0x38; // Global context to camera manager
     // RTTI type-descriptor name of the camera manager, the self-heal anchor for OFFSET_MANAGER_PTR_STORAGE.
     constexpr const char *C_CAMERA_MANAGER_RTTI_NAME = ".?AVC_CameraManager@game@wh@@";
 
@@ -504,15 +513,22 @@ namespace Constants
     // turn-in-place detour never drops it.
     constexpr int32_t ANIMATED_CHARACTER_MOVEMENT_IMPULSE = 2;
 
-    // Crouched turn animation. The player's crouched turn fragments play CROUCHED_TURN_PLAYER_BLEND_SPACE. They are
-    // MotionTurn and MotionTurnBig with the tags stealth+player in kcd_male_database.adb. The right turns of that blend
-    // space break the pose late in the clip. The fault throws the skeleton up to a meter off the body for one to four
-    // frames. It hits about a third of the crouched right turns that play past 1.1 s of the 1.39 s clip. The
-    // first-person game never plays a turn, so the fault never shows there. Crouched NPCs play
-    // CROUCHED_TURN_NPC_BLEND_SPACE, which holds the same turns without that fault, and the native turn plays it
-    // instead (see detour_crouched_turn_animation). The game looks a clip's animation up by the 64-bit hash of its
-    // name in the character's CAnimationSet.
+    // Crouched animations. The player crouches with CROUCHED_IDLE_PLAYER_ANIMATION and turns with
+    // CROUCHED_TURN_PLAYER_BLEND_SPACE: MotionIdle, MotionTurn and MotionTurnBig with the tags stealth+player in
+    // kcd_male_database.adb. The right turns of that blend space break the pose late in the clip. The fault throws the
+    // skeleton up to a meter off the body for one to four frames. It hits about a third of the crouched right turns
+    // that play past 1.1 s of the 1.39 s clip. The first-person game never plays a turn, so the fault never shows
+    // there. Crouched NPCs play CROUCHED_IDLE_NPC_ANIMATION and CROUCHED_TURN_NPC_BLEND_SPACE, whose turns hold without
+    // that fault. The two sets hold the body at different stances: the NPC set carries it further forward over the
+    // feet. A player idle around an NPC turn therefore slides the body forward as the turn blends in and back as the
+    // idle returns, so the native turn swaps the idle and the turns together (see detour_crouched_animation). These
+    // three fragments are the only crouched locomotion with a player variant, and the crouched walk is shared, so the
+    // swapped set stays consistent. The game looks a clip's animation up by the 64-bit hash of its name in the
+    // character's CAnimationSet (GetAnimIDByCRC). The slot and the name hash are read from the game's code
+    // (AnchorId::AnimIdByCrcSlot, AnchorId::AnimNameHashCall).
     constexpr const char *ANIMATION_SET_RTTI_NAME = ".?AVCAnimationSet@@";
+    constexpr std::string_view CROUCHED_IDLE_PLAYER_ANIMATION = "crouched_idle_player";
+    constexpr std::string_view CROUCHED_IDLE_NPC_ANIMATION = "crouched_idle";
     constexpr std::string_view CROUCHED_TURN_PLAYER_BLEND_SPACE = "1d_stealth_idle_bigturns_nw_player";
     constexpr std::string_view CROUCHED_TURN_NPC_BLEND_SPACE = "1d_stealth_idle_bigturns_nw";
 
@@ -576,8 +592,8 @@ namespace Constants
     // Crouch/sneak AND mount BOTH come from the player's STANCE enum. C_ActorModel is a POINTER on
     // C_Player, dereferenced then validated by its RTTI. The 4-byte CURRENT STANCE enum lives at +0x1C8.
     // KCD1 enum (shifted -1 vs KCD2, NO cart): 0 stand, 1 lying, 2 sitting, 3 kneel, 4 horse/mount, 5 crouch.
-    constexpr ptrdiff_t C_PLAYER_ACTOR_MODEL_OFFSET = 0x908; // [KCD2 +0x990]
-    constexpr ptrdiff_t C_ACTOR_MODEL_STANCE_OFFSET = 0x1C8; // [KCD2 +0x80]
+    constexpr ptrdiff_t C_PLAYER_ACTOR_MODEL_OFFSET = 0x908;  // [KCD2 +0x990]
+    constexpr ptrdiff_t C_ACTOR_MODEL_STANCE_OFFSET = 0x1C8;  // [KCD2 +0x80]
     constexpr unsigned int C_ACTOR_MODEL_STANCE_LYING = 1u;   // lying down (sleeping in bed)
     constexpr unsigned int C_ACTOR_MODEL_STANCE_SITTING = 2u; // sitting (bench / chair)
     constexpr unsigned int C_ACTOR_MODEL_STANCE_KNEEL = 3u;   // kneeling

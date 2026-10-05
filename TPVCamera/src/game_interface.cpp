@@ -36,25 +36,20 @@ namespace TPVCamera
         }
 
         // The global-context storage slot is a fixed .data location in the WHGame.dll image (the singleton
-        // getters return *qword_1834FFD10). The Context anchor resolves the slot ADDRESS from a getter's
-        // RIP-relative load (k_contextCandidates); resolution is runtime-only, so a total cascade miss fails
-        // closed here. Publish the slot ADDRESS (not the pointer it holds, which is null until a level
-        // loads); game_state.cpp dereferences it fresh each frame and validates the value.
-        const std::uintptr_t ctx_slot = anchor_address(AnchorId::Context);
+        // getters return *qword_1834FFD10). The Context quorum resolves the slot ADDRESS when at least two of its
+        // three getters' RIP-relative loads agree, and the GameState gate returns 0 otherwise. Publish the slot
+        // ADDRESS (not the pointer it holds, which is null until a level loads). game_state.cpp dereferences it
+        // fresh each frame and validates the value.
+        const std::uintptr_t ctx_slot = gated_anchor_address(Feature::GameState, AnchorId::Context);
         if (ctx_slot == 0)
         {
-            logger.error("GameInterface: Context cascade unresolved (global-context slot)");
+            logger.error("GameInterface: the global-context slot did not resolve");
             return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "game_interface/anchor"});
         }
 
         g_global_context_ptr_address.store(reinterpret_cast<std::byte *>(ctx_slot), std::memory_order_relaxed);
         logger.info("GameInterface: Global context pointer storage at {}", format_address(ctx_slot));
         return {};
-    }
-
-    void cleanup_game_interface()
-    {
-        g_global_context_ptr_address.store(nullptr, std::memory_order_relaxed);
     }
 
 } // namespace TPVCamera

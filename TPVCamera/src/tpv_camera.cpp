@@ -5,15 +5,14 @@
  * init() runs off the Windows loader lock and receives the live Session: on the DetourModKit bootstrap worker in
  * the release ASI, on the resident loader's control thread in the dev build. shutdown() is driven by the host's
  * detach path (dllmain.cpp in production, the logic DLL's Shutdown() export in the dev build) and must likewise
- * run off the loader lock, because hooks are caller-owned and retiring the hook stack through the DetourGate is
- * the only path that restores the patched prologues.
+ * run off the loader lock. Hooks are caller-owned, and only the retirement of the hook set restores the patched
+ * prologues.
  */
 
 #include "tpv_camera.hpp"
 #include "aob_resolver.hpp"
 #include "config.hpp"
 #include "constants.hpp"
-#include "detour_gate.hpp"
 #include "global_state.hpp"
 #include "game_interface.hpp"
 #include "offset_heal.hpp"
@@ -51,14 +50,10 @@ namespace TPVCamera
     // callables under the loader lock.
     static DMK::input::Scope *s_binding_scope = nullptr;
 
-    // Every hook the mod installs. A HookStack restores newest first, the only safe order for layered
+    // Every hook the mod installs. HookSet disables and destroys newest first, the only safe order for layered
     // patches on one target: the newer layer trampoline chains through the older jump, so the base must
-    // be restored last. shutdown() retires it through the DetourGate while the code pages are still mapped.
-    static DMK::hook::HookStack s_hooks;
-
-    // Bound on the DetourGate's caller-quiescence proof (drain + thread sweep). A detour body runs in well under
-    // a frame, so a caller still inside after this long is wedged in game code; the image then stays mapped.
-    constexpr std::chrono::milliseconds k_quiescence_budget{500};
+    // be restored last. shutdown() retires it while the code pages are still mapped.
+    static HookSet s_hooks;
 
     // Bound on the wait for the render thread to run the frame that hands the per-frame overrides back. Generous
     // enough for a low frame rate; a render thread that runs no frame at all (a load screen) falls back to a
@@ -66,7 +61,7 @@ namespace TPVCamera
     constexpr std::chrono::milliseconds k_release_budget{500};
 
     // Teardown progress, so a retried shutdown() resumes where the previous call stopped instead of repeating a
-    // destructive step. s_worker_retained latches: a worker that kept its module reference stays a refusal.
+    // destructive step. s_worker_retained latches: a worker that kept its module reference stays a failure.
     static bool s_workers_stopped = false;
     static bool s_worker_retained = false;
     static bool s_teardown_complete = false;
@@ -181,10 +176,14 @@ namespace TPVCamera
         const ModuleInfo &mod = module_info();
 
         // Resolve every game-image anchor in one parallel pass, confined to the WHGame.dll image range,
-        // before any module init reads its target. resolve_all_anchors() logs a per-anchor status and a
-        // quality summary; each init below reads its address via anchor_address(), and a mandatory anchor
-        // that did not resolve fails the init that needs it.
+        // before any module init reads its target. resolve_all_anchors() logs a per-anchor status, the feature
+        // gates, and a quality summary. Each init below reads its addresses through its feature's gate, and a
+        // mandatory feature whose gate failed fails the init that needs it.
         resolve_all_anchors(mod.base, mod.size);
+        if (settings().export_signatures.load(std::memory_order_relaxed))
+        {
+            export_signatures();
+        }
 
         // Build the cached class-vtable identities over the WHGame.dll image, before any detour is armed.
         // Every per-frame "is this vtable type X" test resolves through these, so the RTTI sweep happens
@@ -523,34 +522,18 @@ namespace TPVCamera
         return {};
     }
 
-    std::string_view to_string(ShutdownVerdict verdict) noexcept
-    {
-        switch (verdict)
-        {
-        case ShutdownVerdict::Retired:
-            return "Retired";
-        case ShutdownVerdict::CallersActive:
-            return "CallersActive";
-        case ShutdownVerdict::WorkerRetained:
-            return "WorkerRetained";
-        case ShutdownVerdict::HookRetained:
-            return "HookRetained";
-        }
-        return "Unknown";
-    }
-
-    ShutdownVerdict shutdown()
+    RetireStatus shutdown()
     {
         namespace diag = DMK::diagnostics;
         DMK::Logger &logger = DMK::log();
 
         if (s_teardown_complete)
         {
-            return ShutdownVerdict::Retired;
+            return RetireStatus::Retired;
         }
         if (s_worker_retained)
         {
-            return ShutdownVerdict::WorkerRetained;
+            return RetireStatus::Failed;
         }
 
         if (!s_workers_stopped)
@@ -587,7 +570,7 @@ namespace TPVCamera
                 s_worker_retained = true;
                 logger.error("Shutdown: a worker did not join and keeps its module reference; the module must stay "
                              "mapped");
-                return ShutdownVerdict::WorkerRetained;
+                return RetireStatus::Failed;
             }
 
             // Persist any unsaved preset edits.
@@ -605,17 +588,12 @@ namespace TPVCamera
                            k_release_budget.count());
         }
 
-        // Retire the game-thread detours: disable every hook newest-first (restoring the targets while their
-        // trampolines stay alive), prove no game thread is inside or entering a detour, and only then clear the
-        // hook stack. Hooks are caller-owned and the library removes none of them, so this is the only path that
-        // restores the patched prologues.
-        const DetourGate::Retirement retirement = DetourGate::retire(s_hooks, k_quiescence_budget);
-        if (retirement != DetourGate::Retirement::Clean)
+        // Hooks are caller-owned and the library removes none of them, so this is the only path that restores the
+        // patched prologues. The set disables every hook, waits until no game thread is inside a detour, and only then
+        // destroys the handles. Busy and Failed keep the hooks, and HookSet logs the reason.
+        if (const RetireStatus hooks = s_hooks.retire(); hooks != RetireStatus::Retired)
         {
-            logger.error("Shutdown: hooks not retired ({}); the module must stay mapped",
-                         DetourGate::to_string(retirement));
-            return retirement == DetourGate::Retirement::RestoreFailed ? ShutdownVerdict::HookRetained
-                                                                       : ShutdownVerdict::CallersActive;
+            return hooks;
         }
 
         // The detours are proven gone, so the state only they touched can be read and retired from this thread.
@@ -633,12 +611,9 @@ namespace TPVCamera
         release_zoom_binding_tokens();
         stop_offset_heal();
 
-        // Clear the game interface's resolved context pointer.
-        cleanup_game_interface();
-
         s_teardown_complete = true;
         logger.info("Shutdown: teardown complete");
-        return ShutdownVerdict::Retired;
+        return RetireStatus::Retired;
     }
 
 } // namespace TPVCamera

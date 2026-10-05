@@ -9,14 +9,11 @@
  * module_size, NOT the whole process: a generic prologue candidate could otherwise false-match inside
  * another injected module and shadow the correct in-module one.
  *
- * Every game-image address the mod hooks or reads is resolved at runtime; no static RVAs are baked in. Most
- * targets carry a multi-candidate cascade here (Context, Genv, CryActionFramework, Frustum, HeadVisibility,
- * InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide, MenuOpen); a total cascade miss fails closed
- * at the consumer (the feature degrades or that init step fails). To keep the KCD1 mod a faithful mirror of
- * KCD2 (same AnchorId set, same anchor_address() API so the ported modules compile unchanged), the AnchorId
- * enum mirrors KCD2's; the KCD1 anchor TABLE wires the cascades above and leaves the rest empty (their ids
- * resolve to 0). RayWorldIntersection / GetObjectsInBox are reached via gEnv member + live vtable slot, so
- * they are not in the table.
+ * Every game-image address the mod hooks or reads is resolved at runtime. No static RVA is baked in. The
+ * cascade tables enter the registry as the anchors AnchorId names below. resolve_all_anchors() resolves the
+ * whole table in one parallel pass at startup, and each feature reads its anchors through its gate
+ * (gated_anchor_address()), which returns 0 when any anchor the feature depends on missed. KCD1 reaches the
+ * physics ray query and the octree queries through live engine vtable slots, so they have no anchor here.
  *
  * Resolution shapes (DMK::scan::Mode -> the DMK::scan::Candidate factory):
  *   - Direct      address = match + walk_back. Entry-hook targets resolve to the function entry (walk_back
@@ -29,11 +26,8 @@
  * carries none. instruction_length is bounded at the x86-64 maximum instruction length of 15 bytes, so every
  * RipRelative candidate whose referencing instruction is not at the pattern start marks it with `|`.
  *
- * A direct call (`E8 rel32`) carries no RIP-relative MEMORY operand, so a RipRelative candidate cannot decode
- * its target. The call-site rungs therefore live in their own table (k_call_site_fallbacks): each is a Direct
- * candidate that lands on the E8 itself, and resolve_all_anchors() decodes the call target with
- * DMK::scan::resolve_rip_relative when, and only when, the target's own cascade missed. That keeps the three-
- * way redundancy the cascades were authored with (two in-function rungs plus one independent call site).
+ * A rung that matches more than once inside its scope is skipped as ambiguous, so a freak collision falls
+ * through to the next candidate rather than resolving blindly. A full cascade miss is a clean failure (0).
  *
  * Constants the game encodes in its own instructions (vtable slot offsets, member offsets, an event id) are
  * read with CodeOperand anchors rather than written down, and a Quorum anchor accepts such a value only when
@@ -41,9 +35,8 @@
  * to one function's .pdata range (resolve_turn_decision_layout, resolve_movement_type_offset), so those
  * candidates only have to be unique inside that function.
  *
- * Every candidate below was verified to return exactly one match inside its scope (WHGame.dll, or the one
- * function it is resolved in) on the Steam and GOG builds, and every cascade (call site included) resolves
- * to one target.
+ * Every candidate below matches exactly once inside its scope (WHGame.dll, or the one function it is resolved
+ * in) on the Steam 1.9.8, GOG 1.9.8 and 1.9.7 builds. Every cascade resolves to one target on each build.
  */
 #ifndef TPVCAMERA_AOB_RESOLVER_HPP
 #define TPVCAMERA_AOB_RESOLVER_HPP
@@ -69,8 +62,10 @@ namespace TPVCamera
         // (the guard-then-load shape `cmp cs:guard,reg; jg init; mov rax, cs:ctx`) back to the SLOT address.
         // The distinctive instruction(s) AFTER the load make each site unique - the guard+load prefix alone is
         // the generic shape shared by every such getter, so the suffix carries the identity. game_interface
-        // publishes this slot ADDRESS (not the pointer it holds, which is null until a level loads); a total
-        // cascade miss fails closed. The `|` marks the 7-byte `mov rax,[rip+ctx]` load (disp32 at +3).
+        // publishes this slot ADDRESS (not the pointer it holds, which is null until a level loads). The `|` marks
+        // the 7-byte `mov rax,[rip+ctx]` load (disp32 at +3). Each rung is one vote of a 2-of-3 quorum, so a
+        // coincidental match after a patch must fool two independent code sites at once, and the slot still
+        // resolves while any two of the three sites survive.
         inline const Candidate k_contextCandidates[] = {
             // sub_18033BF10: mov rax, cs:ctx; mov rcx,r12; mov rbx,[rax+128h].
             Candidate::rip_relative(
@@ -96,9 +91,9 @@ namespace TPVCamera
         // SSystemGlobalEnvironment (g_env) base
         // g_env is an embedded global struct in this CryEngine 3.8 fork (not a pointer), reached by code
         // through RIP-relative references. Each candidate decodes one such reference back to the struct base;
-        // the disp32 is wildcarded so the pattern survives the struct or the referencing code moving. Three
-        // independent reference sites in three different functions give real cascade redundancy; resolve_genv()
-        // in camera_hook fails closed (returns 0) on a total miss. All three resolve to the same g_env base.
+        // the disp32 is wildcarded, so the pattern survives a move of the struct or of the code that references it.
+        // The three reference sites lie in three different functions, and each is one vote of a 2-of-3 quorum.
+        // There is no fixed-address fallback: the Steam and GOG builds keep g_env at different addresses.
         inline const Candidate k_genvCandidates[] = {
             // sub_180E91554 struct-init: `lea rax,g_env; lea rcx,Y; mov [rdi],rcx`. The lea is at the pattern
             // start (disp32 at +3, 7-byte lea). KCD1 analog of KCD2's Genv_P2_LeaStructInit.
@@ -127,9 +122,9 @@ namespace TPVCamera
         // ADDRESS is resolved here from three independent RIP-relative references and the consumer dereferences
         // it (camera_hook resolve_cry_action()), exactly as the Context / Genv slots are. Each candidate decodes
         // a `mov reg, cs:g_pGameFramework` back to the SLOT; the load sits at the pattern start (disp32 at +3,
-        // 7-byte instruction). The slot's VALUE is the live CCryAction object the player walk reads; it holds
-        // null until the framework is constructed, and resolution is runtime-only (a total cascade miss returns
-        // 0). All three are unique and resolve to the same slot on both the Steam and GOG builds.
+        // 7-byte instruction). The slot's VALUE is the live CCryAction object the player walk reads. It holds
+        // null until the framework is constructed. The three sites lie in three different functions, and each
+        // is one vote of a 2-of-3 quorum.
         inline const Candidate k_cryActionFrameworkCandidates[] = {
             // sub_18212E348 shutdown path: `mov rcx, cs:g_pGameFramework; test rcx,rcx; jz; mov rax,[rcx];
             // call [rax+50h]`. The `call qword[rax+0x50]` (FF 50 50) past the null-check is the rare landmark.
@@ -150,9 +145,8 @@ namespace TPVCamera
         // The engine function that turns a camera's 3x4 matrix into world cull planes. It runs once per
         // CView per frame with the camera in rcx, immediately after CView::Update rebuilds the matrix, so it
         // is the final render-camera chokepoint where a third-person offset both moves the view and keeps
-        // culling consistent. P1 pins the function entry; P2 pins the matrix-read body 15 bytes in and walks
-        // back to the entry, so resolution survives a sibling mod inline-hooking the 5-byte prologue. The
-        // third, fully independent rung is the call site in sub_1803E36CC (k_frustumCallSite below).
+        // culling consistent. P1 pins the function entry. P2 pins the matrix-read body 15 bytes in and walks back
+        // to the entry. Another mod's inline hook on the 5-byte prologue leaves P2 intact.
         inline const Candidate k_frustumCandidates[] = {
             Candidate::direct("Frustum_P1_PrologueMatrixRead",
                               Pattern::literal("48 8B C4 55 48 8D 68 ?? 48 81 EC ?? ?? ?? ?? F3 0F 10 51 14 4C 8B C1")),
@@ -168,7 +162,7 @@ namespace TPVCamera
         // prologue's exact stack saves are not pinned, and the trailing branch is left out - a Jcc opcode can
         // flip between its rel8 and rel32 encodings across builds); P2 is the distinctive flag-write pair
         // `mov [rbx+disp],dil; mov [rbx+disp],sil` deeper in the body (disps wildcarded so it survives a
-        // struct-layout shift). The independent call-site rung is k_headVisibilityCallSite below.
+        // struct-layout shift).
         inline const Candidate k_headVisibilityCandidates[] = {
             Candidate::direct("Head_P1_BodyMovSilDilRbxCall",
                               Pattern::literal("41 8A F0 40 8A FA 48 8B D9 E8 ?? ?? ?? ?? 84 C0"), -0xF),
@@ -223,9 +217,7 @@ namespace TPVCamera
 
         // In-game menu open/close toggle (sub_1805B84CC, DisplayIngameMenu; state byte at this+0x41)
         // The menu game-state hook taps this. KCD1 has a single toggle (no separate open/close functions), so
-        // it is wired to AnchorId::MenuOpen and the MenuClose row stays empty. Both in-function rungs resolve to
-        // the entry; the independent call-site rung is k_menuToggleCallSite below. Resolution is runtime-only (a
-        // total miss fails closed).
+        // it is AnchorId::MenuOpen, and KCD1 has no MenuClose anchor. Both rungs resolve to the entry.
         inline const Candidate k_menuToggleCandidates[] = {
             // Prologue: shadow-save rbx/rbp/rsi; push rdi; sub rsp,20h; mov sil,dl; mov rdi,rcx; cmp [rcx+disp],dl.
             Candidate::direct("MenuToggle_P1_Prologue",
@@ -241,9 +233,8 @@ namespace TPVCamera
 
         // Action-filter Enable/DisableFilter worker (sub_1804FCC0C)
         // The overlay / apse UI signal hook taps this enable/disable convergence point. KCD1 has a single
-        // worker (no separate hide/show functions), so it is wired to AnchorId::OverlayHide and the OverlayShow
-        // row stays empty. Both in-function rungs resolve to the entry; the independent call-site rung is
-        // k_actionFilterWorkerCallSite below. Resolution is runtime-only (a total miss fails closed).
+        // worker (no separate hide and show functions), so it is AnchorId::OverlayHide, and KCD1 has no
+        // OverlayShow anchor. Both rungs resolve to the entry.
         inline const Candidate k_actionFilterWorkerCandidates[] = {
             // Prologue: mov rax,rsp; shadow-save rbx/rbp/rsi; push rdi; sub rsp,30h; mov esi,r9d; mov bpl,r8b;
             // mov rdi,rdx; mov rbx,rcx. The bpl/esi byte moves of the 4-arg shuffle are the rare bytes.
@@ -283,37 +274,6 @@ namespace TPVCamera
                               Pattern::literal("44 0F 28 E6 F3 44 0F 58 25 ?? ?? ?? ?? F3 44 0F 58 E6 0F 28 F7 F3 41 "
                                                "0F 58 F1"),
                               -0x194),
-        };
-
-        // Independent call-site rungs (E8 rel32 into the target entry)
-        // Each lands, through its `|` marker, on the 5-byte `call target` instruction in a DIFFERENT function from
-        // the target, so it survives a rewrite of the target body entirely. resolve_all_anchors() decodes the
-        // rel32 (scan::resolve_rip_relative(site, 1, 5)) only when the target's own cascade missed.
-
-        // sub_1803E36CC: `movss [rip+disp], xmm13; call UpdateFrustumPlanes`. The xmm13 RIP store
-        // (F3 44 0F 11 2D) is rare enough to make the call unique.
-        inline const Candidate k_frustumCallSite[] = {
-            Candidate::direct("Frustum_P3_CallSiteMovssXmm13",
-                              Pattern::literal("F3 44 0F 11 2D ?? ?? ?? ?? | E8 ?? ?? ?? ??")),
-        };
-
-        // `mov r8b,[rdi+disp]; mov rcx,rbx; call SetHeadHidden`.
-        inline const Candidate k_headVisibilityCallSite[] = {
-            Candidate::direct("Head_P3_CallSite", Pattern::literal("44 8A 47 ?? 48 8B CB | E8 ?? ?? ?? ??")),
-        };
-
-        // sub_1805B7B10: `call X; mov dl,1; mov rcx,[rax+18h]; call MenuToggle; add rsp,28h; retn`. The `|`
-        // marks the SECOND call (the target); the epilogue tail is kept literal for uniqueness.
-        inline const Candidate k_menuToggleCallSite[] = {
-            Candidate::direct("MenuToggle_P3_CallSite",
-                              Pattern::literal("E8 ?? ?? ?? ?? B2 01 48 8B 48 18 | E8 ?? ?? ?? ?? 48 83 C4 28 C3")),
-        };
-
-        // The EnableFilter thunk sub_1804FC414: `sub rsp,38h; mov r9d,r8d; mov [rsp+disp],0; mov r8b,1
-        // (enable=true); call ActionFilterWorker`.
-        inline const Candidate k_actionFilterWorkerCallSite[] = {
-            Candidate::direct("ActionFilterWorker_P3_CallSite",
-                              Pattern::literal("48 83 EC ?? 45 8B C8 C6 44 24 ?? ?? 41 B0 ?? | E8 ?? ?? ?? ??")),
         };
 
         // Return address of the IsThirdPerson call in C_PlayerMovementAction's turn trigger (ComputeMoveState)
@@ -435,9 +395,8 @@ namespace TPVCamera
                               Pattern::literal("F3 0F 7F 44 24 ?? | 41 FF 90 ?? ?? ?? ?? 90 E9")),
         };
         inline const Candidate k_cameraEventHandleEventIdCandidates[] = {
-            Candidate::direct(
-                "CameraEventHandleEvent_P1_Dispatch",
-                Pattern::literal("41 8B 46 08 | 83 F8 ?? [2-6] 41 83 7E 08 ?? [2-6] 41 83 7E 08 ??")),
+            Candidate::direct("CameraEventHandleEvent_P1_Dispatch",
+                              Pattern::literal("41 8B 46 08 | 83 F8 ?? [2-6] 41 83 7E 08 ?? [2-6] 41 83 7E 08 ??")),
         };
         inline const Candidate k_cameraEventOnEventIdCandidates[] = {
             Candidate::direct("CameraEventOnEvent_P1_Gate",
@@ -466,7 +425,8 @@ namespace TPVCamera
         // C_Player's LockBodyTurn reference count (int32), from LockBodyTurn itself: `mov ecx,[rcx+disp32]` before
         // it compares the count with 1. Read only, for the log.
         inline const Candidate k_lockBodyTurnCountCandidates[] = {
-            Candidate::direct("LockBodyTurnCount_P1_Compare", Pattern::literal("| 8B 89 ?? ?? ?? ?? 40 8A FA 83 F9 01")),
+            Candidate::direct("LockBodyTurnCount_P1_Compare",
+                              Pattern::literal("| 8B 89 ?? ?? ?? ?? 40 8A FA 83 F9 01")),
         };
 
         // The ladders below resolve inside one function's .pdata range, not the whole image, so each only has to be
@@ -500,9 +460,10 @@ namespace TPVCamera
         // or one different instruction could write xmm13; only the abs-mask and branch displacements are
         // wildcarded.
         inline const Candidate k_turnContractCandidates[] = {
-            Candidate::direct("TurnContract_P1_AngleThroughCall",
-                              Pattern::literal("44 0F 28 E8 F3 41 0F 5A CD 0F 54 0D ?? ?? ?? ?? 66 0F 5A F1 41 0F 2F F0 "
-                                               "0F 86 ?? ?? ?? ?? 48 8B 03 48 8B CB FF 90 ?? ?? ?? ??")),
+            Candidate::direct(
+                "TurnContract_P1_AngleThroughCall",
+                Pattern::literal("44 0F 28 E8 F3 41 0F 5A CD 0F 54 0D ?? ?? ?? ?? 66 0F 5A F1 41 0F 2F F0 "
+                                 "0F 86 ?? ?? ?? ?? 48 8B 03 48 8B CB FF 90 ?? ?? ?? ??")),
         };
 
         // `test al, al; jnz chunk; xor cl, cl`, starting at the return address: IsThirdPerson's answer picks the
@@ -521,30 +482,6 @@ namespace TPVCamera
                               Pattern::literal("0F 2F 35 ?? ?? ?? ?? | 0F 97 C1 E9")),
         };
 
-        // The branch into the game's turn path: `test cl, cl; jnz` right after the last-sign store, taken when the
-        // decision is a turn. The near `jnz` encoding is literal because its rel32 is decoded to find the path.
-        inline const Candidate k_turnPathBranchCandidates[] = {
-            Candidate::direct("TurnPathBranch_P1_TestJump",
-                              Pattern::literal("F3 0F 11 97 ?? ?? ?? ?? | 84 C9 0F 85 ?? ?? ?? ??")),
-        };
-
-        // The turn path (the branch target, in the cold fragment), matched exactly at its first byte. It picks the
-        // turn fragment type into esi:
-        //   comiss xmm1, xmm6            90 degrees against |angle|
-        //   jae                          to `mov esi, 1` (a small turn)
-        //   cmp dword [rdi+disp32], -1   the large-turn fragment id
-        //   mov esi, 2                   a large turn
-        //   jne                          over `mov esi, 1`
-        //   mov esi, 1                   a small turn, also for an action without a large-turn fragment
-        // The `|` is the next instruction, `mov eax, [rdi+disp32]` (the installed-turn state). esi holds the choice
-        // there on every path. The short branch distances are literal, because they prove that.
-        inline const Candidate k_turnKindCandidates[] = {
-            Candidate::direct(
-                "TurnKind_P1_ChoiceThroughStateRead",
-                Pattern::literal("0F 2F CE 73 0E 83 BF ?? ?? ?? ?? FF BE 02 00 00 00 75 05 BE 01 00 00 00 "
-                                 "| 8B 87 ?? ?? ?? ??")),
-        };
-
         // ComputeMoveState's turn-angle output pointer: `mov r12, rdx` in the prologue (searched within the prologue
         // length the unwind info declares) and `test r12, r12; jz; movss [r12], xmm` storing through it.
         inline const Candidate k_turnOutputSaveCandidates[] = {
@@ -557,7 +494,8 @@ namespace TPVCamera
         // CAnimatedCharacter's movement request type (int32: 1 absolute, 2 impulse), inside
         // UpdatePhysicalEntityMovement: `cmp dword [rbx+disp32], 1; lea r12d, [rax+2]`.
         inline const Candidate k_movementTypeCandidates[] = {
-            Candidate::direct("MovementType_P1_CompareAbsolute", Pattern::literal("| 83 BB ?? ?? ?? ?? 01 44 8D 60 02")),
+            Candidate::direct("MovementType_P1_CompareAbsolute",
+                              Pattern::literal("| 83 BB ?? ?? ?? ?? 01 44 8D 60 02")),
         };
 
         // CActionScope::InstallAnimation's lookup of a clip's animation:
@@ -587,15 +525,15 @@ namespace TPVCamera
         };
 
         // Identity checks on a vtable slot's target, searched within its first bytes (see read_checked_vtable_slot in
-        // camera_hook.cpp). IsThirdPerson asks the active camera (`mov rcx,rax; mov rdx,[rax]; call [rdx+disp8]`);
-        // C_CameraObserver's update reads the view camera through ISystem (`call [rax+3A0h]`).
+        // camera_hook.cpp). IsThirdPerson asks the active camera (`mov rcx, rax; mov rdx, [rax]; call [rdx+disp8]`).
+        // C_CameraObserver's update fetches the view camera through ISystem (`call [rax+disp32]`) and copies its
+        // translation column (`[rax+1Ch]`, `[rax+0Ch]`, `[rax+2Ch]`) into its position out-parameter. The ISystem
+        // slot is wildcarded, because KCD2 renumbers it between its builds, and the translation reads pin the call.
         inline constexpr Pattern k_isThirdPersonBody = Pattern::literal("48 8B C8 48 8B 10 FF 52 ??");
         inline constexpr std::size_t k_isThirdPersonBodyWindow = 0x50;
-        inline constexpr Pattern k_cameraObserverUpdateBody = Pattern::literal("FF 90 A0 03 00 00");
-        inline constexpr std::size_t k_cameraObserverUpdateBodyWindow = 0x30;
-        // C_Player::HandleEvent's dispatch of the camera-changed event (see handle_event_dispatch()), searched within
-        // its first 0x100 bytes.
-        inline constexpr std::size_t k_handleEventBodyWindow = 0x100;
+        inline constexpr Pattern k_cameraObserverUpdateBody =
+            Pattern::literal("48 8B 01 FF 90 ?? ?? ?? ?? F3 0F 10 50 1C F3 0F 10 48 0C F3 0F 10 40 2C");
+        inline constexpr std::size_t k_cameraObserverUpdateBodyWindow = 0x40;
         // CAnimationSet's GetAnimIDByCRC slot holds a thunk, matched at its first byte: `add rcx, imm8` (to the name
         // map), then `jmp rel32` (to the map lookup).
         inline constexpr Pattern k_animIdByCrcThunk = Pattern::literal("48 83 C1 ?? E9");
@@ -611,54 +549,44 @@ namespace TPVCamera
         // heads prove both the slot numbering and the typed query's argument layout before it is ever called:
         //   mov rax, rsp; mov [rax+8], rbx; push rdi; sub rsp, 30h; and qword ptr [rax-18h], 0;
         //   mov rdi, r9 (typed) / r8 (untyped); and dword ptr [rax-10h], 0; lea r9 / r8, [rax-18h] (the PodArray)
-        inline constexpr Pattern k_engine3dTypedQueryHead = Pattern::literal(
-            "48 8B C4 48 89 58 08 57 48 83 EC 30 48 83 60 E8 00 49 8B F9 83 60 F0 00 4C 8D 48 E8");
-        inline constexpr Pattern k_engine3dUntypedQueryHead = Pattern::literal(
-            "48 8B C4 48 89 58 08 57 48 83 EC 30 48 83 60 E8 00 49 8B F8 83 60 F0 00 4C 8D 40 E8");
+        inline constexpr Pattern k_engine3dTypedQueryHead =
+            Pattern::literal("48 8B C4 48 89 58 08 57 48 83 EC 30 48 83 60 E8 00 49 8B F9 83 60 F0 00 4C 8D 48 E8");
+        inline constexpr Pattern k_engine3dUntypedQueryHead =
+            Pattern::literal("48 8B C4 48 89 58 08 57 48 83 EC 30 48 83 60 E8 00 49 8B F8 83 60 F0 00 4C 8D 40 E8");
     } // namespace Aob
 
     /**
      * @brief Stable identity for every game-image anchor the mod resolves at startup.
-     * @details Mirrors the KCD2 AnchorId set so the ported modules compile unchanged, plus the KCD1-specific
-     *          CryActionFramework id after GetObjectsInBox, ahead of the native-turn ids (KCD2 reaches the framework
-     *          through gEnv, KCD1 through a .data singleton slot). The enumerator order IS the table order; Count is
-     *          the element count and is not a valid anchor. On KCD1 the Context, Genv, CryActionFramework, Frustum,
-     *          HeadVisibility, InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide (the action-filter
-     *          worker), MenuOpen (the menu toggle), TurnTriggerReturn, LockSyncReturn and PhysEntMovement ids carry a
-     *          cascade; every other id up to PhysEntMovement resolves to 0 (its consumer reaches the target via a gEnv
-     *          member / vtable slot, or is stubbed). The ids from IsThirdPersonSlot to AnimIdByCrcSlot are
-     *          KCD1-specific scalars decoded from game code (anchor_value()), not addresses. AnimNameHashCall is a
-     *          call site, and its consumer decodes the callee.
+     * @details Indexes the declarative anchor table that resolve_all_anchors() resolves once, and the stores the gated
+     *          accessors read. The enumerator order IS the table order. Count is the element count and is not a valid
+     *          anchor. The ids up to PhysEntMovement are addresses. The ids from IsThirdPersonSlot to AnimIdByCrcSlot
+     *          are scalars decoded from game code, not addresses. AnimNameHashCall is a call site, and its consumer
+     *          decodes the callee. KCD2 reaches the game framework through g_env, and KCD1 through the
+     *          CryActionFramework slot.
      */
     enum class AnchorId : std::size_t
     {
-        Context,              // global-context storage slot (KCD1: RIP-relative AOB cascade)
-        Genv,                 // SSystemGlobalEnvironment base (KCD1: RIP-relative AOB cascade)
-        Frustum,              // camera frustum builder (mandatory hook target)
-        HeadVisibility,       // head-visibility setter
-        InputDispatch,        // generic input-event dispatcher (KCD1: AOB cascade)
-        ActionDispatch,       // global action dispatcher (KCD1: AOB cascade)
-        RayWorldIntersection, // IPhysicalWorld::RayWorldIntersection (KCD1: vtable slot, not in the table)
-        InteractionRayBuild,  // interaction ray-query builder (KCD1: unused; reserved)
-        InteractorLookRay,    // interactor look-ray builder (KCD1: AOB cascade)
-        InteractionOnScreen,  // on-screen reticle projection gate (KCD1: stubbed)
-        OverlayHide,          // action-filter worker (KCD1: AOB cascade; one toggle for hide/show)
-        OverlayShow,          // ShowOverlays (KCD1: folded into OverlayHide's single worker; not in the table)
-        MenuOpen,             // menu open/close toggle (KCD1: AOB cascade; one toggle for both)
-        MenuClose,            // UI menu-close entry (KCD1: folded into MenuOpen's single toggle; not in the table)
-        GetObjectsInBox,      // I3DEngine::GetObjectsInBox (KCD1: vtable slot, not in the table)
-        CryActionFramework,   // CCryAction game-framework singleton .data slot (KCD1-specific: RIP-rel AOB cascade)
-        TurnTriggerReturn,    // IsThirdPerson return address in the turn trigger (compared, not hooked)
-        LockSyncReturn,       // IsThirdPerson return address in the idle LockBodyTurn sync (compared, not hooked)
-        PhysEntMovement,      // CAnimatedCharacter::UpdatePhysicalEntityMovement (turn steps kept in place)
-        IsThirdPersonSlot,    // C_Player IsThirdPerson vtable byte offset (quorum of its two call sites)
-        HandleEventSlot,      // C_Player HandleEvent vtable byte offset (the camera-changed event's sender)
-        CameraEventId,        // camera-changed SGameObjectEvent id (2-of-3 quorum: sender, HandleEvent, OnEvent)
-        CameraEventFlags,     // camera-changed SGameObjectEvent target/flags word (the sender)
-        TurnInstalledState,   // C_PlayerMovementAction installed-turn state offset (quorum: trigger, OnEvent)
-        LockBodyTurnCount,    // C_Player LockBodyTurn reference-count offset (LockBodyTurn itself; log only)
-        AnimIdByCrcSlot,      // CAnimationSet GetAnimIDByCRC vtable byte offset (CActionScope::InstallAnimation)
-        AnimNameHashCall,     // the call to the animation-name hash in CAnimationSet::GetAnimIDByName
+        Context,            // global-context storage slot (camera-manager root; 2-of-3 quorum)
+        Genv,               // SSystemGlobalEnvironment base (2-of-3 quorum)
+        Frustum,            // camera frustum builder (mandatory hook target)
+        HeadVisibility,     // head-visibility setter
+        InputDispatch,      // generic input-event dispatcher
+        ActionDispatch,     // global action dispatcher
+        InteractorLookRay,  // interactor look-ray builder
+        OverlayHide,        // action-filter worker (one function for hide and show)
+        MenuOpen,           // in-game menu toggle (one function for open and close)
+        CryActionFramework, // CCryAction game-framework singleton .data slot (2-of-3 quorum)
+        TurnTriggerReturn,  // IsThirdPerson return address in the turn trigger (compared, not hooked)
+        LockSyncReturn,     // IsThirdPerson return address in the idle LockBodyTurn sync (compared, not hooked)
+        PhysEntMovement,    // CAnimatedCharacter::UpdatePhysicalEntityMovement (turn steps kept in place)
+        IsThirdPersonSlot,  // C_Player IsThirdPerson vtable byte offset (quorum of its two call sites)
+        HandleEventSlot,    // C_Player HandleEvent vtable byte offset (the camera-changed event's sender)
+        CameraEventId,      // camera-changed SGameObjectEvent id (2-of-3 quorum: sender, HandleEvent, OnEvent)
+        CameraEventFlags,   // camera-changed SGameObjectEvent target/flags word (the sender)
+        TurnInstalledState, // C_PlayerMovementAction installed-turn state offset (quorum: trigger, OnEvent)
+        LockBodyTurnCount,  // C_Player LockBodyTurn reference-count offset (LockBodyTurn itself; log only)
+        AnimIdByCrcSlot,    // CAnimationSet GetAnimIDByCRC vtable byte offset (CActionScope::InstallAnimation)
+        AnimNameHashCall,   // the call to the animation-name hash in CAnimationSet::GetAnimIDByName
         Count,
     };
 
@@ -673,42 +601,88 @@ namespace TPVCamera
         std::ptrdiff_t installed_state_offset = 0;
         /// The previous evaluation's gap sign (float; 0 = none).
         std::ptrdiff_t last_sign_offset = 0;
-        /// The instruction after the turn path's fragment-type choice, where esi holds the choice (0 = unresolved).
-        std::uintptr_t kind_site = 0;
     };
 
     /**
-     * @brief Resolves every game-image anchor in one parallel pass and records the results.
-     * @details Builds the declarative DMK::anchor table over the KCD1 cascade candidate arrays above and
-     *          resolves it with anchor::resolve_all_parallel, confined to the WHGame.dll image
-     *          [module_base, module_base + module_size). The explicit range is required: the DMK default
-     *          DMK::Region::host() is the host EXE, not WHGame.dll. The call-site fallbacks resolve in the same pass
-     *          and stand in for a target whose own cascade missed. Each resolved address is stored for
-     *          anchor_address(); a per-anchor status line, an assess_quality() summary, and the startup gate
-     *          verdict are logged. Anchors with no cascade record 0 and their consumers degrade (fail closed, or
-     *          reach the target via a gEnv member / vtable slot).
+     * @brief A mod feature, enabled only through the gate over exactly the anchors it depends on.
+     * @details resolve_all_anchors() evaluates each gate with DMK::anchor::evaluate_gate under the default, fail-closed
+     *          policy (`[B-51]`): one failed anchor turns the whole feature off, so a feature never runs on a partial
+     *          set. The enumerator order IS the gate table order. Count is the element count and is not a feature.
+     */
+    enum class Feature : std::size_t
+    {
+        Camera,             // Frustum: the third-person camera itself
+        GameState,          // Context: the camera-manager reads behind menu, combat and mount detection
+        Engine,             // Genv: the engine interfaces (aim convergence, collision, occlusion)
+        Framework,          // CryActionFramework: the player walk (player look, body turn, native turns)
+        HeadVisibility,     // HeadVisibility: the player head from behind
+        Orbit,              // InputDispatch: free-look orbit
+        MoveIntent,         // ActionDispatch: device-agnostic movement intent for orbit move detection
+        Interaction,        // InteractorLookRay, Context: camera-space interaction from the framework view pose
+        OverlayState,       // OverlayHide: offset suppression under game UI
+        MenuState,          // MenuOpen: offset suppression under the in-game menu
+        NativeTurn,         // the IsThirdPerson call sites and slot, and the camera-changed event: native turns
+        TurnDecision,       // TurnInstalledState, with the function-scoped proofs: turns that finish on the look
+        TurnSteps,          // PhysEntMovement: turn steps kept in place
+        CrouchedAnimations, // AnimIdByCrcSlot, AnimNameHashCall: the NPC crouched idle and turns for the player
+        Count,
+    };
+
+    /**
+     * @brief Resolves every game-image anchor, applies the signature file's repairs, and evaluates the feature gates.
+     * @details Builds the declarative DMK::anchor table over the cascade candidate arrays above and resolves it with
+     *          anchor::resolve_all_parallel, confined to the WHGame.dll image [module_base, module_base +
+     *          module_size). The explicit range is required: the DMK default host_module_range() is the host EXE,
+     *          not WHGame.dll. Every row carries a role validator (require_validator): a function entry must lie on an
+     *          executable page, open like a function and agree with its .pdata start, an instruction site must lie
+     *          on an executable page, and a global must lie on a readable page that is not code. A
+     *          KCD1_TPVCamera.signatures.ini beside the ASI can then replace a byte-signature or code-operand row by
+     *          label (DMK::manifest::overlay). A repair counts only after it passes the manifest trust gate, and a
+     *          repaired hook target needs the full mutation baselines. A per-anchor status line, the gate verdicts,
+     *          and an assess_quality() summary are logged.
      * @note Setup/control-plane only: allocates and spawns a transient worker pool. Call once at init.
      */
     void resolve_all_anchors(std::uintptr_t module_base, std::size_t module_size);
 
     /**
-     * @brief Returns the resolved absolute address for an anchor, or 0 if it did not resolve.
-     * @note Valid only after resolve_all_anchors() has run; returns 0 before then or on a cascade miss.
+     * @brief Writes every built-in signature, with the baselines captured from the live image, to
+     *        KCD1_TPVCamera.signatures.captured.ini beside the ASI.
+     * @details The file is the editable form of the built-in contract (`[B-54]`). After a game update, a section copied
+     *          into KCD1_TPVCamera.signatures.ini and given a new pattern repairs that signature without a rebuild.
+     *          Quorum anchors have no file form and are not exported.
+     * @note Setup/control-plane only. Call after resolve_all_anchors().
      */
-    [[nodiscard]] std::uintptr_t anchor_address(AnchorId id) noexcept;
+    void export_signatures();
 
     /**
-     * @brief Returns the resolved value of an anchor, or std::nullopt if it did not resolve.
-     * @details For the scalar anchors (a vtable byte offset, a member offset, an event constant), the value decoded
-     *          from game code and accepted by its plausibility check; for an address anchor, the address.
-     * @note Valid only after resolve_all_anchors() has run.
+     * @brief True when @p feature's gate passed, so every anchor it depends on resolved.
+     * @note Valid only after resolve_all_anchors() has run. It returns false before then.
+     */
+    [[nodiscard]] bool feature_ready(Feature feature) noexcept;
+
+    /**
+     * @brief Returns @p id's resolved address when @p feature's gate passed, else 0.
+     * @details @p id must be one of the anchors @p feature depends on.
+     */
+    [[nodiscard]] std::uintptr_t gated_anchor_address(Feature feature, AnchorId id) noexcept;
+
+    /**
+     * @brief Returns @p id's resolved value when @p feature's gate passed, else std::nullopt.
+     * @details For a scalar anchor, the value decoded from game code and accepted by its plausibility check.
+     */
+    [[nodiscard]] std::optional<std::int64_t> gated_anchor_value(Feature feature, AnchorId id) noexcept;
+
+    /**
+     * @brief Returns @p id's resolved value with no feature gate, or std::nullopt.
+     * @details Only for a value no feature depends on (a diagnostic read). A feature reads through its gate.
      */
     [[nodiscard]] std::optional<std::int64_t> anchor_value(AnchorId id) noexcept;
 
     /**
-     * @brief Finds and proves the turn-decision hook site and the action fields it reads, around @p trigger_return.
-     * @details Everything resolves relative to the turn-trigger return address and inside the function that holds
-     *          it (its .pdata range), never at a fixed distance:
+     * @brief Finds and proves the turn hook sites and the action fields the decision hook reads, around
+     *        @p trigger_return.
+     * @details Requires the Feature::TurnDecision gate. Everything resolves relative to the turn-trigger return
+     *          address and inside the function that holds it (its .pdata range), never at a fixed distance:
      *          - the register contract window ends on the return address (k_turnContractCandidates);
      *          - the `test al, al; jnz; xor cl, cl` at the return address gives the join (k_turnJoinCandidates);
      *          - the jnz target is decoded, and the chunk there must open with the compare, `seta cl` and a jmp that
@@ -716,11 +690,8 @@ namespace TPVCamera
      *          - `mov r12, rdx` lies in the prologue and the output store in the same fragment as the trigger;
      *          - the spin latch and last sign are 2-of-2 quorums inside that fragment, and the installed state is
      *            the TurnInstalledState anchor.
-     *          - optionally, the `jnz` after the decision test decodes to the turn path. The path must open exactly
-     *            with the fragment-type choice (k_turnKindCandidates) and read the same installed-state field. A
-     *            failure leaves kind_site 0 and logs a warning, and the layout still holds.
      *          Each scoped anchor is appended to anchor_report(). Logs the first proof that fails.
-     * @return The layout, or std::nullopt when any required proof fails.
+     * @return The layout, or std::nullopt when any proof fails.
      * @note Setup/control-plane only. Call on the init thread after resolve_all_anchors().
      */
     [[nodiscard]] std::optional<TurnDecisionLayout> resolve_turn_decision_layout(std::uintptr_t trigger_return);
@@ -735,8 +706,17 @@ namespace TPVCamera
     resolve_movement_type_offset(std::uintptr_t update_physical_entity_movement);
 
     /**
-     * @brief Returns the retained per-anchor resolution report (wired cascades, call-site rungs, then the
-     *        function-scoped anchors the resolve_* helpers above add).
+     * @brief True when the function at @p handle_event dispatches the camera-changed event @p event_id.
+     * @details Searches the function's whole .pdata range, which must begin at @p handle_event, for the shape the
+     *          k_cameraEventHandleEventIdCandidates vote reads the id from, with @p event_id filled in. Finding it in
+     *          the HandleEvent slot's target ties that slot to the function the vote read the id from.
+     * @note Setup/control-plane only: compiles the pattern at runtime.
+     */
+    [[nodiscard]] bool dispatches_camera_event(std::uintptr_t handle_event, std::uint8_t event_id);
+
+    /**
+     * @brief Returns the retained per-anchor resolution report (the startup table, then the function-scoped anchors
+     *        the resolve_* helpers above add).
      * @details The same span resolve_all_anchors() logged its quality summary from, kept so
      *          diagnostics::collect() can roll it into the mod's health snapshot rather than the mod
      *          re-deriving the counts. Empty before resolve_all_anchors() has run.
@@ -745,21 +725,16 @@ namespace TPVCamera
     [[nodiscard]] std::span<const DMK::anchor::ResolvedAnchor> anchor_report() noexcept;
 
     /**
-     * @brief True when @p pattern matches the code starting exactly at @p address (at most 64 bytes).
-     * @details Proves the instructions an engine call depends on at an address read from live data (a vtable slot),
-     *          before the call is trusted, so a build that changed them is refused.
-     * @note One guarded read per call: for install time or a change of the checked code, never per frame.
+     * @brief True when @p signature matches within the first @p window bytes of the code at @p target, all inside
+     *        @p image.
+     * @details A window of the pattern's own length requires the match to start exactly at @p target. Proves the
+     *          instructions a call or hook depends on at an address read from live data (a vtable slot), before it
+     *          is trusted. A build that changed them is refused. A window above 0x80 bytes never matches.
+     * @note Callback-safe: one guarded read of the window onto the stack, no allocation, lock, or I/O. The render
+     *       path calls it when the engine vtable it reads changes.
      */
-    [[nodiscard]] bool code_matches(std::uintptr_t address, const DMK::scan::Pattern &pattern) noexcept;
-
-    /**
-     * @brief C_Player::HandleEvent's dispatch of the camera-changed event, with @p event_id filled in.
-     * @details The k_cameraEventHandleEventIdCandidates vote's shape (`mov eax,[r14+8]; cmp eax, id`, a jz, then
-     *          the next event compare `cmp dword [r14+8], imm8`). Finding it in the HandleEvent slot's target ties
-     *          that slot to the function the vote read the id from.
-     * @note Setup/control-plane only: compiles the pattern at runtime.
-     */
-    [[nodiscard]] DMK::Result<DMK::scan::Pattern> handle_event_dispatch(std::uint8_t event_id);
+    [[nodiscard]] bool code_window_matches(std::uintptr_t target, const DMK::scan::Pattern &signature,
+                                           std::size_t window, const DMK::Region &image) noexcept;
 } // namespace TPVCamera
 
 #endif // TPVCAMERA_AOB_RESOLVER_HPP

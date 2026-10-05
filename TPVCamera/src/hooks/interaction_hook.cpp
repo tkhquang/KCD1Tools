@@ -28,7 +28,6 @@
 #include "aob_resolver.hpp"
 #include "config.hpp"
 #include "constants.hpp"
-#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
@@ -61,12 +60,12 @@ namespace TPVCamera
          * @details The interaction redirect needs the framework's view subsystem (framework +
          *          FRAMEWORK_VIEW_OFFSET). The framework is the value held in the global-context .data slot (the
          *          engine's framework getter does nothing but load that slot), so it is read from the slot the
-         *          Context AOB cascade resolves: *(ctx_slot) equals the getter's return. A total Context cascade
-         *          miss fails closed (0), and resolve_view_pose then leaves the native selection in place.
+         *          Context quorum resolves: *(ctx_slot) equals the getter's return. A failed Interaction gate
+         *          returns 0, and resolve_view_pose then leaves the native selection in place.
          */
         uintptr_t resolve_framework() noexcept
         {
-            const uintptr_t ctx_slot = anchor_address(AnchorId::Context);
+            const uintptr_t ctx_slot = gated_anchor_address(Feature::Interaction, AnchorId::Context);
             if (ctx_slot == 0)
             {
                 return 0;
@@ -127,7 +126,7 @@ namespace TPVCamera
                 double hasin0 = -1.0;
                 if (r > 0.00001)
                 {
-                    hacos0 = hvy / r;  // yaw
+                    hacos0 = hvy / r; // yaw
                     hasin0 = -hvx / r;
                 }
                 const double hacos1 = hvz / s; // pitch
@@ -202,7 +201,7 @@ namespace TPVCamera
         uintptr_t __fastcall selection_detour(uintptr_t interactor, uintptr_t out, uintptr_t flag, uintptr_t out2,
                                               int mode) noexcept
         {
-            const DetourGate::Pass pass;
+            const DetourScope in_flight;
             const SelectionFunc original = s_selection_original.load(std::memory_order_acquire);
             if (original == nullptr)
             {
@@ -213,8 +212,7 @@ namespace TPVCamera
             // offset is actually applied; every UI/menu state (main menu, in-game menu, inventory, map, dialogue)
             // raises an Overlay action filter that suppresses the offset (SuppressTPVState=Overlay), which
             // invalidates the pose - so this single check excludes all of them, no separate cursor gate needed.
-            if (!settings().interact_from_camera.load(std::memory_order_relaxed) ||
-                !interaction_aim_pose().is_valid())
+            if (!settings().interact_from_camera.load(std::memory_order_relaxed) || !interaction_aim_pose().is_valid())
             {
                 return original(interactor, out, flag, out2, mode);
             }
@@ -265,12 +263,12 @@ namespace TPVCamera
 
     } // namespace
 
-    DMK::Result<void> initialize_interaction_hook(DMK::hook::HookStack &hooks)
+    DMK::Result<void> initialize_interaction_hook(HookSet &hooks)
     {
-        // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates); a total cascade miss fails
-        // closed. The default hook::Options prologue policy is Fail (refuse a breakpoint first byte); a sibling
-        // mod's E9 jump-hook does not trip it, so layering still works.
-        const uintptr_t hook_addr = anchor_address(AnchorId::InteractorLookRay);
+        // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates), read through the Interaction
+        // gate. The default hook::Options prologue policy is Fail (refuse a breakpoint first byte). A sibling mod's
+        // E9 jump-hook does not trip it, so layering still works.
+        const uintptr_t hook_addr = gated_anchor_address(Feature::Interaction, AnchorId::InteractorLookRay);
         if (hook_addr == 0)
         {
             DMK::log().error("InteractionHook: InteractorLookRay cascade unresolved (interaction selection)");
@@ -280,7 +278,10 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "InteractionSelection",
                                                                          .target = DMK::Address{hook_addr}},
                                                 &selection_detour));
-        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_selection_original));
+        // Publish the trampoline and store the handle BEFORE enable() arms the patch, so the set owns a hook whose arm
+        // fails with the patch live.
+        s_selection_original.store(installed.original<SelectionFunc>(), std::memory_order_release);
+        DMK_TRY_VOID(hooks.push(std::move(installed)).enable());
 
         DMK::log().info("InteractionHook: hooked interactor selection at {} (view-consistent camera-space "
                         "interaction enabled)",

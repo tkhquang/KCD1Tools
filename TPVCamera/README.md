@@ -88,6 +88,17 @@ Defaults: toggle third-person `F3` (or hold `LB + RB`), free-look orbit `F4`, pr
 
 For the full controls, the per-situation preset system, the collision options, the hotkey format, controller notes, and troubleshooting, see the **KCD2 mod page**: [Proper Third Person View (TPV Camera)](https://www.nexusmods.com/kingdomcomedeliverance2/mods/3263). The two mods share the same INI layout and overlay, so that documentation applies here as well; the only differences are the game (KC:D 1) and the binary folder above.
 
+### Repairing a broken signature
+
+If a game build breaks a feature, the log names the signature that stopped resolving (`Anchor <name> unresolved`) and the feature that turned off (`Feature gate: <name> Fail`). The rest of the mod keeps working. A broken signature can be repaired without a new build of the mod:
+
+1. Set `ExportSignatures = true` in `[Advanced]` and start the game once. The mod writes every built-in signature to `KCD1_TPVCamera.signatures.captured.ini`.
+2. Copy the broken `[sig.<name>]` section and its `.rung.<N>` sections into a new `KCD1_TPVCamera.signatures.ini` beside the ASI, under the same `[manifest]` header.
+3. Change the `pattern` to match the new game build, and delete the `fingerprint`, `image_identity` and `winning_bytes` lines of that section.
+4. A repair of a signature the mod only calls or reads takes effect at the next start. A repair of a hook target also needs its baselines: start the game once more with `ExportSignatures = true`, then copy the repaired section, with its new baseline lines, from the captured file into `KCD1_TPVCamera.signatures.ini`.
+
+The log reports each repair (`Signatures: <name> uses the repair from the signature file`) and refuses one that it cannot trust. A file written for another signature revision is ignored.
+
 ## Building from Source
 
 Requires Visual Studio 2022 (MSVC) and CMake 3.28+. DetourModKit v4.3.0 is the `external/DetourModKit` submodule; initialize submodules first (the build requires it).
@@ -101,14 +112,20 @@ cmake --build --preset msvc-release
 
 ### Developer hot-reload build (optional)
 
-The `msvc-dev` preset builds DetourModKit's staged-reload pair: a resident loader (`KCD1_TPVCamera.asi`) and the mod logic (`KCD1_TPVCamera.logic.dll`). Set `TPVCAMERA_GAME_DIR` to the game's `Bin/Win64` folder and both deploy there (the preset defaults it to the standard Steam install folder).
+The `msvc-dev` preset builds a resident loader (`KCD1_TPVCamera.asi`) and the mod logic (`KCD1_TPVCamera.logic.dll`) that the loader replaces in the running game. It follows DetourModKit's staged-generation pattern ([hot-reload guide](https://github.com/tkhquang/DetourModKit/blob/main/docs/guides/hot-reload/README.md)). Set `TPVCAMERA_GAME_DIR` to the game's `Bin/Win64` folder (the preset defaults it to the standard Steam install folder).
 
 ```bash
 cmake --preset msvc-dev -DTPVCAMERA_GAME_DIR="<game>/Bin/Win64"
 cmake --build --preset msvc-dev
 ```
 
-Rebuild while the game runs, then press **Numpad 0** with the game focused. The loader retires the current generation and loads a uniquely named copy of the new build (`KCD1_TPVCamera.genNNNN.logic.dll`). It records each decision, including the build revision, in `KCD1_TPVCamera.loader.log`. A generation that cannot prove its hooks and workers quiescent stays loaded but inert. The loader never re-initializes it, and asks for a game restart when its retention budget runs out. See DetourModKit's [hot-reload guide](https://github.com/tkhquang/DetourModKit/blob/main/docs/guides/hot-reload/README.md).
+The build deploys the loader beside the game and the logic DLL with its PDB to `staging/` in the game folder. Release Numpad 0 while the game window has focus to reload:
+
+1. The live generation's `Shutdown()` joins the mod's threads, disables every hook, waits until no game thread is inside a detour, restores the hooked code, and drains DetourModKit's input and config callbacks. It refuses retirement when any step fails, and the old generation then stays mapped.
+2. The loader promotes the staged build and maps a copy under a unique name (`KCD1_TPVCamera.genNNNN.logic.dll`), so a rebuild never collides with a mapped image.
+3. A generation that retires with a retained resource stays mapped, within a budget of 32 images and 128 MiB. A full budget or an unproven retirement stops further reloads until the game restarts.
+
+`KCD1_TPVCamera_Loader.log` beside the ASI records each generation, its build identity, and the retirement verdict. A change to `src/dev/protocol.h` or `src/dev/mod_loader.cpp` needs a game restart, because the loader itself is never reloaded.
 
 The C++ sources follow DetourModKit's coding conventions ([AGENTS.md](https://github.com/tkhquang/DetourModKit/blob/main/AGENTS.md)).
 

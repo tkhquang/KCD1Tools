@@ -114,7 +114,7 @@ namespace TPVCamera
             // camera slot (OFFSET_ACTIVE_CAMERA). DMK::memory::walk screens every dereferenced link under a single
             // fault guard and hands back the leaf ADDRESS; the camera pointer read from it is not range-checked by the
             // walk, so it is screened here before use.
-            const std::array<std::ptrdiff_t, 2> camera_chain{offset_value(runtime_offsets().context_manager),
+            const std::array<std::ptrdiff_t, 2> camera_chain{runtime_offsets().context_manager.load().value,
                                                              Constants::OFFSET_ACTIVE_CAMERA};
             const auto camera_slot = DMK::memory::walk(DMK::Address{*context}, camera_chain);
             if (!camera_slot)
@@ -177,7 +177,7 @@ namespace TPVCamera
          */
         [[nodiscard]] uint32_t poll_active_minigame(uintptr_t c_player) noexcept
         {
-            (void)c_player; // single-player: the only map entry is the player's
+            (void)c_player;           // single-player: the only map entry is the player's
             s_dbg_minigame_size = -1; // diagnostic: set to the real _Mysize below once the map resolves
             const auto context_slot = g_global_context_ptr_address.load(std::memory_order_relaxed);
             if (!context_slot)
@@ -187,7 +187,7 @@ namespace TPVCamera
             // Walk g_global_context -> C_PlayerModule -> std::map holder slot under one fault guard (each
             // dereferenced link screened by the walk's plausibility floor). DMK::memory::walk hands back the leaf
             // ADDRESS; the map value read from it is screened here, because the walk does not range-check the leaf.
-            const std::array<std::ptrdiff_t, 3> map_chain{0, offset_value(runtime_offsets().context_minigame_subsystem),
+            const std::array<std::ptrdiff_t, 3> map_chain{0, runtime_offsets().context_minigame_subsystem.load().value,
                                                           Constants::OFFSET_MINIGAME_MAP};
             const auto map_slot = DMK::memory::walk(DMK::Address{reinterpret_cast<uintptr_t>(context_slot)}, map_chain);
             if (!map_slot)
@@ -249,7 +249,7 @@ namespace TPVCamera
         [[nodiscard]] uint32_t poll_stance(uintptr_t c_player) noexcept
         {
             const auto actor_model = DMK::memory::read<uintptr_t>(
-                DMK::Address{c_player + offset_value(runtime_offsets().c_player_actor_model)});
+                DMK::Address{c_player + runtime_offsets().c_player_actor_model.load().value});
             if (!actor_model || !DMK::memory::is_plausible_ptr(DMK::Address{*actor_model}))
             {
                 return 0u;

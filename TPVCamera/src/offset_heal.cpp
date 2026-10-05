@@ -346,16 +346,6 @@ namespace TPVCamera
         return offsets;
     }
 
-    std::ptrdiff_t offset_value(const DMK::rtti::HealedSlot &slot) noexcept
-    {
-        return slot.load().value;
-    }
-
-    DMK::Result<std::ptrdiff_t> write_authorized_offset(const DMK::rtti::HealedSlot &slot) noexcept
-    {
-        return slot.authorized();
-    }
-
     void note_framework_base(std::uintptr_t cry_action) noexcept
     {
         s_cry_action_base.store(cry_action, std::memory_order_relaxed);
@@ -447,7 +437,7 @@ namespace TPVCamera
                     return false;
                 }
                 const auto action_game = DMK::memory::read<std::uintptr_t>(
-                    DMK::Address{cry_action + offset_value(offsets.ccryaction_actiongame)});
+                    DMK::Address{cry_action + offsets.ccryaction_actiongame.load().value});
                 return action_game.has_value() && DMK::memory::is_plausible_ptr(DMK::Address{*action_game});
             });
 
@@ -501,7 +491,7 @@ namespace TPVCamera
             {
                 const std::uintptr_t c_player = s_player_base.load(std::memory_order_relaxed);
                 const auto anim_human = DMK::memory::read<std::uintptr_t>(
-                    DMK::Address{c_player + offset_value(offsets.c_player_animated_human)});
+                    DMK::Address{c_player + offsets.c_player_animated_human.load().value});
                 if (!anim_human || !DMK::memory::is_plausible_ptr(DMK::Address{*anim_human}))
                 {
                     return false;

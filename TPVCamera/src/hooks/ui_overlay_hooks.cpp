@@ -18,7 +18,6 @@
 #include "ui_overlay_hooks.hpp"
 #include "aob_resolver.hpp"
 #include "constants.hpp"
-#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
@@ -143,18 +142,18 @@ namespace TPVCamera
     static void *__fastcall action_filter_worker_detour(void *mgr, const char *name, std::int64_t enable_raw,
                                                         unsigned int a4, char a5) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         guarded_update_overlay(name, (enable_raw & 0xFF) != 0);
         const ActionFilterWorkerFunc original = s_worker_original.load(std::memory_order_acquire);
         return original ? original(mgr, name, enable_raw, a4, a5) : nullptr;
     }
 
-    DMK::Result<void> initialize_ui_overlay_hooks(DMK::hook::HookStack &hooks)
+    DMK::Result<void> initialize_ui_overlay_hooks(HookSet &hooks)
     {
-        // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates, plus its
-        // call-site rung); a total cascade miss fails closed. The default hook::Options prologue policy is Fail
-        // (refuse a breakpoint first byte); a sibling mod's E9 jump-hook does not trip it, so layering still works.
-        const uintptr_t worker_addr = anchor_address(AnchorId::OverlayHide);
+        // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates), read through
+        // the OverlayState gate. The default hook::Options prologue policy is Fail (refuse a breakpoint first byte).
+        // A sibling mod's E9 jump-hook does not trip it, so layering still works.
+        const uintptr_t worker_addr = gated_anchor_address(Feature::OverlayState, AnchorId::OverlayHide);
         if (worker_addr == 0)
         {
             DMK::log().error("UIOverlayHook: OverlayHide cascade unresolved (action-filter worker)");
@@ -164,7 +163,10 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "ActionFilterWorker",
                                                                          .target = DMK::Address{worker_addr}},
                                                 &action_filter_worker_detour));
-        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_worker_original));
+        // Publish the trampoline and store the handle BEFORE enable() arms the patch, so the set owns a hook whose arm
+        // fails with the patch live.
+        s_worker_original.store(installed.original<ActionFilterWorkerFunc>(), std::memory_order_release);
+        DMK_TRY_VOID(hooks.push(std::move(installed)).enable());
 
         DMK::log().info("UIOverlayHook: hooked action-filter worker at {} (overlay/apse detection enabled)",
                         DMK::format::format_address(worker_addr));

@@ -80,7 +80,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD ul_reason_for_call, LPVOID lp_rese
         // bootstrap_detach is the correct no-op.
         if (lp_reserved == nullptr && s_init_ran.load(std::memory_order_acquire))
         {
-            // The verdict is discarded here on purpose. DllMain cannot refuse a FreeLibrary already in
+            // The status is discarded here on purpose. DllMain cannot refuse a FreeLibrary already in
             // progress, and this ASI is loaded once for the process, so there is no later load that a
             // retained hook could hand a stale image to. shutdown() logs the failure itself.
             (void)TPVCamera::shutdown();

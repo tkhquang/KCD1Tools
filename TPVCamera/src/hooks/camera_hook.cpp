@@ -27,7 +27,6 @@
 #include "aob_resolver.hpp"
 #include "constants.hpp"
 #include "config.hpp"
-#include "detour_gate.hpp"
 #include "global_state.hpp"
 #include "game_state.hpp"
 #include "game_structures.hpp"
@@ -115,7 +114,8 @@ namespace TPVCamera
     // from physics as a velocity and the rotation is composed into the body.
     using UpdatePhysEntMovementFunc = char(__fastcall *)(uintptr_t animchar, float *movement);
 
-    // Trampoline slots, published by DetourGate::arm before each hook arms and read by the detours.
+    // Trampoline slots. Each install stores its slot with release order before the hook arms. Each detour reads its
+    // slot with acquire order, so a detour never chains through a slot it cannot see.
     static std::atomic<FrustumBuildFunc> s_frustum_build_original{nullptr};
     static std::atomic<SetHeadVisibilityFunc> s_set_head_visibility_original{nullptr};
     static std::atomic<InputDispatchFunc> s_input_dispatch_original{nullptr};
@@ -160,12 +160,8 @@ namespace TPVCamera
     // game starts a turn past 35 degrees and stops it as soon as the gap is back under 35, so the body always rests
     // about 35 degrees short of the look. The hook starts a turn past s_turn_start_angle (NativeTurnAngle, radians), or
     // past k_turn_settle_angle once the look has rested for s_turn_settle_delay (NativeTurnSettleDelay). It then keeps
-    // the turn on until the body is within k_turn_finish_angle of the look, or until the gap changes sign within
-    // k_turn_wrap_angle (he faces the look, or the look came back across his facing). A sign change past
-    // k_turn_wrap_angle means the look went on past his back. There the gap wraps through 180 degrees, and its sign
-    // flips between frames while he turns. The turn keeps its direction through the wrap, so s_turn_last_sign holds
-    // the turn's direction while the turn lasts.
-    // s_turn_continuing, s_turn_last_sign and the rest state carry the decision from frame to frame. Only the hook
+    // the turn on until the body is within k_turn_finish_angle of the look, or until the gap changes sign (he faces
+    // it). s_turn_continuing, s_turn_last_sign and the rest state carry the decision from frame to frame. Only the hook
     // updates them, on whichever job worker updates the player that frame, one frame after another; a feature switch
     // in update_native_turn only resets them. The hook runs on every idle frame with a gap, so a player frame without
     // it (s_turn_decision_missed, raised by the movement detour) means the action left its idle decision (he walked, an
@@ -174,16 +170,12 @@ namespace TPVCamera
     // k_turn_decision_break_ms since s_turn_decision_tick.
     // The look counts as resting while the gap stays within k_turn_rest_drift of its value when the rest began. While
     // he is not turning only the look changes the gap, and a cumulative bound (not a per-frame rate) keeps a slow pan
-    // from counting as rest. The game's spin latch holds a turn's old direction when the gap's sign changes under it.
-    // The latch therefore keeps a wrapped turn in its direction. Any other turn that sets the latch is refused for that
-    // frame (see would_set_spin_latch). One frame later the game holds the new sign, and the turn can start. A frame
-    // without a turn clears the latch (see release_spin_latch), so the next turn starts on the gap's own sign. The
-    // action's field offsets the hook reads are resolved from the game's code at install and written before the hook
-    // arms.
-    constexpr float k_turn_finish_angle = 0.07f;    // rad (4 deg)
-    constexpr float k_turn_wrap_angle = 1.5707964f; // rad (90 deg)
-    constexpr float k_turn_settle_angle = 0.21f;    // rad (12 deg)
-    constexpr float k_turn_rest_drift = 0.0175f;    // rad (1 deg)
+    // from counting as rest. A turn that sets the game's spin latch is refused for that frame (see
+    // would_set_spin_latch). One frame later the game holds the new sign, and the turn can start. The action's field
+    // offsets the hook reads are resolved from the game's code at install and written before the hook arms.
+    constexpr float k_turn_finish_angle = 0.07f; // rad (4 deg)
+    constexpr float k_turn_settle_angle = 0.21f; // rad (12 deg)
+    constexpr float k_turn_rest_drift = 0.0175f; // rad (1 deg)
     constexpr uint64_t k_turn_decision_break_ms = 150;
     static std::atomic<float> s_turn_start_angle{0.61086524f};
     static std::atomic<float> s_turn_settle_delay{0.8f}; // seconds, 0 = no settle turns
@@ -219,12 +211,16 @@ namespace TPVCamera
     static std::atomic<uintptr_t> s_player_animchar{0};
     static ptrdiff_t s_movement_type_offset = 0;
 
-    // Crouched turn animation (see Constants::CROUCHED_TURN_PLAYER_BLEND_SPACE). The game looks a clip's animation up
-    // by the 64-bit hash of its name. The hook on that lookup (detour_crouched_turn_animation) swaps the hash of the
-    // player's crouched turn blend space for the NPC hash while the native turn is on. Both hashes come from the
-    // game's own name hash at install, and the install writes them before the hook arms.
-    static std::uint64_t s_crouched_turn_player_hash = 0;
-    static std::uint64_t s_crouched_turn_npc_hash = 0;
+    // Crouched animations (see Constants::CROUCHED_IDLE_PLAYER_ANIMATION). The game looks a clip's animation up by the
+    // 64-bit hash of its name. The hook on that lookup (detour_crouched_animation) swaps the hash of each player clip
+    // for its NPC twin while the native turn is on. The hashes come from the game's own name hash at install, and the
+    // install writes them before the hook arms.
+    struct AnimationSwap
+    {
+        std::uint64_t player = 0;
+        std::uint64_t npc = 0;
+    };
+    static std::array<AnimationSwap, 2> s_crouched_swaps{};
 
     // The first-person eye position of the last game-view frame that rendered the third-person offset, published by the
     // frustum detour for the camera-observer detour. The components are separate atomics: a reader racing a writer can
@@ -529,13 +525,13 @@ namespace TPVCamera
      *          builds), so it is reached purely at runtime through the g_pGameFramework .data slot resolved by
      *          the CryActionFramework RIP-relative AOB cascade, never a hard-coded module offset. The slot's
      *          value is the CCryAction object pointer; it is null until the framework is constructed (0 is
-     *          returned then and the caller retries next frame) and 0 is also returned if the cascade did not
-     *          resolve. Render-thread safe: anchor_address() is a lock-free read of a value resolved once at
+     *          returned then and the caller retries next frame) and 0 is also returned when the Framework gate
+     *          failed. Render-thread safe: gated_anchor_address() is a lock-free read of a value resolved once at
      *          init, and the slot deref is a guarded read.
      */
     static uintptr_t resolve_cry_action() noexcept
     {
-        const uintptr_t fw_slot = anchor_address(AnchorId::CryActionFramework);
+        const uintptr_t fw_slot = gated_anchor_address(Feature::Framework, AnchorId::CryActionFramework);
         if (fw_slot == 0)
         {
             return 0;
@@ -578,7 +574,7 @@ namespace TPVCamera
         RuntimeOffsets &offsets = runtime_offsets();
 
         const auto p_action_game =
-            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offset_value(offsets.ccryaction_actiongame)});
+            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offsets.ccryaction_actiongame.load().value});
         if (!p_action_game || !DMK::memory::is_plausible_ptr(DMK::Address{*p_action_game}))
         {
             return 0;
@@ -590,7 +586,7 @@ namespace TPVCamera
         // C_Player; instead, when the cached slot holds a populated object that is NOT a C_Player (the
         // signature of a CActionGame layout drift), the local-actor heal group is asked to recover it.
         auto player =
-            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offset_value(offsets.cactiongame_local_actor)});
+            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offsets.cactiongame_local_actor.load().value});
         const auto is_c_player = [](const DMK::Result<uintptr_t> &candidate) noexcept
         {
             if (!candidate || !DMK::memory::is_plausible_ptr(DMK::Address{*candidate}))
@@ -683,13 +679,13 @@ namespace TPVCamera
 
         const RuntimeOffsets &offsets = runtime_offsets();
         const auto p_action_game =
-            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offset_value(offsets.ccryaction_actiongame)});
+            DMK::memory::read<uintptr_t>(DMK::Address{cry_action + offsets.ccryaction_actiongame.load().value});
         if (!p_action_game || !DMK::memory::is_plausible_ptr(DMK::Address{*p_action_game}))
         {
             return;
         }
         const auto c_player =
-            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offset_value(offsets.cactiongame_local_actor)});
+            DMK::memory::read<uintptr_t>(DMK::Address{*p_action_game + offsets.cactiongame_local_actor.load().value});
         if (!c_player || !DMK::memory::is_plausible_ptr(DMK::Address{*c_player}))
         {
             return;
@@ -704,7 +700,7 @@ namespace TPVCamera
         // nominal: on a genuinely drifted C_Player the store would land in whatever member now occupies the slot.
         // A miss simply skips the aim control for the frame (fail closed); the camera-side level blend still
         // levels the view.
-        const auto look_controller_offset = write_authorized_offset(offsets.c_player_look_controller);
+        const auto look_controller_offset = offsets.c_player_look_controller.authorized();
         if (!look_controller_offset)
         {
             return;
@@ -757,8 +753,8 @@ namespace TPVCamera
         // would otherwise be stored over whatever member now occupies the slot. A miss skips the body turn for
         // the frame (fail closed).
         const RuntimeOffsets &offsets = runtime_offsets();
-        const auto animated_human_offset = write_authorized_offset(offsets.c_player_animated_human);
-        const auto animchar_offset = write_authorized_offset(offsets.animated_human_animchar);
+        const auto animated_human_offset = offsets.c_player_animated_human.authorized();
+        const auto animchar_offset = offsets.animated_human_animchar.authorized();
         if (!animated_human_offset || !animchar_offset)
         {
             return;
@@ -1097,7 +1093,7 @@ namespace TPVCamera
             // acceptable: worst case on a drifted layout it reads neighboring fields and the sanity checks below
             // reject them. The WRITE path (apply_orbit_aim_control) demands a Confirmed heal.
             const std::ptrdiff_t c_player_look_controller_offset =
-                offset_value(runtime_offsets().c_player_look_controller);
+                runtime_offsets().c_player_look_controller.load().value;
             const auto controller =
                 DMK::memory::read<uintptr_t>(DMK::Address{c_player + c_player_look_controller_offset});
             if (controller && DMK::memory::is_plausible_ptr(DMK::Address{*controller}))
@@ -1251,7 +1247,7 @@ namespace TPVCamera
             if (c_player != 0)
             {
                 const auto ent = DMK::memory::read<uintptr_t>(
-                    DMK::Address{c_player + offset_value(runtime_offsets().c_player_entity)});
+                    DMK::Address{c_player + runtime_offsets().c_player_entity.load().value});
                 if (ent && DMK::memory::is_plausible_ptr(DMK::Address{*ent}))
                 {
                     entity_addr = *ent;
@@ -1770,8 +1766,8 @@ namespace TPVCamera
                 if (cam.orbit_move_armed)
                 {
                     moving = true;
-                    do_align = true;                  // idle -> moving edge: capture the camera heading
-                    cam.orbit_settle_hold = false;    // a fresh move re-captures the heading; drop any pending settle
+                    do_align = true;               // idle -> moving edge: capture the camera heading
+                    cam.orbit_settle_hold = false; // a fresh move re-captures the heading; drop any pending settle
                     // Diagnostic: what tripped the body-turn. move_magnitude near 1.0 with a movement key/stick =
                     // genuine locomotion; a smaller or unexpected value while the player is only free-looking
                     // points at game-driven movement (finishing-move / combat footwork) being mistaken for intent.
@@ -1999,8 +1995,7 @@ namespace TPVCamera
                     const float input_angle_raw = std::atan2(move_lat, move_fwd);
                     constexpr float k_half_pi = std::numbers::pi_v<float> / 2.0f;
                     const bool full_turn = cfg.orbit_sprint_full_turn.load(std::memory_order_relaxed);
-                    if (sprint_held &&
-                        (full_turn || std::fabs(input_angle_raw) <= k_orbit_sprint_backpedal_angle))
+                    if (sprint_held && (full_turn || std::fabs(input_angle_raw) <= k_orbit_sprint_backpedal_angle))
                     {
                         float input_angle = input_angle_raw;
                         if (!full_turn)
@@ -2047,11 +2042,15 @@ namespace TPVCamera
                     s_kbd_angle_valid = true;
                 }
                 float delta = kbd_redirect_angle - s_kbd_angle_eased;
-                while (delta > k_pi) delta -= 2.0f * k_pi;
-                while (delta < -k_pi) delta += 2.0f * k_pi;
+                while (delta > k_pi)
+                    delta -= 2.0f * k_pi;
+                while (delta < -k_pi)
+                    delta += 2.0f * k_pi;
                 s_kbd_angle_eased += kbd_ease * delta;
-                while (s_kbd_angle_eased > k_pi) s_kbd_angle_eased -= 2.0f * k_pi;
-                while (s_kbd_angle_eased < -k_pi) s_kbd_angle_eased += 2.0f * k_pi;
+                while (s_kbd_angle_eased > k_pi)
+                    s_kbd_angle_eased -= 2.0f * k_pi;
+                while (s_kbd_angle_eased < -k_pi)
+                    s_kbd_angle_eased += 2.0f * k_pi;
                 body_yaw_final = body_target_yaw - s_kbd_angle_eased;
                 kbd_move_x = 0.0f; // pure forward in the body frame -> the movement curves with the eased facing
                 kbd_move_y = 1.0f;
@@ -2145,9 +2144,9 @@ namespace TPVCamera
                 // Find the nearest solid world surface along the arm. The coverage of the occluder is NOT measured
                 // on KCD1 (the render-coverage raster is not ported), so blocked_cov stays at the not-measured
                 // sentinel and is only logged.
-                std::optional<RayHit> fan = ray_fan_sweep(pivot, to_camera, collision_radius,
-                                                          Constants::RWI_OBJTYPES_CAMERA,
-                                                          Constants::RWI_FLAGS_STOP_AT_SOLID);
+                std::optional<RayHit> fan =
+                    ray_fan_sweep(pivot, to_camera, collision_radius, Constants::RWI_OBJTYPES_CAMERA,
+                                  Constants::RWI_FLAGS_STOP_AT_SOLID);
                 const float blocked_cov = -9.0f; // coverage gate not consulted on KCD1; logged as not-measured
                 std::optional<RayHit> hit = fan;
                 bool from_sphere = false;
@@ -2158,8 +2157,8 @@ namespace TPVCamera
                     // probe casts in REVERSE camera->pivot because the pivot is inside the body). Capped at 4.
                     uintptr_t skip_ents[4];
                     const int n_skip = resolve_player_physics_skip(
-                        pivot, to_camera, collision_radius, Constants::RWI_OBJTYPES_ALL,
-                        Constants::RWI_OBJTYPES_CAMERA, Constants::RWI_FLAGS_STOP_AT_SOLID, skip_ents, 4);
+                        pivot, to_camera, collision_radius, Constants::RWI_OBJTYPES_ALL, Constants::RWI_OBJTYPES_CAMERA,
+                        Constants::RWI_FLAGS_STOP_AT_SOLID, skip_ents, 4);
                     const std::optional<RayHit> sphere = sphere_world_sweep(
                         pivot, collision_radius, to_camera, Constants::RWI_OBJTYPES_CAMERA, skip_ents, n_skip);
                     // The FAN is the AUTHORITY (objtypes 0x101 provably excludes all actors). The PWI sphere
@@ -2767,9 +2766,9 @@ namespace TPVCamera
     static bool read_body_and_look_yaw(uintptr_t c_player, float &body_yaw, float &look_yaw)
     {
         const auto entity =
-            DMK::memory::read<uintptr_t>(DMK::Address{c_player + offset_value(runtime_offsets().c_player_entity)});
+            DMK::memory::read<uintptr_t>(DMK::Address{c_player + runtime_offsets().c_player_entity.load().value});
         const auto controller = DMK::memory::read<uintptr_t>(
-            DMK::Address{c_player + offset_value(runtime_offsets().c_player_look_controller)});
+            DMK::Address{c_player + runtime_offsets().c_player_look_controller.load().value});
         if (!entity || !controller || !DMK::memory::is_plausible_ptr(DMK::Address{*entity}) ||
             !DMK::memory::is_plausible_ptr(DMK::Address{*controller}))
         {
@@ -2883,8 +2882,8 @@ namespace TPVCamera
         if (actor != 0)
         {
             const RuntimeOffsets &offsets = runtime_offsets();
-            const std::array<std::ptrdiff_t, 3> animchar_chain{offset_value(offsets.c_player_animated_human),
-                                                               offset_value(offsets.animated_human_animchar), 0};
+            const std::array<std::ptrdiff_t, 3> animchar_chain{offsets.c_player_animated_human.load().value,
+                                                               offsets.animated_human_animchar.load().value, 0};
             const auto anim_char = DMK::memory::walk(DMK::Address{c_player}, animchar_chain);
             if (anim_char && DMK::memory::is_plausible_ptr(*anim_char))
             {
@@ -3186,12 +3185,11 @@ namespace TPVCamera
     }
 
     /**
-     * @brief SEH frame around the per-frame camera body.
-     * @details Split from the detour because a __try frame cannot share a function with the detour's Pass (an
-     *          object with a destructor, MSVC C2712). It runs only inside that Pass, so the in-flight counter
-     *          covers it.
+     * @brief Runs the per-frame camera offset under SEH, so an outdated offset or layout never crashes the game.
+     * @details Apart from the detour, because the detour's DetourScope needs C++ object unwinding, which a __try
+     *          frame cannot hold.
      */
-    static void guarded_frustum_offset(uintptr_t camera) noexcept
+    static void frustum_build_offset_guarded(uintptr_t camera) noexcept
     {
         __try
         {
@@ -3207,23 +3205,23 @@ namespace TPVCamera
      * @brief Per-frame frustum-builder detour.
      * @details The matrix offset runs BEFORE the original, which then computes the cull planes from
      *          the offset matrix, so geometry culling matches the rendered third-person view. A
-     *          layout drift degrades the offset to a no-op; the original always runs and its return
+     *          layout drift degrades the offset to a no-op. The original always runs and its return
      *          value is forwarded so the frustum is still built whether or not the offset applied.
      */
     static uintptr_t __fastcall detour_frustum_build(uintptr_t camera) noexcept
     {
-        const DetourGate::Pass pass;
-        guarded_frustum_offset(camera);
+        const DetourScope in_flight;
+        frustum_build_offset_guarded(camera);
         const FrustumBuildFunc original = s_frustum_build_original.load(std::memory_order_acquire);
         return original ? original(camera) : 0;
     }
 
     /**
-     * @brief Head-visibility body under an SEH frame: latch the call, mirror the offset state, run the original.
-     * @details Split from the detour for the same C2712 reason as guarded_frustum_offset; it runs only inside the
-     *          detour's Pass.
+     * @brief Runs the head-visibility latch and the original setter under SEH.
+     * @details Apart from the detour, because the detour's DetourScope needs C++ object unwinding, which a __try
+     *          frame cannot hold.
      */
-    static void guarded_set_head_visibility(SetHeadVisibilityFunc original, uintptr_t entity, bool hide_head,
+    static void set_head_visibility_guarded(SetHeadVisibilityFunc original, uintptr_t entity, bool hide_head,
                                             char flags) noexcept
     {
         __try
@@ -3254,15 +3252,15 @@ namespace TPVCamera
      * @brief Head-visibility detour: keep the player head while the offset is rendering.
      * @details The first-person rig hides the head so it does not clip the eye camera.
      *          While the third-person view is active, force hide_head to false
-     *          so the player is not headless from behind; otherwise pass the game's
+     *          so the player is not headless from behind. Otherwise pass the game's
      *          intended value through unchanged.
      */
     static void __fastcall detour_set_head_visibility(uintptr_t entity, bool hide_head, char flags) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         if (const SetHeadVisibilityFunc original = s_set_head_visibility_original.load(std::memory_order_acquire))
         {
-            guarded_set_head_visibility(original, entity, hide_head, flags);
+            set_head_visibility_guarded(original, entity, hide_head, flags);
         }
     }
 
@@ -3361,11 +3359,12 @@ namespace TPVCamera
     }
 
     /**
-     * @brief SEH frame around the free-look capture decision; a fault falls back to normal dispatch.
-     * @details Split from the detour for the same C2712 reason as guarded_frustum_offset; it runs only inside the
-     *          detour's Pass.
+     * @brief Runs orbit_capture_and_decide under SEH. A fault falls back to normal dispatch.
+     * @details Apart from the detour, because the detour's DetourScope needs C++ object unwinding, which a __try
+     *          frame cannot hold.
+     * @return true to block (swallow) the event, false to dispatch it normally.
      */
-    static bool guarded_orbit_capture(uintptr_t input_event) noexcept
+    [[nodiscard]] static bool orbit_capture_guarded(uintptr_t input_event) noexcept
     {
         __try
         {
@@ -3373,7 +3372,7 @@ namespace TPVCamera
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return false; // on any fault, fall back to normal dispatch
+            return false;
         }
     }
 
@@ -3382,9 +3381,8 @@ namespace TPVCamera
      */
     static void __fastcall detour_input_dispatch(uintptr_t controller, uintptr_t input_event, char flag) noexcept
     {
-        const DetourGate::Pass pass;
-        const bool block = guarded_orbit_capture(input_event);
-        if (block)
+        const DetourScope in_flight;
+        if (orbit_capture_guarded(input_event))
         {
             return;
         }
@@ -3396,27 +3394,28 @@ namespace TPVCamera
 
     /**
      * @brief Resolves the SSystemGlobalEnvironment (g_env) base, patch-resiliently.
-     * @details Resolves the g_env base from the Genv anchor (a RIP-relative lea/mov [rip+g_env]
-     *          reference-site cascade, see aob_resolver.hpp k_genvCandidates), so the address survives
-     *          game patches that shift it. Resolution is runtime-only: a total cascade miss returns 0 and the
-     *          g_env-dependent features (physics raycast, hardware-mouse and 3D-engine reads) stay off. The
-     *          result is screened as a plausible user-space pointer before it is accepted.
-     * @return The g_env base address, or 0 if the cascade did not resolve.
+     * @details Reads the g_env base through the Engine gate. The Genv anchor is a 2-of-3 quorum of
+     *          RIP-relative lea/mov [rip+g_env] reference sites, so the address survives game
+     *          patches that shift the RVA. The result is screened as a plausible user-space pointer
+     *          before it is accepted. There is no fixed-address fallback. The Steam and GOG builds keep
+     *          g_env at different addresses, so a fixed one names the wrong slot on every build but one.
+     * @return The g_env base address, or 0 when the gate failed. Every consumer then stays off.
      */
     static uintptr_t resolve_genv()
     {
         DMK::Logger &logger = DMK::log();
 
-        // The Genv anchor resolves the g_env base from a lea/mov [rip+g_env] reference site (resolved up front
-        // by resolve_all_anchors()); the result is screened as a plausible pointer.
-        const uintptr_t resolved = anchor_address(AnchorId::Genv);
+        // The Genv quorum resolved up front in resolve_all_anchors(), when at least two independent
+        // lea/mov [rip+g_env] reference sites agreed. The result is screened as a plausible pointer.
+        const uintptr_t resolved = gated_anchor_address(Feature::Engine, AnchorId::Genv);
         if (resolved != 0 && DMK::memory::is_plausible_ptr(DMK::Address{resolved}))
         {
-            logger.info("Camera: g_env resolved via AOB at {}", DMK::format::format_address(resolved));
+            logger.info("Camera: g_env resolved at {}", DMK::format::format_address(resolved));
             return resolved;
         }
 
-        logger.warning("Camera: g_env cascade unresolved; g_env-dependent features disabled");
+        logger.warning("Camera: g_env did not resolve; collision, aim convergence, render occlusion and the "
+                       "hardware-mouse reads are unavailable");
         return 0;
     }
 
@@ -3433,7 +3432,7 @@ namespace TPVCamera
     static bool __fastcall detour_camera_observer_update(uintptr_t observer, float *position, bool *position_valid,
                                                          float *direction, bool *direction_valid, float *fov) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         const CameraObserverUpdateFunc original = s_camera_observer_update_original.load(std::memory_order_acquire);
         const bool updated =
             original != nullptr && original(observer, position, position_valid, direction, direction_valid, fov);
@@ -3449,6 +3448,16 @@ namespace TPVCamera
     }
 
     /**
+     * @brief Reads a vtable slot and returns its target when it lies in the game image, else 0.
+     */
+    static uintptr_t read_image_vtable_slot(uintptr_t vtable, size_t slot, uintptr_t module_base, size_t module_size)
+    {
+        const DMK::Region image{DMK::Address{module_base}, module_size};
+        const auto slot_value = DMK::memory::read<uintptr_t>(DMK::Address{vtable + slot * sizeof(uintptr_t)});
+        return slot_value.has_value() && image.contains(DMK::Address{*slot_value}) ? *slot_value : 0;
+    }
+
+    /**
      * @brief Reads a vtable slot and returns its target when it lies in the game image and @p signature matches
      *        within its first @p window bytes, else 0, so a slot that no longer holds the expected function is
      *        refused rather than hooked or called.
@@ -3457,29 +3466,19 @@ namespace TPVCamera
                                               size_t window, uintptr_t module_base, size_t module_size)
     {
         const DMK::Region image{DMK::Address{module_base}, module_size};
-        const auto slot_value = DMK::memory::read<uintptr_t>(DMK::Address{vtable + slot * sizeof(uintptr_t)});
-        if (window == 0 || !slot_value.has_value() || !image.contains(DMK::Address{*slot_value}))
-        {
-            return 0;
-        }
-        const DMK::Region head{DMK::Address{*slot_value}, window};
-        if (!image.contains(head.base.offset(static_cast<std::ptrdiff_t>(window) - 1)) ||
-            !DMK::scan::scan(signature, head, 1, DMK::scan::Pages::Executable).has_value())
-        {
-            return 0;
-        }
-        return *slot_value;
+        const uintptr_t target = read_image_vtable_slot(vtable, slot, module_base, module_size);
+        return code_window_matches(target, signature, window, image) ? target : 0;
     }
 
     /**
      * @brief Hooks the camera observer's update, found through its RTTI vtable (no signature scan).
      * @details Best-effort: without it the camera still works, and NPCs just beyond the pulled-back camera's reach stay
      *          hidden in third person, as they would for the unmodded game with its view camera there. The slot's
-     *          target must lie in the game image and still read the view camera (the GetViewCamera call bytes among
-     *          its first instructions), so a patch that moves the slot leaves the hook uninstalled rather than hooking
-     *          another function.
+     *          target must lie in the game image and still read the view camera (Aob::k_cameraObserverUpdateBody
+     *          among its first instructions), so a patch that moves the slot leaves the hook uninstalled rather than
+     *          hooking another function.
      */
-    static void install_camera_observer_hook(uintptr_t module_base, size_t module_size, DMK::hook::HookStack &hooks)
+    static void install_camera_observer_hook(uintptr_t module_base, size_t module_size, HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
         const std::optional<std::uintptr_t> vtable = class_vtable(GameClass::CameraObserver);
@@ -3510,7 +3509,10 @@ namespace TPVCamera
                            result.error().message());
             return;
         }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result), s_camera_observer_update_original); !armed)
+        // Publish the trampoline before enable() arms the patch, so the detour never sees a null original.
+        s_camera_observer_update_original.store(result->original<CameraObserverUpdateFunc>(),
+                                                std::memory_order_release);
+        if (auto armed = hooks.push(std::move(*result)).enable(); !armed)
         {
             logger.warning("Camera: camera-observer hook could not be armed ({}); in third person the AI keeps judging "
                            "NPCs from the pulled-back camera",
@@ -3532,7 +3534,7 @@ namespace TPVCamera
      */
     static bool __fastcall detour_is_third_person(uintptr_t actor) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         if (actor != 0 && actor == s_native_turn_actor.load(std::memory_order_relaxed))
         {
             const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
@@ -3566,21 +3568,6 @@ namespace TPVCamera
             return true;
         }
         return *latched == 0 && (*state == 1 || *state == 2) && *last_sign != 0.0f && *last_sign != sign;
-    }
-
-    /**
-     * @brief Clears the game's spin latch on @p action when it is set, so the next turn takes the gap's own sign.
-     * @details The game derives the latch on every evaluation from its current value, so a cleared latch stays clear
-     *          until a turn sets it. A latch left set holds at least until the gap is back under 20 degrees, which
-     *          can outlast the turn that set it.
-     */
-    static void release_spin_latch(uintptr_t action) noexcept
-    {
-        const DMK::Address latch{action + s_spin_latch_offset};
-        if (DMK::memory::read<uint8_t>(latch).value_or(0) != 0)
-        {
-            (void)DMK::memory::write_in_place<uint8_t>(latch, 0);
-        }
     }
 
     /**
@@ -3636,23 +3623,16 @@ namespace TPVCamera
         const uint64_t rest_ms = now - s_turn_rest_since.load(std::memory_order_relaxed);
         const bool rested = settle_delay > 0.0f && static_cast<float>(rest_ms) >= settle_delay * 1000.0f;
 
-        // A started turn continues until he faces the look, in its own direction through a wrap of the gap (see
-        // k_turn_wrap_angle). Otherwise a turn starts past the start angle, or past the settle angle after the look
-        // rested. Only a wrapped turn can set the game's spin latch, which holds the turn's direction.
-        const uintptr_t action = DMK::hook::gpr(ctx, DMK::hook::Gpr::Rdi);
-        const bool continuing = s_turn_continuing.load(std::memory_order_relaxed);
-        const float direction = s_turn_last_sign.load(std::memory_order_relaxed);
-        const bool wrapped = continuing && sign != direction && gap_abs > k_turn_wrap_angle;
-        const bool wants_turn = continuing ? gap_abs > k_turn_finish_angle && (sign == direction || wrapped)
-                                           : gap_abs > s_turn_start_angle.load(std::memory_order_relaxed) ||
-                                                 (gap_abs > k_turn_settle_angle && rested);
-        const bool turn = wants_turn && (wrapped || !would_set_spin_latch(action, sign));
-        if (!turn)
-        {
-            release_spin_latch(action);
-        }
+        // A started turn continues until he faces the look. Otherwise a turn starts past the start angle, or past the
+        // settle angle after the look rested.
+        const bool wants_turn =
+            s_turn_continuing.load(std::memory_order_relaxed)
+                ? gap_abs > k_turn_finish_angle && sign == s_turn_last_sign.load(std::memory_order_relaxed)
+                : gap_abs > s_turn_start_angle.load(std::memory_order_relaxed) ||
+                      (gap_abs > k_turn_settle_angle && rested);
+        const bool turn = wants_turn && !would_set_spin_latch(DMK::hook::gpr(ctx, DMK::hook::Gpr::Rdi), sign);
         s_turn_continuing.store(turn, std::memory_order_relaxed);
-        s_turn_last_sign.store(wrapped ? direction : sign, std::memory_order_relaxed);
+        s_turn_last_sign.store(sign, std::memory_order_relaxed);
         if (turn)
         {
             s_turn_decided_tick.store(now, std::memory_order_relaxed);
@@ -3669,75 +3649,15 @@ namespace TPVCamera
         cpu_flags = turn ? (cpu_flags & ~(k_carry_flag | k_zero_flag)) : (cpu_flags | k_zero_flag);
     }
 
-    // The game's move states for an installed turn (ComputeMoveState's return value, held in esi on the turn path).
-    constexpr uintptr_t k_turn_kind_small = 1;
-    constexpr uintptr_t k_turn_kind_large = 2;
-
-    /**
-     * @brief Turn-kind mid hook: keeps the player's native turns on the game's small-turn fragment.
-     * @details Runs on the game's turn path right after the game picks the turn fragment type into esi. A gap
-     *          of at most 90 degrees picks a small turn, and a larger gap picks a large turn. An action without a
-     *          large-turn fragment picks a small turn at any angle. The game picks again every frame with no
-     *          hysteresis. A change of type installs the other fragment, and its clip starts over. A turn whose gap
-     *          crosses 90 degrees therefore restarts its animation midway, and a gap near 90 degrees restarts it
-     *          again and again. The first-person game never plays either fragment. The hook turns a large turn into
-     *          a small one, which is the game's own path for an action without a large-turn fragment. Each native
-     *          turn therefore plays one fragment from start to finish. Any other actor is left to the game.
-     */
-    static void detour_turn_kind(DMK::hook::MidContext &ctx) noexcept
-    {
-        const uintptr_t actor = DMK::hook::gpr(ctx, DMK::hook::Gpr::Rbx);
-        if (actor == 0 || actor != s_native_turn_actor.load(std::memory_order_relaxed))
-        {
-            return;
-        }
-        uintptr_t &kind = DMK::hook::gpr(ctx, DMK::hook::Gpr::Rsi);
-        if (kind == k_turn_kind_large)
-        {
-            kind = k_turn_kind_small;
-        }
-    }
-
-    /**
-     * @brief Hooks the turn path's fragment-type choice (see detour_turn_kind). Best-effort: without it a turn past 90
-     *        degrees switches between the large-turn and small-turn fragments and restarts its animation midway.
-     */
-    static void install_turn_kind_hook(uintptr_t kind_site, DMK::hook::HookStack &hooks)
-    {
-        DMK::Logger &logger = DMK::log();
-        if (kind_site == 0)
-        {
-            logger.warning("Camera: turn kind hook skipped; turns past 90 degrees restart their animation midway");
-            return;
-        }
-        auto result = DMK::hook::mid_at(DMK::hook::MidRequest{.name = "TurnKind", .target = DMK::Address{kind_site}},
-                                        detour_turn_kind);
-        if (!result.has_value())
-        {
-            logger.warning("Camera: turn kind hook failed ({}); turns past 90 degrees restart their animation midway",
-                           result.error().message());
-            return;
-        }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result)); !armed)
-        {
-            logger.warning("Camera: turn kind hook could not be armed ({}); turns past 90 degrees restart their "
-                           "animation midway",
-                           armed.error().message());
-            return;
-        }
-        logger.info("Camera: turn kind hooked at {} (every turn plays the small-turn fragment)",
-                    DMK::format::format_address(kind_site));
-    }
-
     /**
      * @brief Installs the turn-decision mid hook on the site resolve_turn_decision_layout proves around the trigger.
      * @details Best-effort: without it the native turn still works, with the game's own 35 degrees and the body
      *          resting about 35 degrees short of the look. The layout fixes the registers the hook reads (rbx, xmm13,
      *          rdi, r12), the instruction it sits on, and the action's spin-latch field offsets, which are written
-     *          before the hook arms. The turn-kind hook goes in with it.
+     *          before the hook arms.
      * @return True when the hook is armed.
      */
-    static bool install_turn_decision_hook(uintptr_t trigger_return, DMK::hook::HookStack &hooks)
+    static bool install_turn_decision_hook(uintptr_t trigger_return, HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
         const std::optional<TurnDecisionLayout> layout = resolve_turn_decision_layout(trigger_return);
@@ -3758,7 +3678,7 @@ namespace TPVCamera
                            result.error().message());
             return false;
         }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result)); !armed)
+        if (auto armed = hooks.push(std::move(*result)).enable(); !armed)
         {
             logger.warning("Camera: turn decision hook could not be armed ({}); turns rest about 35 degrees short "
                            "of the look",
@@ -3767,7 +3687,6 @@ namespace TPVCamera
         }
         logger.info("Camera: turn decision hooked at {} (turns finish facing the look)",
                     DMK::format::format_address(site));
-        install_turn_kind_hook(layout->kind_site, hooks);
         return true;
     }
 
@@ -3783,7 +3702,7 @@ namespace TPVCamera
      */
     static char __fastcall detour_phys_ent_movement(uintptr_t animchar, float *movement) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         if (animchar != 0 && animchar == s_player_animchar.load(std::memory_order_relaxed))
         {
             if (!s_turn_decision_seen.exchange(false, std::memory_order_relaxed))
@@ -3813,10 +3732,10 @@ namespace TPVCamera
      * @brief Hooks CAnimatedCharacter::UpdatePhysicalEntityMovement to keep turn steps in place. Best-effort: without
      *        it a turn step moves the body 5-20 cm, which the still camera leaves slightly off centre.
      */
-    static void install_turn_in_place_hook(DMK::hook::HookStack &hooks)
+    static void install_turn_in_place_hook(HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
-        const uintptr_t target = anchor_address(AnchorId::PhysEntMovement);
+        const uintptr_t target = gated_anchor_address(Feature::TurnSteps, AnchorId::PhysEntMovement);
         if (target == 0)
         {
             logger.warning("Camera: UpdatePhysicalEntityMovement did not resolve; turn steps move the body a little");
@@ -3841,7 +3760,9 @@ namespace TPVCamera
                            result.error().message());
             return;
         }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result), s_phys_ent_movement_original); !armed)
+        // Published before enable() arms the patch, and never cleared: an armed or pinned hook still routes through it.
+        s_phys_ent_movement_original.store(result->original<UpdatePhysEntMovementFunc>(), std::memory_order_release);
+        if (auto armed = hooks.push(std::move(*result)).enable(); !armed)
         {
             logger.warning("Camera: UpdatePhysicalEntityMovement hook could not be armed ({}); turn steps move "
                            "the body a little",
@@ -3854,97 +3775,112 @@ namespace TPVCamera
     }
 
     /**
-     * @brief Crouched-turn animation mid hook on CAnimationSet::GetAnimIDByCRC (see
-     *        Constants::CROUCHED_TURN_PLAYER_BLEND_SPACE).
-     * @details While the native turn is on, a lookup of the player's crouched turn blend space gets the NPC one. The
-     *          hook runs at the entry of the vtable slot's thunk, with the name hash in rdx. Every character's
-     *          lookups pass through it, so it only compares. Any other hash goes to the game unchanged, and so does
-     *          any lookup while the native turn is off (first person, or the feature switched off). A clip looks
-     *          its animation up when it starts, so a crouched turn started in third person keeps that animation.
+     * @brief Crouched animations mid hook on CAnimationSet::GetAnimIDByCRC (see
+     *        Constants::CROUCHED_IDLE_PLAYER_ANIMATION).
+     * @details While the native turn is on, a lookup of the player's crouched idle or crouched turn blend space gets
+     *          its NPC twin, so the idle and the turns share one stance. The hook runs at the entry of the vtable
+     *          slot's thunk, with the name hash in rdx. Every character's lookups pass through it, so it only compares.
+     *          Any other hash goes to the game unchanged, and so does any lookup while the native turn is off (first
+     *          person, or the feature switched off). A clip looks its animation up when it starts, so a crouched clip
+     *          started in third person keeps that animation.
      */
-    static void detour_crouched_turn_animation(DMK::hook::MidContext &ctx) noexcept
+    static void detour_crouched_animation(DMK::hook::MidContext &ctx) noexcept
     {
         if (s_native_turn_actor.load(std::memory_order_relaxed) == 0)
         {
             return;
         }
         uintptr_t &hash = DMK::hook::gpr(ctx, DMK::hook::Gpr::Rdx);
-        if (hash == s_crouched_turn_player_hash)
+        for (const AnimationSwap &swap : s_crouched_swaps)
         {
-            hash = s_crouched_turn_npc_hash;
+            if (hash == swap.player)
+            {
+                hash = swap.npc;
+                return;
+            }
         }
     }
 
     /**
-     * @brief Hooks CAnimationSet::GetAnimIDByCRC for the crouched turn animation swap (see
-     *        detour_crouched_turn_animation). Best-effort: without it a crouched right turn can throw the game's broken
-     *        pose late in its clip.
+     * @brief Hooks CAnimationSet::GetAnimIDByCRC for the crouched animation swap (see detour_crouched_animation).
+     *        Best-effort: without it a crouched right turn can throw the game's broken pose late in its clip.
      * @details CActionScope::InstallAnimation calls the slot with a clip's name hash, and AnchorId::AnimIdByCrcSlot
-     *          reads the slot from that call. The slot comes from CAnimationSet's RTTI vtable. Its target must still
-     *          be the thunk to the name map lookup (Aob::k_animIdByCrcThunk). The two hashes come from the name hash
-     *          that CAnimationSet::GetAnimIDByName calls (AnchorId::AnimNameHashCall). That function must still open
-     *          as Aob::k_animNameHashBody before the mod calls it. The two hashes must be distinct and non-zero.
+     *          reads the slot from that call. The slot comes from CAnimationSet's RTTI vtable. Its target must lie in
+     *          the game image and still be the thunk to the name map lookup (Aob::k_animIdByCrcThunk). The hashes come
+     *          from the name hash that CAnimationSet::GetAnimIDByName calls (AnchorId::AnimNameHashCall). That function
+     *          must lie in the game image and still open as Aob::k_animNameHashBody before the mod calls it. All four
+     *          hashes must be non-zero and distinct, and the idle and the turns swap together or not at all, because
+     *          one without the other slides the body between the two stances.
      */
-    static void install_crouched_turn_animation_hook(uintptr_t module_base, size_t module_size,
-                                                     DMK::hook::HookStack &hooks)
+    static void install_crouched_animation_hook(uintptr_t module_base, size_t module_size, HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
         const DMK::Region image{DMK::Address{module_base}, module_size};
-        const std::optional<std::int64_t> slot_offset = anchor_value(AnchorId::AnimIdByCrcSlot);
+        const std::optional<std::int64_t> slot_offset =
+            gated_anchor_value(Feature::CrouchedAnimations, AnchorId::AnimIdByCrcSlot);
         const std::optional<std::uintptr_t> vtable = class_vtable(GameClass::AnimationSet);
         const uintptr_t lookup =
             slot_offset.has_value() && vtable.has_value()
                 ? read_checked_vtable_slot(*vtable, static_cast<size_t>(*slot_offset) / sizeof(uintptr_t),
-                                           Aob::k_animIdByCrcThunk, Aob::k_animIdByCrcThunk.size(), module_base,
-                                           module_size)
+                                           Aob::k_animIdByCrcThunk, Aob::k_animIdByCrcThunk.max_match_length(),
+                                           module_base, module_size)
                 : 0;
+        // The anchor proved that the call's target is a function entry in the image before this decode.
         uintptr_t hash_function = 0;
-        if (const uintptr_t hash_call = anchor_address(AnchorId::AnimNameHashCall); hash_call != 0)
+        if (const uintptr_t hash_call = gated_anchor_address(Feature::CrouchedAnimations, AnchorId::AnimNameHashCall);
+            hash_call != 0)
         {
-            const auto callee = DMK::scan::resolve_rip_relative(DMK::Address{hash_call}, 1, 5);
-            hash_function = callee && image.contains(*callee) && code_matches(callee->raw(), Aob::k_animNameHashBody)
-                                ? callee->raw()
-                                : 0;
+            if (const auto callee = DMK::scan::resolve_rip_relative(DMK::Address{hash_call}, 1, 5); callee)
+            {
+                hash_function = callee->raw();
+            }
         }
-        if (lookup == 0 || hash_function == 0)
+        if (lookup == 0 || !code_window_matches(hash_function, Aob::k_animNameHashBody,
+                                                Aob::k_animNameHashBody.max_match_length(), image))
         {
-            logger.warning("Camera: crouched turn animation lookup not found; crouched right turns can show the "
-                           "game's broken pose");
+            logger.warning("Camera: crouched animation lookup not found; crouched right turns can show the game's "
+                           "broken pose");
             return;
         }
         using NameHashFunc = std::uint64_t(__fastcall *)(const char *name, std::uint32_t length);
         const auto name_hash = reinterpret_cast<NameHashFunc>(hash_function);
         const auto hash_of = [name_hash](std::string_view name) -> std::uint64_t
         { return name_hash(name.data(), static_cast<std::uint32_t>(name.size())); };
-        s_crouched_turn_player_hash = hash_of(Constants::CROUCHED_TURN_PLAYER_BLEND_SPACE);
-        s_crouched_turn_npc_hash = hash_of(Constants::CROUCHED_TURN_NPC_BLEND_SPACE);
-        if (s_crouched_turn_player_hash == 0 || s_crouched_turn_npc_hash == 0 ||
-            s_crouched_turn_player_hash == s_crouched_turn_npc_hash)
+        const std::array<AnimationSwap, 2> swaps{{
+            {hash_of(Constants::CROUCHED_IDLE_PLAYER_ANIMATION), hash_of(Constants::CROUCHED_IDLE_NPC_ANIMATION)},
+            {hash_of(Constants::CROUCHED_TURN_PLAYER_BLEND_SPACE), hash_of(Constants::CROUCHED_TURN_NPC_BLEND_SPACE)},
+        }};
+        const std::array<std::uint64_t, 4> hashes{swaps[0].player, swaps[0].npc, swaps[1].player, swaps[1].npc};
+        const bool usable =
+            std::ranges::none_of(hashes, [](std::uint64_t h) { return h == 0; }) &&
+            std::ranges::all_of(hashes, [&hashes](std::uint64_t h) { return std::ranges::count(hashes, h) == 1; });
+        if (!usable)
         {
-            logger.warning("Camera: crouched turn animation hashes are not usable; crouched right turns can show the "
+            logger.warning("Camera: crouched animation hashes are not usable; crouched right turns can show the "
                            "game's broken pose");
             return;
         }
+        s_crouched_swaps = swaps;
         auto result =
-            DMK::hook::mid_at(DMK::hook::MidRequest{.name = "CrouchedTurnAnimation", .target = DMK::Address{lookup}},
-                              detour_crouched_turn_animation);
+            DMK::hook::mid_at(DMK::hook::MidRequest{.name = "CrouchedAnimation", .target = DMK::Address{lookup}},
+                              detour_crouched_animation);
         if (!result.has_value())
         {
-            logger.warning("Camera: crouched turn animation hook failed ({}); crouched right turns can show the game's "
+            logger.warning("Camera: crouched animation hook failed ({}); crouched right turns can show the game's "
                            "broken pose",
                            result.error().message());
             return;
         }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result)); !armed)
+        if (auto armed = hooks.push(std::move(*result)).enable(); !armed)
         {
-            logger.warning("Camera: crouched turn animation hook could not be armed ({}); crouched right turns can "
-                           "show the game's broken pose",
+            logger.warning("Camera: crouched animation hook could not be armed ({}); crouched right turns can show the "
+                           "game's broken pose",
                            armed.error().message());
             return;
         }
-        logger.debug("Camera: crouched turn blend space hash {:#x}, played as {:#x}", s_crouched_turn_player_hash,
-                     s_crouched_turn_npc_hash);
-        logger.info("Camera: crouched turn animation hooked at {} (crouched turns play the NPC turns)",
+        logger.debug("Camera: crouched idle hash {:#x} plays as {:#x}, crouched turn hash {:#x} plays as {:#x}",
+                     swaps[0].player, swaps[0].npc, swaps[1].player, swaps[1].npc);
+        logger.info("Camera: crouched animations hooked at {} (the crouched idle and turns play the NPC set)",
                     DMK::format::format_address(lookup));
     }
 
@@ -3957,17 +3893,17 @@ namespace TPVCamera
      *          - the IsThirdPerson slot both call sites use resolves, and its target lies in the game image and still
      *            asks the active camera;
      *          - the camera-changed event (id, target/flags word, HandleEvent slot) resolves, and that slot's target
-     *            compares the id. Without it a switch-off cannot reach an idle action, whose body then stays free of
+     *            dispatches the id. Without it a switch-off cannot reach an idle action, whose body then stays free of
      *            the look in first person until the player's next step.
      *          The trampoline pointer is never cleared: an armed hook, or one a failed teardown left installed, still
      *          routes calls through it. s_native_turn_armed is what switches the feature on, and only once the hook is
      *          armed.
      */
-    static void install_native_turn_hook(uintptr_t module_base, size_t module_size, DMK::hook::HookStack &hooks)
+    static void install_native_turn_hook(uintptr_t module_base, size_t module_size, HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
-        const uintptr_t trigger_return = anchor_address(AnchorId::TurnTriggerReturn);
-        const uintptr_t lock_sync_return = anchor_address(AnchorId::LockSyncReturn);
+        const uintptr_t trigger_return = gated_anchor_address(Feature::NativeTurn, AnchorId::TurnTriggerReturn);
+        const uintptr_t lock_sync_return = gated_anchor_address(Feature::NativeTurn, AnchorId::LockSyncReturn);
         if (trigger_return == 0 || lock_sync_return == 0)
         {
             logger.warning("Camera: native turn animation unavailable (locomotion call sites did not resolve: turn "
@@ -3982,10 +3918,13 @@ namespace TPVCamera
             return;
         }
         // The vtable slots and the event are read from the game's code (see AnchorId::IsThirdPersonSlot onwards).
-        const std::optional<std::int64_t> is_third_person_offset = anchor_value(AnchorId::IsThirdPersonSlot);
-        const std::optional<std::int64_t> handle_event_offset = anchor_value(AnchorId::HandleEventSlot);
-        const std::optional<std::int64_t> event_id = anchor_value(AnchorId::CameraEventId);
-        const std::optional<std::int64_t> event_flags = anchor_value(AnchorId::CameraEventFlags);
+        const std::optional<std::int64_t> is_third_person_offset =
+            gated_anchor_value(Feature::NativeTurn, AnchorId::IsThirdPersonSlot);
+        const std::optional<std::int64_t> handle_event_offset =
+            gated_anchor_value(Feature::NativeTurn, AnchorId::HandleEventSlot);
+        const std::optional<std::int64_t> event_id = gated_anchor_value(Feature::NativeTurn, AnchorId::CameraEventId);
+        const std::optional<std::int64_t> event_flags =
+            gated_anchor_value(Feature::NativeTurn, AnchorId::CameraEventFlags);
         if (!is_third_person_offset || !handle_event_offset || !event_id || !event_flags)
         {
             logger.warning("Camera: native turn animation unavailable (C_Player's IsThirdPerson or HandleEvent slot, "
@@ -4005,13 +3944,13 @@ namespace TPVCamera
             return;
         }
 
-        // HandleEvent dispatches the event id among its first instructions; finding that dispatch with the resolved id
-        // ties the slot the sender calls to the function the id was read from.
-        const auto handle_event_body = handle_event_dispatch(static_cast<uint8_t>(*event_id));
-        s_player_handle_event = handle_event_body.has_value()
-                                    ? read_checked_vtable_slot(*player_vtable, handle_event_slot, *handle_event_body,
-                                                               Aob::k_handleEventBodyWindow, module_base, module_size)
-                                    : 0;
+        // HandleEvent dispatches the event id somewhere in its body. That dispatch, found with the resolved id, ties
+        // the slot the sender calls to the function the id was read from.
+        const uintptr_t handle_event =
+            read_image_vtable_slot(*player_vtable, handle_event_slot, module_base, module_size);
+        const bool dispatches =
+            handle_event != 0 && dispatches_camera_event(handle_event, static_cast<uint8_t>(*event_id));
+        s_player_handle_event = dispatches ? handle_event : 0;
         s_game_object_event_vtable = class_vtable(GameClass::GameObjectEvent).value_or(0);
         if (s_player_handle_event == 0 || s_game_object_event_vtable == 0)
         {
@@ -4037,7 +3976,9 @@ namespace TPVCamera
                            result.error().message());
             return;
         }
-        if (auto armed = DetourGate::arm(hooks, std::move(*result), s_is_third_person_original); !armed)
+        // Publish the trampoline before enable() arms the patch, so the detour never sees a null original.
+        s_is_third_person_original.store(result->original<IsThirdPersonFunc>(), std::memory_order_release);
+        if (auto armed = hooks.push(std::move(*result)).enable(); !armed)
         {
             // The detour may still be reachable (a backend error after the patch committed leaves the hook active), so
             // the trampoline stays; the feature simply stays off.
@@ -4058,10 +3999,10 @@ namespace TPVCamera
         {
             install_turn_in_place_hook(hooks);
         }
-        install_crouched_turn_animation_hook(module_base, module_size, hooks);
+        install_crouched_animation_hook(module_base, module_size, hooks);
     }
 
-    DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size, DMK::hook::HookStack &hooks)
+    DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size, HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
 
@@ -4087,13 +4028,13 @@ namespace TPVCamera
 
         // The default hook::Options prologue policy is Fail: refuse an entry that leads with a breakpoint byte
         // (a cascade mis-resolution or a foreign int3 stub). A sibling mod's E9 jump-hook decodes as a
-        // relocatable branch rather than a refusal, so layering still works. Every hook goes onto the mod's hook
-        // stack, which shutdown() retires through the DetourGate only after proving its game callers quiescent.
+        // relocatable branch rather than a refusal, so layering still works. Every hook goes into the mod's hook
+        // set, which shutdown() retires only after no game thread is left inside a detour.
 
         // Hook the camera frustum builder - the matrix-offset point; without it the feature does nothing, so
         // its Error propagates verbatim. The module-scoped cascade resolves to the function entry inside the game
         // image or returns 0, so no separate bounds check is needed here.
-        const uintptr_t frustum_addr = anchor_address(AnchorId::Frustum);
+        const uintptr_t frustum_addr = gated_anchor_address(Feature::Camera, AnchorId::Frustum);
         if (frustum_addr == 0)
         {
             logger.error("Camera: frustum builder cascade unresolved");
@@ -4102,11 +4043,15 @@ namespace TPVCamera
         DMK_TRY(frustum_hook, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "CameraFrustumBuild",
                                                                             .target = DMK::Address{frustum_addr}},
                                                    &detour_frustum_build));
-        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(frustum_hook), s_frustum_build_original));
+        // Publish the trampoline and store the handle BEFORE enable() arms the patch. The detour then cannot observe a
+        // null original on its first frame, and the set owns a hook whose arm fails with the patch live. The backend
+        // allocates the trampoline at install, so it is readable off the still-disabled handle.
+        s_frustum_build_original.store(frustum_hook.original<FrustumBuildFunc>(), std::memory_order_release);
+        DMK_TRY_VOID(hooks.push(std::move(frustum_hook)).enable());
 
         // The head-visibility hook is best-effort: if it fails the camera still works,
         // the player just appears headless from behind, so a miss is a warning.
-        const uintptr_t head_addr = anchor_address(AnchorId::HeadVisibility);
+        const uintptr_t head_addr = gated_anchor_address(Feature::HeadVisibility, AnchorId::HeadVisibility);
         if (head_addr == 0)
         {
             logger.warning("Camera: Head visibility cascade unresolved; player may appear headless from behind");
@@ -4119,16 +4064,22 @@ namespace TPVCamera
             logger.warning("Camera: Head visibility hook failed ({}); player may appear headless from behind",
                            head_hook.error().message());
         }
-        else if (auto armed = DetourGate::arm(hooks, std::move(*head_hook), s_set_head_visibility_original); !armed)
+        else
         {
-            logger.warning("Camera: Head visibility hook did not arm ({}); player may appear headless from behind",
-                           armed.error().message());
+            s_set_head_visibility_original.store(head_hook->original<SetHeadVisibilityFunc>(),
+                                                 std::memory_order_release);
+            if (auto armed = hooks.push(std::move(*head_hook)).enable(); !armed)
+            {
+                logger.warning("Camera: Head visibility hook did not arm ({}); player may appear headless from "
+                               "behind",
+                               armed.error().message());
+            }
         }
 
         // The input-dispatcher hook powers free-look orbit. Best-effort: a miss only disables orbit, the
         // offset camera still works. The detour is inert until the orbit key is held, so it is harmless when
         // free-look is unused. InputDispatch is a runtime AOB cascade (k_inputDispatchCandidates).
-        const uintptr_t input_addr = anchor_address(AnchorId::InputDispatch);
+        const uintptr_t input_addr = gated_anchor_address(Feature::Orbit, AnchorId::InputDispatch);
         if (input_addr == 0)
         {
             logger.warning("Camera: Input dispatcher cascade unresolved; free-look orbit unavailable");
@@ -4141,10 +4092,14 @@ namespace TPVCamera
             logger.warning("Camera: Input dispatcher hook failed ({}); free-look orbit unavailable",
                            input_hook.error().message());
         }
-        else if (auto armed = DetourGate::arm(hooks, std::move(*input_hook), s_input_dispatch_original); !armed)
+        else
         {
-            logger.warning("Camera: Input dispatcher hook did not arm ({}); free-look orbit unavailable",
-                           armed.error().message());
+            s_input_dispatch_original.store(input_hook->original<InputDispatchFunc>(), std::memory_order_release);
+            if (auto armed = hooks.push(std::move(*input_hook)).enable(); !armed)
+            {
+                logger.warning("Camera: Input dispatcher hook did not arm ({}); free-look orbit unavailable",
+                               armed.error().message());
+            }
         }
 
         // Keep the AI judging which NPCs to update (and which to hide and pause) from the first-person eye while the
