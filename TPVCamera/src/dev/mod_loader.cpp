@@ -7,7 +7,7 @@
  *
  *          1. Unique staged names. Mapping the build output would lock it, so a rebuild could not replace it, and
  *             mapping a REUSED name can hand back a still-mapped predecessor with its statics intact. Each
- *             generation loads KCD1_TPVCamera.genNNNN.logic.dll, a name never used before in this process.
+ *             generation loads <mod>.genNNNN.logic.dll, a name never used before in this process.
  *          2. A resident wheel host. A mouse-wheel binding makes the input engine take a permanent module
  *             keepalive on whichever module hosts wheel capture. Hosting it here, in a module that is never
  *             unloaded, lets every logic generation keep its wheel bindings and still unmap. This loader
@@ -20,7 +20,7 @@
  *
  *          Reload is serialized on one resident control thread, accepted only while the game owns the
  *          foreground window, and fires on the Numpad 0 key-down edge. Every decision is written to
- *          KCD1_TPVCamera.loader.log beside the loader. This loader is dev-only: the release build is a single
+ *          <mod>.loader.log beside the loader. This loader is dev-only: the release build is a single
  *          ASI with no reload path at all.
  */
 
@@ -45,12 +45,12 @@
 
 namespace
 {
-    using InitFn = std::uint32_t(DMK_WHEELHOST_CALL *)(const Kcd1TpvReloadInitRequest *) noexcept;
+    using InitFn = std::uint32_t(DMK_WHEELHOST_CALL *)(const TpvReloadInitRequest *) noexcept;
     using ShutdownFn = std::uint32_t(DMK_WHEELHOST_CALL *)() noexcept;
     using RevisionFn = const char *(DMK_WHEELHOST_CALL *)() noexcept;
 
-    /// The mod name every derived file name starts with.
-    constexpr std::wstring_view MOD_NAME = L"KCD1_TPVCamera";
+    /// The build supplies TPVCAMERA_MOD_NAME. One name derives the logic-DLL names, the sweep filter, and the logs.
+    constexpr std::wstring_view MOD_NAME = L"" TPVCAMERA_MOD_NAME;
 
     /// The reload hotkey.
     constexpr int RELOAD_VK = VK_NUMPAD0;
@@ -68,7 +68,7 @@ namespace
     constexpr SHORT KEY_DOWN_MASK = static_cast<SHORT>(0x8000);
     /// Loader-owned owner id for the probe lease: ASCII "TPVPROBE". Any value a generation never uses.
     constexpr std::uint64_t LEASE_PROBE_OWNER = UINT64_C(0x54505650524F4245);
-    constexpr std::uint32_t INIT_REQUEST_SIZE = static_cast<std::uint32_t>(sizeof(Kcd1TpvReloadInitRequest));
+    constexpr std::uint32_t INIT_REQUEST_SIZE = static_cast<std::uint32_t>(sizeof(TpvReloadInitRequest));
 
     /// One loaded staged copy and its exports.
     struct Generation
@@ -321,7 +321,7 @@ namespace
         {
             return false;
         }
-        if (verdict == KCD1_TPVCAMERA_RELOAD_RETAINED)
+        if (verdict == TPVCAMERA_RELOAD_RETAINED)
         {
             // Keep our reference even if a leaked resource holds no module pin.
             record_retained_generation(generation, generation.module);
@@ -352,7 +352,7 @@ namespace
             return false;
         }
         const std::uint32_t verdict = generation.shutdown();
-        if (verdict != KCD1_TPVCAMERA_RELOAD_OK && verdict != KCD1_TPVCAMERA_RELOAD_RETAINED)
+        if (verdict != TPVCAMERA_RELOAD_OK && verdict != TPVCAMERA_RELOAD_RETAINED)
         {
             append_log("Shutdown refused retirement. The generation stays mapped.");
             return false;
@@ -434,9 +434,9 @@ namespace
             append_formatted_log("LoadLibrary failed (error {}).", error);
             return false;
         }
-        generation.init = resolve<InitFn>(generation.module, KCD1_TPVCAMERA_RELOAD_INIT_SYMBOL);
-        generation.shutdown = resolve<ShutdownFn>(generation.module, KCD1_TPVCAMERA_RELOAD_SHUTDOWN_SYMBOL);
-        generation.revision = resolve<RevisionFn>(generation.module, KCD1_TPVCAMERA_RELOAD_REVISION_SYMBOL);
+        generation.init = resolve<InitFn>(generation.module, TPVCAMERA_RELOAD_INIT_SYMBOL);
+        generation.shutdown = resolve<ShutdownFn>(generation.module, TPVCAMERA_RELOAD_SHUTDOWN_SYMBOL);
+        generation.revision = resolve<RevisionFn>(generation.module, TPVCAMERA_RELOAD_REVISION_SYMBOL);
         generation.unmap_address = reinterpret_cast<const void *>(generation.init);
         if (generation.init == nullptr || generation.shutdown == nullptr || generation.revision == nullptr)
         {
@@ -444,17 +444,17 @@ namespace
             append_log("The export resolution failed (Init / Shutdown / Revision).");
             return false;
         }
-        const Kcd1TpvReloadInitRequest request{
+        const TpvReloadInitRequest request{
             .struct_size = INIT_REQUEST_SIZE,
-            .abi_version = KCD1_TPVCAMERA_RELOAD_ABI_VERSION,
+            .abi_version = TPVCAMERA_RELOAD_ABI_VERSION,
             .generation_id = generation.generation_id,
             .expected_host_identity = s_host_identity,
             .wheel_host = &s_wheel_host,
         };
-        if (generation.init(&request) != KCD1_TPVCAMERA_RELOAD_OK)
+        if (generation.init(&request) != TPVCAMERA_RELOAD_OK)
         {
             retire_failed_stage(generation);
-            append_log("Init failed (see KCD1_TPVCamera.log).");
+            append_log("Init failed (see " TPVCAMERA_MOD_NAME ".log).");
             return false;
         }
         s_current.emplace(std::move(generation));
@@ -476,7 +476,7 @@ namespace
             return true;
         }
         const std::uint32_t verdict = s_current->shutdown();
-        if (verdict != KCD1_TPVCAMERA_RELOAD_OK && verdict != KCD1_TPVCAMERA_RELOAD_RETAINED)
+        if (verdict != TPVCAMERA_RELOAD_OK && verdict != TPVCAMERA_RELOAD_RETAINED)
         {
             append_log("Shutdown refused retirement. The generation stays mapped (inert). Retry after quiescence, or "
                        "restart if the mod log reports a retained worker or hook.");

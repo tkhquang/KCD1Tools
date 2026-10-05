@@ -387,7 +387,7 @@ namespace TPVCamera
             }
             // A non-world entity (player body, worn gear, NPC) is invisible to the world-only mask: collect it
             // only when the all-types hit is nearer than the world hit (or the world ray misses). World geometry
-            // appears in BOTH casts at the same range, so it is never collected -- we must not skip the world.
+            // appears in BOTH casts at the same range, so it is never collected - we must not skip the world.
             const auto h_world = ray_world_intersection(o, back, objtypes_world, flags);
             const bool is_non_world = !h_world.has_value() || h_all->m_distance < h_world->m_distance - 0.02f;
             if (!is_non_world)

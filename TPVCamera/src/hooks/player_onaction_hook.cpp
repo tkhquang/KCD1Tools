@@ -2,7 +2,7 @@
  * @file hooks/player_onaction_hook.cpp
  * @brief Hooks the KCD1 global action dispatcher and latches device-agnostic movement intent for the orbit.
  *
- * KCD2 hooked sub_1808EBEE4, found by a profiler string STRIPPED from retail KCD1 1.9.7. On KCD1 the same
+ * KCD2 hooked sub_1808EBEE4, found by a profiler string STRIPPED from retail KCD1. On KCD1 the same
  * dispatcher was located via the surviving "OnAction" Lua string -> sub_1801FF740, whose signature is
  * IDENTICAL to KCD2's: (this, const char** name, uint activation, float value). It runs the action-map
  * press/release/hold state machine and is the C++ source of Lua Player:OnAction, so every player action
@@ -78,7 +78,7 @@ namespace TPVCamera
     static std::atomic<bool> s_force_forward_axes{false};
 
     // Activation code for an analog "value changed" event (eIS_Changed). Analog axes dispatch ONLY on change, so
-    // a stick held at full deflection stops sending events -- the re-assert below uses this to re-inject the
+    // a stick held at full deflection stops sending events - the re-assert below uses this to re-inject the
     // collapsed value between real events.
     static constexpr unsigned int k_activation_changed = 8u;
 
@@ -86,7 +86,7 @@ namespace TPVCamera
     // but a held full-back stick stops sending xi_movey Changed events, so the engine keeps the stale backward
     // value and the char runs backward for up to ~1.6s despite force_fwd (the root cause). To keep the
     // collapse fresh, cache the engine CryString name of each gamepad analog axis (as it fires) and which axis the
-    // current event was, then re-dispatch the OTHER axis on every move event -- the frequently-jittering lateral
+    // current event was, then re-dispatch the OTHER axis on every move event - the frequently-jittering lateral
     // axis drives the forward refresh. All touched only on the input thread (the detour) -> plain statics suffice.
     static const char *s_fwd_axis_name = nullptr; // engine CryString for xi_movey / movement_y
     static const char *s_lat_axis_name = nullptr; // engine CryString for xi_movex / movement_x
@@ -180,9 +180,11 @@ namespace TPVCamera
         // KEYBOARD digital move keys only (k_move_actions indices 0=moveforward, 1=moveback, 2=moveleft,
         // 3=moveright). Digital values are ~1 while held, so the net vector is forward = moveforward - moveback,
         // lateral = moveright - moveleft (+lateral is right, matching the engine's +0x58 x sign). The gamepad
-        // analog axes (indices 4..7) are deliberately excluded -- they use the gamepad collapse path.
-        const float fwd = s_move_signed[0].load(std::memory_order_relaxed) - s_move_signed[1].load(std::memory_order_relaxed);
-        const float lat = s_move_signed[3].load(std::memory_order_relaxed) - s_move_signed[2].load(std::memory_order_relaxed);
+        // analog axes (indices 4..7) are deliberately excluded - they use the gamepad collapse path.
+        const float fwd =
+            s_move_signed[0].load(std::memory_order_relaxed) - s_move_signed[1].load(std::memory_order_relaxed);
+        const float lat =
+            s_move_signed[3].load(std::memory_order_relaxed) - s_move_signed[2].load(std::memory_order_relaxed);
         forward = fwd;
         lateral = lat;
         return (fwd * fwd + lat * lat) > 1e-4f;
@@ -190,8 +192,8 @@ namespace TPVCamera
 
     /**
      * @brief Trace-only vocabulary probe: logs each distinct action name once (with its activation + value) so
-     *        the on-foot movement vocabulary can be confirmed from the trace log. Inert unless trace is on; the dedup list is
-     *        touched only here, on the input thread, under its own mutex.
+     *        the on-foot movement vocabulary can be confirmed from the trace log. Inert unless trace is on; the
+     *        dedup list is touched only here, on the input thread, under its own mutex.
      */
     static void maybe_log_action_name(const char *name, unsigned int activation, float value)
     {
@@ -253,9 +255,9 @@ namespace TPVCamera
         // Full-turn orbit redirect (backward hemisphere): collapse the GAMEPAD move axes to pure-forward so the
         // forced-forward sprint runs along the body's faced (stick) direction instead of the raw backward input,
         // which would sprint AWAY from the camera. Only when the camera detour asks for it AND sprint is actually
-        // held -- the sprint gate is the failsafe against a stranded flag disabling normal strafing/back-pedal.
+        // held - the sprint gate is the failsafe against a stranded flag disabling normal strafing/back-pedal.
         // The signed latch below stays the REAL stick (the camera detour reads it to set the body-turn angle), so
-        // only the value forwarded to the engine is rewritten -- no feedback into the angle.
+        // only the value forwarded to the engine is rewritten - no feedback into the angle.
         const bool collapse = s_force_forward_axes.load(std::memory_order_relaxed) &&
                               s_sprint_active.load(std::memory_order_relaxed);
         float forward_value = value;
@@ -302,9 +304,8 @@ namespace TPVCamera
      *          detour's Pass (an object with a destructor, MSVC C2712). It runs only inside that Pass, so the
      *          in-flight counter covers it.
      */
-    TPV_DETOUR static uintptr_t dispatch_with_capture(ActionDispatchFunc original, uintptr_t self,
-                                                      const char **action_name, unsigned int activation,
-                                                      float value) noexcept
+    static uintptr_t dispatch_with_capture(ActionDispatchFunc original, uintptr_t self, const char **action_name,
+                                           unsigned int activation, float value) noexcept
     {
         // forward_value is the value passed on to the engine: identical to the latched input except while the
         // full-turn orbit redirect is collapsing the gamepad move axes to pure-forward (see capture_movement_input).
@@ -329,7 +330,7 @@ namespace TPVCamera
         const uintptr_t ret = original(self, action_name, activation, forward_value);
 
         // Keep the collapse FRESH across the change-only analog axes. A stick held at full deflection stops sending
-        // its Changed events, so without this the engine retains the stale value -- a full-back stick keeps running
+        // its Changed events, so without this the engine retains the stale value - a full-back stick keeps running
         // backward despite force_fwd (the cause of the few-second wrong-direction window). On each
         // move event re-dispatch the OTHER axis (the frequently-jittering lateral axis thus refreshes forward); on
         // the collapse falling edge push the REAL stick once so a steady stick does not strand the forced-forward
@@ -379,8 +380,8 @@ namespace TPVCamera
     /**
      * @brief Action-dispatcher detour: counts itself in flight, then runs the capture-and-forward body.
      */
-    TPV_DETOUR static uintptr_t __fastcall detour_action_dispatch(uintptr_t self, const char **action_name,
-                                                                  unsigned int activation, float value) noexcept
+    static uintptr_t __fastcall detour_action_dispatch(uintptr_t self, const char **action_name,
+                                                       unsigned int activation, float value) noexcept
     {
         const DetourGate::Pass pass;
         const ActionDispatchFunc original = s_action_dispatch_original.load(std::memory_order_acquire);
@@ -391,7 +392,7 @@ namespace TPVCamera
         return dispatch_with_capture(original, self, action_name, activation, value);
     }
 
-    DMK::Result<void> initialize_player_onaction_hook()
+    DMK::Result<void> initialize_player_onaction_hook(DMK::hook::HookStack &hooks)
     {
         DMK::Logger &logger = DMK::log();
 
@@ -408,7 +409,7 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "PlayerOnActionDispatch",
                                                                          .target = DMK::Address{dispatch_addr}},
                                                 &detour_action_dispatch));
-        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_action_dispatch_original));
+        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_action_dispatch_original));
 
         s_available.store(true, std::memory_order_relaxed);
         logger.info("PlayerOnAction: hooked action dispatcher at {} (orbit move-detection enabled)",

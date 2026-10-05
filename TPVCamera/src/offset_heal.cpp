@@ -6,7 +6,7 @@
  * the mod-specific part: which landmarks describe which struct, the corroborated top-of-struct bracket that
  * recovers two members from one delta, and the gates that hold each group back until its base is live.
  *
- * Ported from the KCD2 TPVCamera against the SAME DetourModKit self-heal API. KCD1 1.9.7 carries fewer
+ * Ported from the KCD2 TPVCamera against the SAME DetourModKit self-heal API. KCD1 carries fewer
  * C_Player landmarks than KCD2: there is no embedded missile controller and no HitDeathReactions member to
  * anchor on, so those two landmarks are dropped. The corroborated top-of-struct bracket that KCD2 builds from
  * {entity, HitDeathReactions} is rebuilt here from {entity, actorModel}: the actor model is the deepest

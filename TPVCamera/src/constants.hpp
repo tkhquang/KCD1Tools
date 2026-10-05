@@ -7,7 +7,7 @@
  * multi-candidate AOB cascades in aob_resolver.hpp so they survive game updates;
  * this file keeps no hard-coded image addresses.
  *
- * This is the KCD1 1.9.7 retarget of the KCD2 TPVCamera mod: the structure,
+ * This is the KCD1 retarget of the KCD2 TPVCamera mod: the structure,
  * constant NAMES and comments mirror the KCD2 source so the two builds stay
  * maintainable in lockstep; only the KCD1-specific binary values differ.
  */
@@ -52,7 +52,7 @@ namespace Constants
     /** @brief Per-PID instance-mutex prefix so duplicate ASI loads bail cleanly. */
     constexpr const char *INSTANCE_MUTEX_PREFIX = "KCD1_TPVCamera_";
 
-    // --- Default Configuration Values ---
+    // Default Configuration Values
     /** @brief Default logging level ("INFO"). */
     constexpr const char *DEFAULT_LOG_LEVEL = "INFO";
 
@@ -76,36 +76,43 @@ namespace Constants
     //
     // KCD1 uses a CCryAction singleton (NOT gEnv->pGame->GetIGameFramework). Chain:
     //   CCryAction  = *(g_pGameFramework slot)  (resolved at runtime by the AnchorId::CryActionFramework AOB
-    //                 cascade; RTTI "CCryAction") -- see camera_hook resolve_cry_action()
+    //                 cascade; RTTI "CCryAction") - see camera_hook resolve_cry_action()
     //   CActionGame = *(CCryAction + CCRYACTION_ACTIONGAME_OFFSET)   [KCD2 used +0x88]
     //   C_Player    = *(CActionGame + CACTIONGAME_LOCAL_ACTOR_OFFSET), validated by its RTTI type name [KCD2 +0xA40]
     //   -> look controller (C_Player + C_PLAYER_LOOK_CONTROLLER_OFFSET)   [KCD2 +0x238]
     //   -> scalar look PITCH (controller + LOOK_CONTROLLER_PITCH_OFFSET, radians, 0 = level), with a
-    //      synchronized copy at LOOK_CONTROLLER_PITCH2_OFFSET; the camera reads the DERIVED quat at +0x24.
-    // KCD1 pitch primary is +0x48 with a synced copy at +0x08 (KCD2 had pitch +0x8/+0x48). To LEVEL the
-    // aim write BOTH pitch copies; the cameras read the derived quat lc+0x24, not the scalar.
+    //      synchronized copy at LOOK_CONTROLLER_PITCH2_OFFSET; yaw lives alongside and is left alone.
+    // The look quaternion the cameras read (controller + 0x24) is DERIVED from this scalar pitch+yaw
+    // EVERY frame, so writing that quat is overwritten - the SCALAR pitch is what must be written to
+    // level the aim. Both copies are written so any internal current/target smoothing also settles at level.
 
     // g_env (SSystemGlobalEnvironment) base is resolved at runtime by the AnchorId::Genv AOB cascade;
     // pPhysicalWorld/p3DEngine/pHardwareMouse are members reached via the GENV_* offsets below.
     // RTTI type-descriptor name of C_Player, used to validate the resolved actor (replaces a
     // hardcoded vtable address so the check survives patches).
     constexpr const char *C_PLAYER_RTTI_NAME = ".?AVC_Player@entitymodule@wh@@";
-    // RTTI type-descriptor name of CCryAction, used to validate the resolved framework object.
-    constexpr const char *CCRYACTION_RTTI_NAME = ".?AVCCryAction@@";
     constexpr ptrdiff_t CCRYACTION_ACTIONGAME_OFFSET = 0x78; // [KCD2 +0x88]
     // RTTI type-descriptor name of CActionGame, the self-heal anchor for CCRYACTION_ACTIONGAME_OFFSET.
     constexpr const char *CACTIONGAME_RTTI_NAME = ".?AVCActionGame@@";
     constexpr ptrdiff_t CACTIONGAME_LOCAL_ACTOR_OFFSET = 0xA00;  // [KCD2 +0xA40]
     constexpr ptrdiff_t C_PLAYER_LOOK_CONTROLLER_OFFSET = 0x4C0; // [KCD2 +0x238]; ptr, lazy-init, +0 = C_Player back-ptr
-    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH_OFFSET = 0x48;     // scalar look pitch (radians, 0 = level) [KCD2 +0x8]
-    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH2_OFFSET = 0x08;    // synchronized pitch copy [KCD2 +0x48]
-    // Look quaternion the camera/aim reads (DERIVED from pitch+yaw each frame).
-    constexpr ptrdiff_t LOOK_CONTROLLER_QUAT_OFFSET = 0x24; // unit quat XYZW
-    // GetLookQuaternion = C_Player IActor vtable slot 56 (+0x1C0); GetLookPitch = slot 58 (+0x1D0).
-    constexpr ptrdiff_t C_PLAYER_GET_LOOK_QUAT_VTABLE_OFFSET = 0x1C0;
-    constexpr ptrdiff_t C_PLAYER_GET_LOOK_PITCH_VTABLE_OFFSET = 0x1D0;
+    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH_OFFSET = 0x8;      // scalar look pitch (radians, 0 = level)
+    constexpr ptrdiff_t LOOK_CONTROLLER_PITCH2_OFFSET = 0x48;    // synchronized pitch copy (returned by GetLookPitch)
+    // Scalar look yaw (radians; horizontal forward = (-sin yaw, cos yaw)). Read only, so its synchronized copy at
+    // +0x44 is left to the engine.
+    constexpr ptrdiff_t LOOK_CONTROLLER_YAW_OFFSET = 0x10;
+    // The derived look quaternion (XYZW) at controller + 0x24, returned by GetLookQuat (C_Player vtable slot 56).
+    // The engine rebuilds it every frame from the controller's Euler angles (pitch +0x8, roll +0xC, yaw +0x10).
+    // It is the player's clean AIM orientation and carries NO head-bob, weapon-sway, or engine view-shake (combat /
+    // hit / landing). At rest it equals the CView eye quat (SVIEWPARAMS_ROTATION_OFFSET). During an action the eye
+    // quat diverges by the view-shake while this quat stays on the aim. StableAimBasis builds the third-person rig
+    // basis from this aim, so a multi-meter follow distance does not amplify the view-shake into a camera swing.
+    // The raw quat is not always level: a roll angle left at +0xC (a horse mount animation leaves one) keeps it
+    // tilted. StableAimBasis therefore reads it through level_look_rotation, which keeps only the heading and the
+    // scalar pitch, as the first-person camera does.
+    constexpr ptrdiff_t LOOK_CONTROLLER_QUAT_OFFSET = 0x24;
 
-    // --- Player BODY-turn: force the entity world yaw (camera-relative body facing) ----------------
+    // Player BODY-turn: force the entity world yaw (camera-relative body facing)
     // The look controller above is aim-only, so a separate primitive turns the BODY. The engine's
     // CAnimatedCharacter override-rotation is exactly two writes: an active byte and a world quat. The
     // animated-character update copies that quat into the entity rotation for the frame, REPLACING the
@@ -139,7 +146,7 @@ namespace Constants
     // Keyboard turn-and-run: the player's input object (the action-dispatcher's `self`) is a
     // wh::entitymodule::C_PlayerInput; its body-relative MOVE INPUT is two floats (x = strafe, +right; y =
     // forward). Writing (x=0, y=+1) each frame forces pure-forward movement, which OVERRIDES the held digital
-    // move keys and -- being a field write, not an xi_* action -- does NOT flip the HUD device glyphs. The pointer
+    // move keys and - being a field write, not an xi_* action - does NOT flip the HUD device glyphs. The pointer
     // is cached from the hook (player_onaction_player_input); the consumer validates this RTTI name before
     // writing. KCD2 pins the look yaw directly instead, so this field write is a KCD1-only mechanism.
     constexpr const char *C_PLAYERINPUT_RTTI_NAME = ".?AVC_PlayerInput@entitymodule@wh@@";
@@ -153,18 +160,13 @@ namespace Constants
     // visible while the third-person offset is rendering so the player is not headless
     // from behind. KCD1 setter = sub_18106201C.
 
-    // Global action dispatcher: the KCD2 AOB keys on a profiler/action string stripped from KCD1, but the
-    // dispatcher itself was located via the surviving "OnAction" Lua string -> the player OnAction bridge
-    // sub_181077628. The player_onaction_hook hooks it for orbit move-detection, resolved at runtime by the
-    // AnchorId::ActionDispatch cascade (k_actionDispatchCandidates).
-
-    // --- Physics world raycast (camera collision + aim convergence) ---
+    // Physics world raycast (camera collision + aim convergence)
     // IPhysicalWorld::RayWorldIntersection inline helper (k_rayWorldIntersectionCandidates). Casts a
     // world ray and fills a ray_hit; returns the hit count. Signature (Microsoft x64):
     //   int(this /*rcx = p_physical_world*/, const Vec3* org /*rdx*/, const Vec3* dir /*r8*/,
     //       int objtypes /*r9d*/, uint flags, ray_hit* hits, int n_max_hits, void* p_skip_ents,
     //       int n_skip_ents, void* p_foreign_data, int i_foreign_data, const char* p_name_tag)
-    // dir is NOT normalized -- its length is the maximum ray length, and ray_hit.dist is the
+    // dir is NOT normalized - its length is the maximum ray length, and ray_hit.dist is the
     // world-space distance to the hit.
 
     // p_physical_world (IPhysicalWorld*) is a member of the g_env struct: its slot address is
@@ -183,6 +185,24 @@ namespace Constants
     constexpr ptrdiff_t GENV_HARDWARE_MOUSE_OFFSET = 0x108; // [KCD2 +0x118]
     constexpr ptrdiff_t HARDWARE_MOUSE_CURSOR_COUNT_OFFSET = 0x30;
 
+    // Engine frame clock: the camera paces its per-frame integrators on the engine's own frame time so that a
+    // rate-driven motion (the gamepad orbit) advances by the same step per frame as the world. The timer
+    // (ITimer*, class CTimer) is a g_env member at GENV_TIMER_OFFSET, confirmed by its RTTI name before use.
+    //   GetFrameStartTime = vtable slot 5 (+0x28): const CTimeValue &(this /*rcx*/, ETimer which /*edx*/). The
+    //     CTimeValue is one int64; the UI clock's value is stamped once at frame start and never pauses, so it
+    //     identifies the frame (both game-view frustum builds of one frame read the same stamp).
+    //   GetFrameTime = vtable slot 8 (+0x40) [KCD2 slot 9 / +0x48]: float(this /*rcx*/, ETimer which /*edx*/),
+    //     seconds. KCD1's slot 9 is GetRealFrameTime. The GAME clock returns the frame time the world advanced by:
+    //     clamped, time-scaled and, with t_Smoothing on (the default), averaged over the last quarter second. It
+    //     returns 0 while the game timer is paused, when the UI clock's unsmoothed frame time is used instead so
+    //     menus still ease.
+    constexpr ptrdiff_t GENV_TIMER_OFFSET = 0x80;
+    constexpr const char *CTIMER_RTTI_NAME = ".?AVCTimer@@";
+    constexpr ptrdiff_t ITIMER_VTABLE_GET_FRAME_START_TIME_OFFSET = 0x28;
+    constexpr ptrdiff_t ITIMER_VTABLE_GET_FRAME_TIME_OFFSET = 0x40; // [KCD2 +0x48]
+    constexpr int ETIMER_GAME = 0;
+    constexpr int ETIMER_UI = 1;
+
     // ray_hit field offsets (CryEngine physinterface.h). The engine writes a full ray_hit through the
     // SRWIParams hits pointer; size the buffer generously (0x60, matching the fork layout) so a
     // slightly larger fork ray_hit can never overflow the stack buffer.
@@ -193,19 +213,9 @@ namespace Constants
     constexpr ptrdiff_t RAY_HIT_OFFSET_NORMAL = 0x30;   // Vec3 surface normal
     constexpr ptrdiff_t RAY_HIT_OFFSET_TERRAIN = 0x3C;  // int bTerrain (non-zero == global terrain heightmap hit)
 
-    // CPhysicalEntity / CPhysicalPlaceholder world AABB (m_BBox): min @ +0x08, max @ +0x14, each a Vec3.
-    constexpr ptrdiff_t PHYS_ENTITY_BBOX_MIN_OFFSET = 0x08;
-    constexpr ptrdiff_t PHYS_ENTITY_BBOX_MAX_OFFSET = 0x14;
-
-    // CPhysicalEntity foreign data: m_pForeignData @ +0x20 (the IRenderNode the physics entity belongs to),
-    // m_iForeignData @ +0x28 (the PHYS_FOREIGN_ID; 1 == PHYS_FOREIGN_ID_STATIC = a static brush/render node).
-    constexpr ptrdiff_t PHYS_ENTITY_FOREIGN_DATA_OFFSET = 0x20;
-    constexpr ptrdiff_t PHYS_ENTITY_FOREIGN_TYPE_OFFSET = 0x28;
-    constexpr int PHYS_FOREIGN_ID_STATIC = 1;
-
     // entity_query_flags subset (physinterface.h): ent_static=1, ent_sleeping_rigid=2, ent_rigid=4,
     // ent_living=8, ent_independent=0x10, ent_terrain=0x100. Camera collision blocks on the SOLID WORLD
-    // ONLY -- ent_static | ent_terrain -- which is buildings/walls/level geometry/static props/vegetation
+    // ONLY - ent_static | ent_terrain - which is buildings/walls/level geometry/static props/vegetation
     // plus the ground. It deliberately EXCLUDES movable rigids, living capsules and independents.
     constexpr int RWI_OBJTYPES_CAMERA = 0x101; // ent_static | ent_terrain (solid world only)
     // ent_all: every entity type (static|rigid|living|independent|terrain|...). Used ONLY to find the
@@ -234,8 +244,8 @@ namespace Constants
     //                            int iCaller /*r9d*/)   <- in sub_18041B7F0; iCaller is the 4th arg
     // The caller builds a zeroed SRWIParams (org/dir are EMBEDDED Vec3 values, not pointers), points its hits
     // field at a ray_hit buffer, sets nMaxHits = 1, and passes iCaller = RWI_EXTERNAL_CALLER (the external
-    // physics-thread index; the synchronous path spin-locks on it). The field offsets below are KCD1 1.9.7
-    // specific. KCD2 instead resolved a flat 12-arg INLINE helper by AOB -- a DIFFERENT entry; the
+    // physics-thread index; the synchronous path spin-locks on it). The field offsets below are KCD1
+    // specific. KCD2 instead resolved a flat 12-arg INLINE helper by AOB - a DIFFERENT entry; the
     // vtable slot must NOT be called with that flat signature (args land in the wrong registers).
     constexpr int RWI_EXTERNAL_CALLER = 4;           // SRWIParams iCaller (MAX_PHYS_THREADS external slot)
     constexpr size_t SRWI_PARAMS_SIZE = 0x80;        // zeroed params block
@@ -246,15 +256,15 @@ namespace Constants
     constexpr ptrdiff_t SRWI_HITS_OFFSET = 0x38;     // ray_hit* hits
     constexpr ptrdiff_t SRWI_NMAXHITS_OFFSET = 0x40; // int nMaxHits
 
-    // --- Swept-sphere camera collision: IPhysicalWorld::PrimitiveWorldIntersection (PWI / SPWIParams) ---
-    // PORTED FROM KCD2: the Warhorse fork shares this physics layout, so KCD1's offsets are IDENTICAL to
+    // Swept-sphere camera collision: IPhysicalWorld::PrimitiveWorldIntersection (PWI / SPWIParams)
+    // The Warhorse fork shares this physics layout, so KCD1's offsets are IDENTICAL to
     // KCD2's. On KCD1 (impl sub_18038878C): PWI = CPhysicalWorld vtable slot 57; the impl reads
     // the SPWIParams fields at the offsets below; pLockContacts (r8) defaults to pp+0xD8 when null. Signature:
     //   float(this /*rcx=world*/, SPWIParams* pp /*rdx*/, WriteLockCond* pLockContacts /*r8=0->pp+0xD8*/,
     //         const char* pNameTag /*r9*/)  -> xmm0 = distance to first contact (> 0 == hit; sweep).
     constexpr ptrdiff_t PHYS_WORLD_VTABLE_PWI_OFFSET = 0x1C8; // CPhysicalWorld vtable slot 57
 
-    // primitives::sphere { Vec3 center; float r; } -- 16 bytes, type id 4. center is WORLD space.
+    // primitives::sphere { Vec3 center; float r; } - 16 bytes, type id 4. center is WORLD space.
     constexpr int PRIMITIVE_TYPE_SPHERE = 4;
     constexpr size_t PRIMITIVE_SPHERE_SIZE = 0x10;
     // primitives::sphere is { Vec3 center; float r; }: center at +0, radius float at +0xC (a fixed POD layout,
@@ -269,7 +279,7 @@ namespace Constants
     constexpr ptrdiff_t SPWI_OFF_PPRIM = 0x20;        // const primitives::primitive*
     constexpr ptrdiff_t SPWI_OFF_SWEEPDIR = 0x8C;     // Vec3 sweep vector (|dir| > 0 -> sweep)
     constexpr ptrdiff_t SPWI_OFF_FLAGS = 0x98;        // int rwi-style flags: impl tests &0x800 = queue and feeds
-                                                      // the broadphase filter -- set 0x101, NEVER 0x800
+                                                      // the broadphase filter - set 0x101, NEVER 0x800
     constexpr ptrdiff_t SPWI_OFF_ENTTYPES = 0x9C;     // entity_query_flags per header order; DEAD in this fork
     constexpr ptrdiff_t SPWI_OFF_PPCONTACT = 0xA0;    // geom_contact** OUT (engine writes *ppcontact)
     constexpr ptrdiff_t SPWI_OFF_GEOMFLAGSALL = 0xA8; // int (parts must have ALL these geom flags)
@@ -287,7 +297,7 @@ namespace Constants
     // Colltype mask for SPWI_OFF_GEOMFLAGSANY: stop the sphere on ANY solid surface (mirrors the RWI intent).
     constexpr int SPWI_GEOMFLAGS_ANY_SOLID = 0x0FFF;
 
-    // --- Render-node camera occlusion (collide with render-only roofs RWI cannot see) ---
+    // Render-node camera occlusion (collide with render-only roofs RWI cannot see)
     // Some roofs (tent / awning canopy cloth) are CBrush render meshes with NO ray-collidable physics, so
     // the physics camera collision glides straight through them and the cloth buries the camera when a
     // look-down raises it overhead. The renderer DOES see them: I3DEngine::GetObjectsInBox is an octree
@@ -301,23 +311,54 @@ namespace Constants
     //   uint32 GetObjectsInBox(this /*rcx*/, const AABB* bbox /*rdx; 6 floats min.xyz,max.xyz*/,
     //   IRenderNode** p_out /*r8*/). p_out == null returns the count only; otherwise it memcpys the FULL
     //   list with NO size cap, so the count is read first and the buffer sized to fit it.
-    constexpr ptrdiff_t C3DENGINE_VTABLE_GETOBJECTSINBOX_OFFSET = 233 * 8;
-    // IRenderNode vtable: GetBBox = slot 5 (+0x28) [KCD2 slot 4/+0x20]; GetRenderNodeType = slot 7 (+0x38),
-    // returns EERType (eERType_Brush == 1) [same as KCD2].
-    constexpr ptrdiff_t RENDERNODE_VTABLE_GETBBOX_OFFSET = 0x28;
+    constexpr ptrdiff_t ENGINE3D_VTABLE_GET_OBJECTS_IN_BOX_OFFSET = 233 * 8;
+    // C3DEngine::GetObjectsByTypeInBox(this /*rcx*/, EERType type /*edx*/, const AABB* bbox /*r8*/,
+    //   IRenderNode** p_out /*r9*/) -> uint32 count, the vtable slot right before GetObjectsInBox [KCD2 242, which
+    // also takes a fifth rnd_flags_mask argument that KCD1 does not have]. Same count-or-fill contract, but it
+    // descends only into octree cells whose per-type object mask holds the type and walks only that type's object
+    // list, keeping the objects whose GetRenderNodeType() equals it. A brush query therefore skips the vegetation,
+    // decal, light and entity objects the untyped query visits and every caller here discards, which is most of the
+    // untyped query's cost. The slot is trusted only while both slots read as the same wrapper shape (see
+    // render_occlusion.cpp refresh_brush_query); otherwise the untyped query is used and the caller's own type
+    // filter applies.
+    constexpr ptrdiff_t ENGINE3D_VTABLE_GET_OBJECTS_BY_TYPE_IN_BOX_OFFSET = 232 * 8;
+    // Both slots are the same small wrapper: it builds a PodArray on the stack, calls the PodArray overload, then
+    // copies the result to the caller's list, which it keeps in rdi. The list arrives in r9 for the typed query
+    // (this, type, bbox, list) and in r8 for the untyped one (this, bbox, list), so these heads prove both the slot
+    // numbering and the typed query's argument layout before it is ever called.
+    constexpr uint8_t ENGINE3D_TYPED_QUERY_HEAD[] = {
+        0x48, 0x8B, 0xC4,             // mov rax, rsp
+        0x48, 0x89, 0x58, 0x08,       // mov [rax+8], rbx
+        0x57,                         // push rdi
+        0x48, 0x83, 0xEC, 0x30,       // sub rsp, 30h
+        0x48, 0x83, 0x60, 0xE8, 0x00, // and qword ptr [rax-18h], 0
+        0x49, 0x8B, 0xF9,             // mov rdi, r9  (the caller's list)
+        0x83, 0x60, 0xF0, 0x00,       // and dword ptr [rax-10h], 0
+        0x4C, 0x8D, 0x48, 0xE8,       // lea r9, [rax-18h]  (the PodArray)
+    };
+    constexpr uint8_t ENGINE3D_UNTYPED_QUERY_HEAD[] = {
+        0x48, 0x8B, 0xC4,             // mov rax, rsp
+        0x48, 0x89, 0x58, 0x08,       // mov [rax+8], rbx
+        0x57,                         // push rdi
+        0x48, 0x83, 0xEC, 0x30,       // sub rsp, 30h
+        0x48, 0x83, 0x60, 0xE8, 0x00, // and qword ptr [rax-18h], 0
+        0x49, 0x8B, 0xF8,             // mov rdi, r8  (the caller's list)
+        0x83, 0x60, 0xF0, 0x00,       // and dword ptr [rax-10h], 0
+        0x4C, 0x8D, 0x40, 0xE8,       // lea r8, [rax-18h]  (the PodArray)
+    };
+    // IRenderNode vtable: GetRenderNodeType = slot 7 (+0x38), returns EERType (eERType_Brush == 1) [same as KCD2].
     constexpr ptrdiff_t RENDERNODE_VTABLE_GETTYPE_OFFSET = 0x38;
     constexpr int EERTYPE_BRUSH = 1;
-    // IRenderNode::m_dwRndFlags (carries ERF_HIDDEN). UNRESOLVED for KCD1 + currently UNUSED: 0x34 is NOT
-    // m_dwRndFlags -- it is a render-state dword whose bit 8 (0x100) is SET on many VISIBLE brushes, so the KCD2
-    // ERF_HIDDEN visibility gate is omitted in render_occlusion.cpp until the real offset is reversed (see the
-    // TODO there). Kept for documentation / the eventual restore. [KCD2 m_dwRndFlags +0x28, ERF_HIDDEN BIT(8)]
-    constexpr ptrdiff_t RENDERNODE_RNDFLAGS_OFFSET = 0x34; // WRONG/unresolved -- not currently referenced
-    constexpr unsigned int ERF_HIDDEN = 0x100;             // ERenderNodeFlags BIT(8)
     // A render node whose largest world-AABB dimension exceeds this (meters) is treated as world / terrain
     // and never used as an overhead roof clamp, so only compact props (tents, awnings, lean-tos) qualify.
     constexpr float RENDER_OCCLUSION_MAX_BRUSH_SIZE = 50.0f;
     // Safety cap on the per-query node count; also sizes the stack list buffer for the count-then-fill query.
     constexpr int RENDER_OCCLUSION_MAX_NODES = 1024;
+    // Headroom kept free in that buffer between the counting query and the filling one. The fill copies whatever
+    // the octree holds at that moment, so a node registered between the two calls would otherwise land past the
+    // end of the buffer. A count above RENDER_OCCLUSION_MAX_NODES - RENDER_OCCLUSION_NODE_SLACK is treated like a
+    // count above the cap.
+    constexpr int RENDER_OCCLUSION_NODE_SLACK = 64;
 
     // CBrush layout (KCD1): Matrix34 @ +0x48 [KCD2 +0x50]; IStatObj* @ +0x98 [same];
     // cached world AABB min @ +0xAC, max @ +0xB8 (read directly; what GetBBox returns).
@@ -327,11 +368,11 @@ namespace Constants
     constexpr ptrdiff_t CBRUSH_AABB_MAX_OFFSET = 0xB8; // cached world AABB max Vec3
     // IStatObj::m_szFileName, a CryString whose value IS the char* to the .cgf path chars (dereferenced once).
     // On KCD1: statobj+0xA8 -> "objects/buildings/.../*_roof.cgf" (KCD2 was +0xA0; reads null here).
-    // (statobj+0xB8 is a DIFFERENT attr string -- "lastpose = undefined" -- so do not confuse the two.)
+    // (statobj+0xB8 is a DIFFERENT attr string - "lastpose = undefined" - so do not confuse the two.)
     // Used for trace-logging WHAT a render-occlusion clamp latched onto (identify false positives by name).
     constexpr ptrdiff_t STATOBJ_CGF_NAME_OFFSET = 0xA8; // char* to .cgf path on the IStatObj [KCD2 +0xA0]
 
-    // --- Render-mesh cloth ray-march (ports KCD2's overhead cloth clamp 1:1; only the values differ) ---
+    // Render-mesh cloth ray-march (ports KCD2's overhead cloth clamp 1:1; only the values differ)
     // IStatObj -> IRenderMesh (CRenderMesh): statobj+0x48 RTTI == "CRenderMesh" [KCD2 +0x58].
     constexpr ptrdiff_t STATOBJ_RENDERMESH_OFFSET = 0x48; // IRenderMesh* (CRenderMesh) [KCD2 +0x58]
     // CRenderMesh vertex count: GetPosPtr (slot 43) allocates 12 * *(rmesh+0x6C) and fills that
@@ -349,7 +390,7 @@ namespace Constants
     constexpr int RENDER_OCCLUSION_MIN_COLUMN_VERTS = 3;
     constexpr float RENDER_OCCLUSION_REQUERY_DIST = 0.40f;
 
-    // --- Camera-space interaction (door/usable look-at ray redirect) ---
+    // Camera-space interaction (door/usable look-at ray redirect)
     // RESOLVED for KCD1 via the interactor SELECTION-WRAP (interaction_hook.cpp + the INTERACTOR_LOOKRAY /
     // FRAMEWORK_VIEW constants below): the per-tick selection is wrapped and its framework-view pose is
     // transiently overwritten with the render camera + crosshair (origin slid to the eye projection). The KCD2
@@ -361,7 +402,7 @@ namespace Constants
     // resolved at runtime by its own AOB cascade: the menu via the wh::guimodule toggle (AnchorId::MenuOpen)
     // and the overlay/apse UI (inventory, codex, map) via the CryEngine action-filter worker
     // (AnchorId::OverlayHide). Dialogue is detected separately via the active-camera RTTI (the dialogue camera
-    // swaps to wh::game::C_CameraDialog, type_id 2 -- see CAMERA_TYPE_DIALOG).
+    // swaps to wh::game::C_CameraDialog, type_id 2 - see CAMERA_TYPE_DIALOG).
 
     // Generic input-event dispatcher (k_inputDispatchCandidates resolves it at runtime): KCD1 hook point is
     // CBaseInput::PostInputEvent (sub_1803E60B8; CBaseInput vtable slot 12). Every input event (movement and
@@ -374,13 +415,13 @@ namespace Constants
     // name /*rdx*/, uint activation /*r8d: 1=press, 2=release, 4=hold*/, float value /*xmm3*/). It runs the
     // action-map press/release/hold state machine and forwards to Lua OnAction; every player action (movement:
     // moveforward/xi_movey, value ~1 held / 0 released) flows through it. The orbit move-detection hooks it and
-    // latches |value|. (The earlier leaf sub_181077628 was the per-entity Lua bridge, which player movement does
-    // NOT reach.)
+    // latches |value|. (The per-entity Lua bridge sub_181077628 below it is not the hook point: player movement
+    // never reaches it.)
 
     // In-game menu open/close toggle sub_1805B84CC, the wh::guimodule menu show/hide convergence:
     // void(this /*rcx*/, char display /*dl: 1=open, 0=close*/). It acts only on a state CHANGE (*(this+0x41) is
     // the current menu-open byte) and is the single point ALL menu open/close paths funnel through (Flash
-    // "DisplayIngameMenu" handler sub_1805B849C, input, etc -- 5+ callers). Found via the C_UIMenuEvents
+    // "DisplayIngameMenu" handler sub_1805B849C, input, etc - 5+ callers). Found via the C_UIMenuEvents
     // registry (sub_1811425C8). KCD2 hooked separate vtable MenuOpen/MenuClose; KCD1 has this one toggle
     // instead, resolved at runtime by k_menuToggleCandidates (wired to AnchorId::MenuOpen; MenuClose stays
     // empty).
@@ -398,7 +439,7 @@ namespace Constants
     // the in-game menu overlay) raise "only_ui", the world map raises "only_map", dialogue raises "only_dialog",
     // and the MAIN MENU / frontend (no level gameplay) raises "only_menu". All drive the Overlay game-state, so
     // the default SuppressTPVState="Overlay" hides the TPV offset in every one of them (incl. the main menu,
-    // which renders a background camera with a RESOLVED player -- only_menu is the reliable signal that
+    // which renders a background camera with a RESOLVED player - only_menu is the reliable signal that
     // distinguishes it from gameplay, where NO filter is enabled). Dialogue ALSO sets the separate Dialogue bit
     // via active-camera RTTI in game_state.cpp, used by the edge-triggered Forced* state policies.
     constexpr const char *ACTION_FILTER_ONLY_UI = "only_ui";         // inventory / codex / in-game menu overlay
@@ -420,7 +461,7 @@ namespace Constants
     // camera-ray + eye-view mismatch that crashes. Instead the hook wraps sub_1803E51EC and transiently
     // overwrites v10 with the render camera + crosshair, then restores it. v10 is resolved as:
     //   framework = *(global-context slot)  (the AnchorId::Context cascade; the engine getter sub_180430AA4
-    //               just loads that slot -- see interaction_hook resolve_framework());
+    //               just loads that slot - see interaction_hook resolve_framework());
     //   view = *(framework + FRAMEWORK_VIEW_OFFSET);
     //   v10 = view + VIEW_POSE_OFFSET (+ VIEW_POSE_ALT_DELTA when *(view + VIEW_POSE_ALT_FLAG_OFFSET) != 0).
     // v10 layout = Vec3 position (floats 0..2) then a CryEngine Quat (v.x, v.y, v.z, w = floats 3..6).
@@ -431,19 +472,16 @@ namespace Constants
 
     // Look-axis event ids (SInputEvent.keyId / EKeyId, KCD-renumbered) matched on the analog look channel
     // together with MOUSE_INPUT_TYPE_ID below (which is actually EInputState::eIS_Changed, NOT a device
-    // type -- so the same gate catches mouse AND gamepad analog axes; see INPUT_EVENT_TYPE_OFFSET).
+    // type - so the same gate catches mouse AND gamepad analog axes; see INPUT_EVENT_TYPE_OFFSET).
     constexpr int INPUT_LOOK_YAW_EVENT_ID = 0x10A;   // mouse horizontal look (maxis_x); value = delta
     constexpr int INPUT_LOOK_PITCH_EVENT_ID = 0x10B; // mouse vertical look (maxis_y); value = delta
     // Gamepad RIGHT-STICK axes (xi_thumbrx / xi_thumbry). Same eIS_Changed channel, but value at +0x18 is
-    // the analog DEFLECTION (-1..1), not a delta -- the orbit hook latches it and the render hook integrates
+    // the analog DEFLECTION (-1..1), not a delta - the orbit hook latches it and the render hook integrates
     // it by rate (GamepadOrbitSpeed X/Y deg/s). [KCD2 was 0x21A/0x21B.]
     constexpr int INPUT_PAD_LOOK_YAW_EVENT_ID = 0x216;   // right-stick X (horizontal)
     constexpr int INPUT_PAD_LOOK_PITCH_EVENT_ID = 0x217; // right-stick Y (vertical)
-    // Left-stick + the WASD movement keys give movement INTENT in the absence of an action dispatcher.
-    constexpr int INPUT_PAD_MOVE_X_EVENT_ID = 0x210; // left-stick X (xi_thumblx)
-    constexpr int INPUT_PAD_MOVE_Y_EVENT_ID = 0x211; // left-stick Y (xi_thumbly)
 
-    // --- Memory Offsets ---
+    // Memory Offsets
     // Global-context -> camera-manager pointer. The manager is the root the game-state detection
     // walks to read the active camera (see OFFSET_ACTIVE_CAMERA below and game_state.cpp). The global-context
     // slot itself is resolved at runtime by the AnchorId::Context cascade (game_interface.cpp).
@@ -451,24 +489,138 @@ namespace Constants
     // RTTI type-descriptor name of the camera manager, the self-heal anchor for OFFSET_MANAGER_PTR_STORAGE.
     constexpr const char *C_CAMERA_MANAGER_RTTI_NAME = ".?AVC_CameraManager@game@wh@@";
 
-    // --- Game-state detection (see game_state.cpp) ---
+    // wh::engine3d::C_CameraObserver: the engine observer that follows the system view camera. Its update, vtable slot
+    // 31 [KCD2 30], copies GetViewCamera()'s position, forward and field of view into its out-parameters. The AI
+    // selects which NPCs to update in full, and which to hide and pause, from this observer (WH_AI_LOD_Override's
+    // default mode follows it through the world observer), so in third person it judges from the pulled-back camera
+    // instead of the eye.
+    constexpr const char *C_CAMERA_OBSERVER_RTTI_NAME = ".?AVC_CameraObserver@engine3d@wh@@";
+    constexpr size_t CAMERA_OBSERVER_VTABLE_UPDATE_SLOT = 31; // [KCD2 30]
+    // The update reads the view camera through ISystem vtable +0x3A0 [KCD2 +0x438] (call qword ptr [rax+3A0h]);
+    // finding these bytes among its first instructions confirms the slot before it is hooked.
+    constexpr uint8_t CAMERA_OBSERVER_UPDATE_SIGNATURE[] = {0xFF, 0x90, 0xA0, 0x03, 0x00, 0x00};
+    constexpr size_t CAMERA_OBSERVER_UPDATE_SIGNATURE_WINDOW = 0x30;
+
+    // Native turn-in-place animation. The free-roam locomotion action (wh::entitymodule::C_PlayerMovementAction) plays
+    // its turn fragments, and takes the LockBodyTurn reference that stops the body following the look, only when the
+    // actor reports third person.
+    // IActor::IsThirdPerson is C_Player vtable slot 72: for the local player it asks the active camera (slot 4), which
+    // is false for the first-person camera the mod keeps active. The function is shared by every actor class and
+    // answers true for any actor that is not the local player.
+    constexpr size_t C_PLAYER_IS_THIRD_PERSON_VTABLE_SLOT = 72;
+    // IsThirdPerson calls the active camera's slot 4 (mov rcx,rax; mov rdx,[rax]; call [rdx+20h]) among its first
+    // instructions; finding these bytes confirms the slot before it is hooked.
+    constexpr uint8_t C_PLAYER_IS_THIRD_PERSON_SIGNATURE[] = {0x48, 0x8B, 0xC8, 0x48, 0x8B, 0x10, 0xFF, 0x52, 0x20};
+    constexpr size_t C_PLAYER_IS_THIRD_PERSON_SIGNATURE_WINDOW = 0x50;
+    // IGameObjectExtension::HandleEvent is C_Player vtable slot 21 [KCD2 23]. When the camera manager switches the
+    // active camera it sends the player SGameObjectEvent 39 through this slot, and the movement action answers it,
+    // while idle, by re-reading IsThirdPerson and taking or dropping its LockBodyTurn reference. The mod sends the same
+    // event when it starts or stops reporting third person, so the body follows at once instead of on the next
+    // locomotion change.
+    constexpr size_t C_PLAYER_HANDLE_EVENT_VTABLE_SLOT = 21; // [KCD2 23]
+    // HandleEvent compares the event id with 39 (cmp eax,27h; jz); finding it confirms the slot.
+    constexpr uint8_t C_PLAYER_HANDLE_EVENT_SIGNATURE[] = {0x83, 0xF8, 0x27, 0x0F, 0x84};
+    constexpr size_t C_PLAYER_HANDLE_EVENT_SIGNATURE_WINDOW = 0x100;
+    // The event object: vtable, event id, then the target/flags word and a 16-byte parameter, as the camera manager
+    // builds it (SGameObjectEvent{39, 0x4FFFF, 0}). KCD1 numbers these events one above KCD2: 38 is a different event.
+    constexpr const char *SGAME_OBJECT_EVENT_RTTI_NAME = ".?AUSGameObjectEvent@@";
+    constexpr uint32_t GAME_OBJECT_EVENT_CAMERA_CHANGED = 39; // [KCD2 38]
+    constexpr uint32_t GAME_OBJECT_EVENT_CAMERA_CHANGED_FLAGS = 0x4FFFF;
+
+    // The turn decision in ComputeMoveState, around the turn-trigger return address: the signed look-minus-body angle
+    // is copied to xmm13 and its absolute value to xmm6, and IsThirdPerson is called with rcx = rbx = the actor. When
+    // it answers true, a `jnz` leaves for a separate code chunk that runs `comiss xmm6, [35 degrees]; seta cl` and
+    // jumps back (`jmp rel32`) to the join right after the inline `xor cl,cl` [KCD2 keeps all of it inline]. cl is the
+    // turn-versus-idle choice, made every idle frame. Because the game re-decides against the same 35 degrees every
+    // frame, a turn stops as soon as the gap drops under it, so the body always rests about 35 degrees short of the
+    // look. A mid hook on the `seta cl` (3 bytes) + `jmp rel32` (5 bytes) sets the flags it reads, which lets the mod
+    // start turns at its own angle and finish them facing the look.
+    // The window below, from TURN_DECISION_WINDOW_BEFORE bytes before the return address, proves the inline layout
+    // (identical on the Steam and GOG builds); a 0x100 entry marks a wildcard byte. The chunk is then found through the
+    // `jnz` displacement and proven by TURN_DECISION_CHUNK, whose `jmp` must land on the join.
+    constexpr size_t TURN_DECISION_WINDOW_BEFORE = 0x2A; // [KCD2 0x25]
+    constexpr uint16_t TURN_DECISION_WINDOW[] = {
+        0x44, 0x0F, 0x28,  0xE8,                       // movaps xmm13, xmm0   (signed angle)
+        0xF3, 0x41, 0x0F,  0x5A,  0xCD,                // cvtss2sd xmm1, xmm13
+        0x0F, 0x54, 0x0D,  0x100, 0x100, 0x100, 0x100, // andps xmm1, [abs mask]
+        0x66, 0x0F, 0x5A,  0xF1,                       // cvtpd2ps xmm6, xmm1  (|angle|)
+        0x41, 0x0F, 0x2F,  0xF0,                       // comiss xmm6, xmm8
+        0x0F, 0x86, 0x100, 0x100, 0x100, 0x100,        // jbe
+        0x48, 0x8B, 0x03,  0x48,  0x8B,  0xCB,         // mov rax,[rbx]; mov rcx,rbx  (actor)
+        0xFF, 0x90, 0x40,  0x02,  0x00,  0x00,         // call [rax+240h]  (IsThirdPerson)
+        0x84, 0xC0,                                    // test al,al  <- return address
+        0x0F, 0x85, 0x100, 0x100, 0x100, 0x100,        // jnz chunk
+        0x32, 0xC9,                                    // xor cl,cl
+    };
+    // The `jnz` displacement and the address it is relative to, from the return address.
+    constexpr size_t TURN_DECISION_BRANCH_DISP_AT = 0x04;
+    constexpr size_t TURN_DECISION_BRANCH_NEXT = 0x08;
+    // The join every path reaches with cl set, from the return address; the chunk's `jmp` must land here.
+    constexpr size_t TURN_DECISION_JOIN_AFTER = 0x0A;
+    constexpr uint16_t TURN_DECISION_CHUNK[] = {
+        0x0F, 0x2F, 0x35, 0x100, 0x100, 0x100, 0x100, // comiss xmm6, [35 degrees]
+        0x0F, 0x97, 0xC1,                             // seta cl  <- hook site
+        0xE9,                                         // jmp join
+    };
+    constexpr size_t TURN_DECISION_SITE_IN_CHUNK = 0x07;
+    constexpr size_t TURN_DECISION_JOIN_DISP_IN_CHUNK = 0x0B; // the `jmp` rel32, relative to the chunk + 0x0F
+
+    // The game's spin latch, which the turn-decision hook must never set. rdi is the C_PlayerMovementAction there
+    // (ComputeMoveState's `this`, unchanged up to the hook site). The latch sets when a turn is decided while a turn
+    // fragment is still installed (state 1 or 2) and the gap's sign differs from the previous evaluation's non-zero
+    // sign, and then spins the body the OLD way, the long way round. Each instruction below reads one of those fields
+    // and is checked before the hook goes in (identical on the Steam and GOG builds), which proves the field offsets
+    // the hook reads. The latch and state reads follow the join (offsets from the return address); the last-sign read
+    // sits in the chunk (offset from the hook site).
+    constexpr ptrdiff_t MOVEMENT_ACTION_SPIN_LATCH_OFFSET = 0xD0;      // uint8, latch set [KCD2 0xF0]
+    constexpr ptrdiff_t MOVEMENT_ACTION_INSTALLED_STATE_OFFSET = 0xB0; // int32, 1 and 2 = turn installed [KCD2 0xD0]
+    constexpr ptrdiff_t MOVEMENT_ACTION_LAST_SIGN_OFFSET = 0xB4;       // float, previous sign, 0 = none [KCD2 0xD4]
+    constexpr size_t TURN_SPIN_LATCH_READ_AT = 0x5F;                   // from the return address
+    constexpr uint8_t TURN_SPIN_LATCH_READ[] = {0x40, 0x38, 0xB7, 0xD0, 0x00, 0x00, 0x00}; // cmp [rdi+0D0h], sil
+    constexpr size_t TURN_INSTALLED_STATE_READ_AT = 0x6C;                                  // from the return address
+    constexpr uint8_t TURN_INSTALLED_STATE_READ[] = {0x8B, 0x87, 0xB0, 0x00, 0x00, 0x00,   // mov eax, [rdi+0B0h]
+                                                     0xFF, 0xC8, 0x83, 0xF8, 0x01};        // dec eax; cmp eax, 1
+    constexpr size_t TURN_LAST_SIGN_READ_AT = 0x70;                                        // from the hook site
+    constexpr uint8_t TURN_LAST_SIGN_READ[] = {0xF3, 0x0F, 0x10, 0x87,
+                                               0xB4, 0x00, 0x00, 0x00}; // movss xmm0, [rdi+0B4h]
+
+    // ComputeMoveState keeps its turn-angle output pointer in r12 from its prologue to its end. The installed action's
+    // Update passes one; UpdatePending, which runs it while the action is only queued behind another one (an
+    // interaction, a stagger), passes null, so r12 == 0 at the hook site means the player's movement is not this
+    // action's. Both instructions are checked at their offset from the return address (identical on Steam and GOG
+    // builds; nothing between them writes r12).
+    constexpr size_t TURN_OUTPUT_SAVE_BEFORE = 0x217;
+    constexpr uint8_t TURN_OUTPUT_SAVE[] = {0x4C, 0x8B, 0xE2}; // mov r12, rdx
+    constexpr size_t TURN_OUTPUT_STORE_AT = 0x9D;
+    constexpr uint8_t TURN_OUTPUT_STORE[] = {0x4D, 0x85, 0xE4,                    // test r12, r12
+                                             0x74, 0x06,                          // jz
+                                             0xF3, 0x41, 0x0F, 0x11, 0x3C, 0x24}; // movss [r12], xmm7
+
+    // CAnimatedCharacter movement request type, read by UpdatePhysicalEntityMovement (1 absolute, 2 impulse). An
+    // impulse's translation is a push, not a step, and the turn-in-place detour never drops it. The read is checked at
+    // its offset from the function's start before the hook goes in (identical on the Steam and GOG builds).
+    constexpr ptrdiff_t ANIMATED_CHARACTER_MOVEMENT_TYPE_OFFSET = 0x698;
+    constexpr int32_t ANIMATED_CHARACTER_MOVEMENT_IMPULSE = 2;
+    constexpr size_t PHYS_ENT_MOVEMENT_TYPE_READ_AT = 0x12D;                                     // [KCD2 0x66C]
+    constexpr uint8_t PHYS_ENT_MOVEMENT_TYPE_READ[] = {0x83, 0xBB, 0x98, 0x06, 0x00, 0x00, 0x01, // cmp [rbx+698h], 1
+                                                       0x44, 0x8D, 0x60, 0x02};                  // lea r12d, [rax+2]
+
+    // LockBodyTurn reference count on C_Player (C_Player vtable slot 126 [KCD2 135] adds or removes one; mounting,
+    // pickups and scripted interactions hold references too). While it is 0 the body follows the look, as in first
+    // person. Read only, for the log.
+    constexpr ptrdiff_t C_PLAYER_LOCK_BODY_TURN_COUNT_OFFSET = 0x15C; // [KCD2 0x174]
+
+    // Game-state detection (see game_state.cpp)
     // Active-camera pointer on the wh::game::C_CameraManager. KCD1 stores the active camera at manager+0x10
     // and each camera carries a TYPE ID at cam+0x08 (0=FP 1=TP 2=Dialog 3=Combat 4=Minigame(dice) 7=Ansel),
     // so the active camera is identified by its type id (faster than RTTI). The game selects this camera
     // BEFORE the pose smoother runs, so a state read from it does not lag.
     constexpr ptrdiff_t OFFSET_ACTIVE_CAMERA = 0x10;  // [KCD2 used +0x30 + RTTI]
     constexpr ptrdiff_t OFFSET_CAMERA_TYPE_ID = 0x08; // int type id at cam+0x08
-    constexpr int CAMERA_TYPE_FIRST_PERSON = 0;
-    constexpr int CAMERA_TYPE_THIRD_PERSON = 1;
     constexpr int CAMERA_TYPE_DIALOG = 2;
     constexpr int CAMERA_TYPE_COMBAT = 3;
-    constexpr int CAMERA_TYPE_MINIGAME = 4; // dice/tabletop only
-    constexpr int CAMERA_TYPE_ANSEL = 7;
-    // RTTI type-descriptor names kept for cross-reference / fallback identification.
-    constexpr const char *C_CAMERA_COMBAT_RTTI_NAME = ".?AVC_CameraCombatDelegate@game@wh@@";
-    constexpr const char *C_CAMERA_DIALOG_RTTI_NAME = ".?AVC_CameraDialog@game@wh@@";
 
-    // --- Minigame detection (see game_state.cpp poll_active_minigame) ---
+    // Minigame detection (see game_state.cpp poll_active_minigame)
     // Every minigame (dice, reading, pickpocketing, alchemy, herb gathering) derives from
     // wh::playermodule::C_Minigame and is owned by the C_PlayerModule. The module keeps the active
     // minigames in a std::map<actorId, C_Minigame*>; a non-empty map means a minigame is on screen.
@@ -476,19 +628,18 @@ namespace Constants
     //   subsystem = *(context + OFFSET_MINIGAME_SUBSYSTEM)    // C_PlayerModule (RTTI-confirmed)
     //   map       = *(subsystem + OFFSET_MINIGAME_MAP)        // ptr to std::map node tree (getter sub_1806FD770)
     //   in_minigame = *(uint64*)(map + OFFSET_MINIGAME_MAP_SIZE) > 0
-    // Each tree node holds the key (actorId) at OFFSET_MINIGAME_NODE_KEY and the C_Minigame* value at
-    // OFFSET_MINIGAME_NODE_VALUE; the concrete minigame's RTTI then identifies WHICH minigame (dice -> C_Dice,
-    // reading -> C_Reading, and so on for all 11 in this one map -- so the per-minigame child bit is reliable).
+    // Each tree node holds the key (actorId) at +0x20 and the C_Minigame* value at OFFSET_MINIGAME_NODE_VALUE; the
+    // concrete minigame's RTTI then identifies WHICH minigame (dice -> C_Dice, reading -> C_Reading, and so on for
+    // all 11 in this one map - so the per-minigame child bit is reliable).
     // On KCD1 lockpicking and hole-digging are C_Minigame too, so they resolve a child bit like the rest.
     constexpr ptrdiff_t OFFSET_MINIGAME_SUBSYSTEM = 0xE8; // global context -> C_PlayerModule [KCD2 +0x128]
     // RTTI type-descriptor name of the minigame subsystem, the self-heal anchor for OFFSET_MINIGAME_SUBSYSTEM.
     constexpr const char *C_PLAYER_MODULE_RTTI_NAME = ".?AVC_PlayerModule@playermodule@wh@@";
-    // Map pointer = C_PlayerModule vtable slot 9 getter sub_1806FD770, which returns *(this + 0x98). The old 0x90
-    // read a wrong adjacent heap pointer, giving a garbage _Mysize that left the Minigame umbrella stuck ON with
-    // no child bit ever resolving; 0x98 is the correct offset.
+    // Map pointer = C_PlayerModule vtable slot 9 getter sub_1806FD770, which returns *(this + 0x98). The adjacent
+    // +0x90 is a different heap pointer: read as the map, its garbage _Mysize holds the Minigame umbrella on with no
+    // child bit ever resolving.
     constexpr ptrdiff_t OFFSET_MINIGAME_MAP = 0x98;        // C_PlayerModule -> std::map<actorId,C_Minigame*> ptr
     constexpr ptrdiff_t OFFSET_MINIGAME_MAP_SIZE = 0x08;   // map -> _Mysize (0 == no minigame)
-    constexpr ptrdiff_t OFFSET_MINIGAME_NODE_KEY = 0x20;   // tree node -> key (actorId dword)
     constexpr ptrdiff_t OFFSET_MINIGAME_NODE_VALUE = 0x28; // tree node -> C_Minigame* value
 
     // RTTI type-descriptor names of the concrete KCD1 minigames, matched against the active minigame's vtable.
@@ -511,7 +662,7 @@ namespace Constants
     // controller (the KCD2 c_player+0xD70 path does not exist) and the weapon runtime is behind a handle table
     // (no pointer chain to it), but C_Player itself carries a player-side ranged-aim flag at +0x298: it reads 1
     // in EVERY non-aiming state (holstered, weapon lowered, melee/combat stance) and 0 ONLY while aiming a
-    // ranged weapon -- INVERTED, so aiming == (*(byte)(c_player+0x298) == 0). Being on C_Player (RTTI
+    // ranged weapon - INVERTED, so aiming == (*(byte)(c_player+0x298) == 0). Being on C_Player (RTTI
     // wh::entitymodule::C_Player) it is weapon-agnostic (covers crossbows, which share the C_Bow class) and a
     // fixed offset (no chain). +0x299 mirrors it. A failed read must report "not aiming" (fail closed).
     constexpr ptrdiff_t OFFSET_AIMING_FLAG = 0x298; // C_Player -> ranged-aim byte (0 == aiming, inverted)
@@ -550,14 +701,16 @@ namespace Constants
     // Hide-head flag mirrored on the player entity (relative to the entity passed to the
     // head-visibility setter); read to re-assert the head while the offset is active.
     constexpr ptrdiff_t OFFSET_ENTITY_HIDE_HEAD_FLAG = 0x9C4; // [KCD2 +0xA38]
+    // The setter's third argument, stored next to the flag (+0x9C5); the game passes it back unchanged on re-applies.
+    constexpr ptrdiff_t OFFSET_ENTITY_HIDE_HEAD_ARG = 0x9C5; // [KCD2 +0xA39]
 
-    // --- Input Event Offsets ---
+    // Input Event Offsets
     // SInputEvent layout (CryEngine IInput.h: deviceType@+0x00, state@+0x04, keyName@+0x08, keyId@+0x10,
     // modifiers@+0x14, value@+0x18, pSymbol@+0x20). TYPE_OFFSET is the STATE field, not the device type.
     constexpr ptrdiff_t INPUT_EVENT_TYPE_OFFSET = 0x04;  // SInputEvent.state (EInputState)
     constexpr ptrdiff_t INPUT_EVENT_ID_OFFSET = 0x10;    // SInputEvent.keyId (EKeyId)
     constexpr ptrdiff_t INPUT_EVENT_VALUE_OFFSET = 0x18; // SInputEvent.value (mouse: delta; pad: deflection)
-    // EInputState::eIS_Changed (1 << 3). Every analog axis move -- mouse OR gamepad stick -- posts with this
+    // EInputState::eIS_Changed (1 << 3). Every analog axis move - mouse OR gamepad stick - posts with this
     // state, so it is the device-AGNOSTIC gate for the look channel. Name kept for compatibility; it is the
     // input STATE, not a mouse/device type (the keyId distinguishes the axis and the device).
     constexpr int MOUSE_INPUT_TYPE_ID = 8;

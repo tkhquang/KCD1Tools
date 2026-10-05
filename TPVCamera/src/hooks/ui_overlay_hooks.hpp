@@ -6,7 +6,7 @@
  * is up. The camera reads overlay_state().active to suppress the third-person offset while an overlay
  * (inventory, codex, map) is up, so the view renders from the untouched engine frame under any UI.
  *
- * KCD1: the KCD2 HideOverlays/ShowOverlays AOBs get 0 matches on 1.9.7, so this drives the same
+ * KCD1: the KCD2 HideOverlays/ShowOverlays AOBs get 0 matches on KCD1, so this drives the same
  * overlay_state().active from the CryEngine action-filter worker instead (apse screens raise "only_ui" /
  * "only_map" / "only_dialog"); see ui_overlay_hooks.cpp. The API and overlay_state() output match KCD2 so the
  * call sites are unchanged between the two builds, and the overlay covers the dialog screen as KCD2 does.
@@ -15,6 +15,7 @@
 #define TPVCAMERA_UI_OVERLAY_HOOKS_HPP
 
 #include <DetourModKit/error.hpp>
+#include <DetourModKit/hook.hpp>
 
 namespace TPVCamera
 {
@@ -23,9 +24,9 @@ namespace TPVCamera
      * @brief Installs the overlay/apse hook that drives overlay_state().active.
      * @return An empty Result once the hook is armed, or the typed Error (overlay detection then disabled).
      * @note KCD1 hooks the action-filter worker resolved at runtime by the AnchorId::OverlayHide cascade. The hook
-     *       is owned by the DetourGate, which retires it at shutdown.
+     *       is pushed onto @p hooks, which shutdown() retires through the DetourGate.
      */
-    [[nodiscard]] DMK::Result<void> initialize_ui_overlay_hooks();
+    [[nodiscard]] DMK::Result<void> initialize_ui_overlay_hooks(DMK::hook::HookStack &hooks);
 
 } // namespace TPVCamera
 

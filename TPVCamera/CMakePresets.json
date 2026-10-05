@@ -14,7 +14,7 @@
       "binaryDir": "${sourceDir}/build/release-msvc",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "KCD1_TPVCAMERA_DEV_BUILD": "OFF"
+        "TPVCAMERA_DEV_BUILD": "OFF"
       }
     },
     {
@@ -25,8 +25,8 @@
       "binaryDir": "${sourceDir}/build/dev-msvc",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "KCD1_TPVCAMERA_DEV_BUILD": "ON",
-        "KCD1_TPVCAMERA_GAME_DIR": "C:/Program Files (x86)/Steam/steamapps/common/KingdomComeDeliverance/Bin/Win64"
+        "TPVCAMERA_DEV_BUILD": "ON",
+        "TPVCAMERA_GAME_DIR": "C:/Program Files (x86)/Steam/steamapps/common/KingdomComeDeliverance/Bin/Win64"
       }
     }
   ],

@@ -3,7 +3,7 @@
  * @brief KCD1 overlay/apse detection via the CryEngine action-filter worker.
  *
  * KCD2 drove overlay_state().active from a HideOverlays/ShowOverlays pair whose entry AOBs get 0 matches on
- * KCD1 1.9.7. KCD1 has no equivalent central overlay pair, but every blocking apse/UI screen instead enables
+ * KCD1. KCD1 has no equivalent central overlay pair, but every blocking apse/UI screen instead enables
  * a NAMED action filter on CActionMapManager, and in plain gameplay NO filter is enabled. All
  * EnableFilter/DisableFilter calls funnel through one worker, sub_1804FCC0C, so this hooks that worker and
  * sets overlay_state().active while an apse filter ("only_ui" = inventory/codex/menu, "only_map" = world map,
@@ -124,7 +124,7 @@ namespace TPVCamera
      * @details Split from the detour because a __try frame cannot share a function with the detour's Pass (an
      *          object with a destructor, MSVC C2712). A fault while reading the engine-owned name is swallowed.
      */
-    TPV_DETOUR static void guarded_update_overlay(const char *name, bool enable) noexcept
+    static void guarded_update_overlay(const char *name, bool enable) noexcept
     {
         __try
         {
@@ -140,8 +140,8 @@ namespace TPVCamera
      *        the engine's filter handling is untouched. A fault while reading the event is swallowed and the
      *        original still runs (its return value is propagated unchanged).
      */
-    TPV_DETOUR static void *__fastcall action_filter_worker_detour(void *mgr, const char *name, std::int64_t enable_raw,
-                                                                   unsigned int a4, char a5) noexcept
+    static void *__fastcall action_filter_worker_detour(void *mgr, const char *name, std::int64_t enable_raw,
+                                                        unsigned int a4, char a5) noexcept
     {
         const DetourGate::Pass pass;
         guarded_update_overlay(name, (enable_raw & 0xFF) != 0);
@@ -149,7 +149,7 @@ namespace TPVCamera
         return original ? original(mgr, name, enable_raw, a4, a5) : nullptr;
     }
 
-    DMK::Result<void> initialize_ui_overlay_hooks()
+    DMK::Result<void> initialize_ui_overlay_hooks(DMK::hook::HookStack &hooks)
     {
         // OverlayHide is the action-filter worker runtime AOB cascade (k_actionFilterWorkerCandidates, plus its
         // call-site rung); a total cascade miss fails closed. The default hook::Options prologue policy is Fail
@@ -164,7 +164,7 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "ActionFilterWorker",
                                                                          .target = DMK::Address{worker_addr}},
                                                 &action_filter_worker_detour));
-        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_worker_original));
+        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_worker_original));
 
         DMK::log().info("UIOverlayHook: hooked action-filter worker at {} (overlay/apse detection enabled)",
                         DMK::format::format_address(worker_addr));

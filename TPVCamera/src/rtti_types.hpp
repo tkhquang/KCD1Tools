@@ -43,6 +43,12 @@ namespace TPVCamera
         PlayerInput,
         /// wh::entitymodule::C_ActorModel, which carries the stance the MOUNT and STEALTH presets key on.
         ActorModel,
+        /// wh::engine3d::C_CameraObserver, the engine observer that follows the system view camera.
+        CameraObserver,
+        /// CTimer, the engine frame clock the camera paces its per-frame integrators on.
+        Timer,
+        /// SGameObjectEvent, the event the mod sends the player when it starts or stops the native turn animation.
+        GameObjectEvent,
         /// Enumerator count. Not a class.
         Count,
     };

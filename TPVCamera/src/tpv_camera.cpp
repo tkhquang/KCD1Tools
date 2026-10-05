@@ -5,8 +5,8 @@
  * init() runs off the Windows loader lock and receives the live Session: on the DetourModKit bootstrap worker in
  * the release ASI, on the resident loader's control thread in the dev build. shutdown() is driven by the host's
  * detach path (dllmain.cpp in production, the logic DLL's Shutdown() export in the dev build) and must likewise
- * run off the loader lock, because hooks are caller-owned and the DetourGate it retires is the only path that
- * restores the patched prologues.
+ * run off the loader lock, because hooks are caller-owned and retiring the hook stack through the DetourGate is
+ * the only path that restores the patched prologues.
  */
 
 #include "tpv_camera.hpp"
@@ -51,6 +51,11 @@ namespace TPVCamera
     // callables under the loader lock.
     static DMK::input::Scope *s_binding_scope = nullptr;
 
+    // Every hook the mod installs. A HookStack restores newest first, the only safe order for layered
+    // patches on one target: the newer layer trampoline chains through the older jump, so the base must
+    // be restored last. shutdown() retires it through the DetourGate while the code pages are still mapped.
+    static DMK::hook::HookStack s_hooks;
+
     // Bound on the DetourGate's caller-quiescence proof (drain + thread sweep). A detour body runs in well under
     // a frame, so a caller still inside after this long is wedged in game code; the image then stays mapped.
     constexpr std::chrono::milliseconds k_quiescence_budget{500};
@@ -78,7 +83,7 @@ namespace TPVCamera
 
     /**
      * @brief Engages free-look orbit, seeding the orbit angles to the configured centre.
-     * @details Seeds yaw/pitch to 0,0 (directly behind the player -- the camera's resting offset) so a
+     * @details Seeds yaw/pitch to 0,0 (directly behind the player - the camera's resting offset) so a
      *          fresh engage always starts from the centred pose, then flips orbit_active on. Shared by
      *          the orbit toggle, the momentary hold binding, and the start-of-session auto-enable so
      *          "engage" means exactly the same thing at every entry point.
@@ -196,22 +201,23 @@ namespace TPVCamera
         warn_if_degraded(initialize_game_interface(),
                          "Game interface initialization failed - game-state camera detection disabled");
 
-        warn_if_degraded(initialize_ui_menu_hooks(), "UI Menu hooks initialization failed - menu suppression disabled");
+        warn_if_degraded(initialize_ui_menu_hooks(s_hooks),
+                         "UI Menu hooks initialization failed - menu suppression disabled");
 
-        warn_if_degraded(initialize_ui_overlay_hooks(),
+        warn_if_degraded(initialize_ui_overlay_hooks(s_hooks),
                          "UI Overlay hooks initialization failed - overlay suppression disabled");
 
-        warn_if_degraded(initialize_interaction_hook(),
+        warn_if_degraded(initialize_interaction_hook(s_hooks),
                          "Interaction hook initialization failed - camera-space interaction disabled");
 
         // Device-agnostic movement intent for the orbit move-detection. Best-effort: a miss falls back to
         // body-position speed, so the camera still works without it.
-        warn_if_degraded(initialize_player_onaction_hook(),
+        warn_if_degraded(initialize_player_onaction_hook(s_hooks),
                          "Player OnAction hook initialization failed - orbit move-detection uses body speed");
 
         // The third-person camera itself. A hard failure here means the mod cannot function, so its Error is
         // returned unchanged rather than flattened into a mod-invented code.
-        if (auto camera = initialize_camera(mod.base, mod.size); !camera.has_value())
+        if (auto camera = initialize_camera(mod.base, mod.size, s_hooks); !camera.has_value())
         {
             logger.error("Critical: third-person camera hook installation failed ({}) - mod cannot function",
                          camera.error().message());
@@ -600,10 +606,10 @@ namespace TPVCamera
         }
 
         // Retire the game-thread detours: disable every hook newest-first (restoring the targets while their
-        // trampolines stay alive), prove no game thread is inside or entering a detour, and only then destroy the
-        // hooks. Hooks are caller-owned and the library removes none of them, so this is the only path that
+        // trampolines stay alive), prove no game thread is inside or entering a detour, and only then clear the
+        // hook stack. Hooks are caller-owned and the library removes none of them, so this is the only path that
         // restores the patched prologues.
-        const DetourGate::Retirement retirement = DetourGate::retire(k_quiescence_budget);
+        const DetourGate::Retirement retirement = DetourGate::retire(s_hooks, k_quiescence_budget);
         if (retirement != DetourGate::Retirement::Clean)
         {
             logger.error("Shutdown: hooks not retired ({}); the module must stay mapped",

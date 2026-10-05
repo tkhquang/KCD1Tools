@@ -42,9 +42,9 @@ namespace TPVCamera::Presets
          * @brief Equal-specificity tiebreak weight for a bind mask.
          * @details Each framing bit gets a distinct power of two, so any mask's summed weight is unique
          *          (a bitset) and a tie resolves by the highest-priority bit present. Priority, high to
-         *          low: Crouch > Combat > Mount > Lying > Sitting > Kneel. The stance bits
+         *          low: Aiming > Crouch > Combat > Mount > Lying > Sitting > Kneel. The stance bits
          *          (Mount, Crouch, Lying, Sitting, Kneel) are mutually exclusive in practice, so their
-         *          order only matters versus the orthogonal Combat bit. resolve_active_binding
+         *          order only matters versus the orthogonal Combat / Aiming bits. resolve_active_binding
          *          scales popcount above this sum (which is < 256), so specificity still dominates.
          */
         [[nodiscard]] std::uint32_t bind_priority_weight(std::uint32_t mask) noexcept

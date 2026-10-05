@@ -10,6 +10,7 @@
 #define TPVCAMERA_UI_MENU_HOOKS_HPP
 
 #include <DetourModKit/error.hpp>
+#include <DetourModKit/hook.hpp>
 
 namespace TPVCamera
 {
@@ -18,10 +19,10 @@ namespace TPVCamera
      * @brief Installs the in-game menu toggle hook from the pre-resolved MenuOpen anchor.
      * @return An empty Result once the hook is armed, or the typed Error (NoMatch for an unresolved anchor,
      *         otherwise the install / enable code).
-     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is owned
-     *       by the DetourGate, which retires it at shutdown.
+     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is pushed
+     *       onto @p hooks, which shutdown() retires through the DetourGate.
      */
-    [[nodiscard]] DMK::Result<void> initialize_ui_menu_hooks();
+    [[nodiscard]] DMK::Result<void> initialize_ui_menu_hooks(DMK::hook::HookStack &hooks);
 
     /**
      * @brief Check if the in-game menu is currently open.

@@ -66,10 +66,19 @@ namespace TPVCamera
 
         // Camera framing. The follow distance, offsets, eye height, aim focus, follow yaw/pitch, the orbit
         // tuning, and the per-preset collision values are all OWNED BY PRESETS (in the shipped presets JSON,
-        // applied to the live atomics each frame), so they are NOT INI settings -- tune them in the overlay.
+        // applied to the live atomics each frame), so they are NOT INI settings - tune them in the overlay.
         // Only the non-preset, always-live camera options remain here:
         camera.bind<bool>("InteractFromCamera", "Interact From Camera", s.interact_from_camera, true);
         camera.bind<float>("ViewTransitionDuration", "View Transition Duration", s.view_transition_duration, 0.0f);
+        // Camera stability against engine view-shake amplified by the follow distance (see LiveSettings).
+        // StableAimBasis builds the rig basis from the clean look-controller aim quat; AimBasisSmoothing
+        // low-passes the basis (0 = off). Both always-live.
+        camera.bind<bool>("StableAimBasis", "Stable Aim Basis", s.stable_aim_basis, true);
+        camera.bind<float>("AimBasisSmoothing", "Aim Basis Smoothing", s.aim_basis_smoothing, 0.3f);
+        // The game's own turn-in-place animations while the third-person view is engaged (see LiveSettings).
+        camera.bind<bool>("NativeTurnAnimation", "Native Turn Animation", s.native_turn_animation, true);
+        camera.bind<float>("NativeTurnAngle", "Native Turn Angle", s.native_turn_angle, 35.0f);
+        camera.bind<float>("NativeTurnSettleDelay", "Native Turn Settle Delay", s.native_turn_settle_delay, 0.8f);
 
         // Free-look orbit (non-preset, always-live; the orbit feel values are per-preset). The orbit hold key
         // (OrbitHoldKey) is an input binding, registered with its combo in tpv_camera.cpp.
@@ -78,14 +87,15 @@ namespace TPVCamera
 
         // Camera collision (non-preset, always-live; Enable/Skin/ReturnSpeed are per-preset). UseCoverageCollision
         // is the master switch for the coverage gate and the lateral probe (render occlusion is independent); OFF
-        // reverts to plain nearest-solid collision. (KCD1: the coverage gate is not ported -- that key is kept
-        // for parity but ignored; UseSphereCollision IS live -- it enables the PWI swept-sphere smoothing.)
+        // reverts to plain nearest-solid collision. (KCD1: the coverage gate is not ported - that key is kept
+        // for parity but ignored; UseSphereCollision IS live - it enables the PWI swept-sphere smoothing.)
         collision.bind<bool>("UseCoverageCollision", "Use Coverage Collision", s.use_coverage_collision, false);
         collision.bind<bool>("UseSphereCollision", "Use Sphere Collision", s.use_sphere_collision, true);
         collision.bind<float>("CollisionRadius", "Collision Radius", s.collision_radius, 0.15f);
         collision.bind<float>("CoverageThreshold", "Coverage Threshold", s.collision_coverage_threshold, 0.8f);
         collision.bind<float>("CameraProbeSize", "Camera Probe Size", s.camera_probe_size, 0.3f);
         collision.bind<bool>("UseRenderOcclusion", "Use Render Occlusion", s.use_render_occlusion, false);
+        collision.bind<float>("HeadClearance", "Head Clearance", s.head_clearance, 0.35f);
 
         // State-driven camera policy. The four *State values are comma-separated GameState token lists
         // (Menu, Overlay, Combat, Mount, Dialogue, Aiming, the stances Crouch/Lying/Sitting/Kneel, the umbrella
@@ -110,6 +120,10 @@ namespace TPVCamera
         // every other state debounced).
         state_behavior.bind_parsed("SuppressTPVState", "Suppress TPV State", s.suppress_tpv_mask, parse_state_mask,
                                    "Overlay");
+        // States that switch the native turn animation off: the body re-locks to the look there. A continuous gate
+        // like SuppressTPVState, NOT gated by EnableStateBehavior.
+        state_behavior.bind_parsed("NativeTurnExcludeState", "Native Turn Exclude State", s.native_turn_exclude_mask,
+                                   parse_state_mask, "Combat,Aiming,Mount,Dialogue,Minigame,Lying,Sitting,Kneel");
 
         // Preset manager (always active). PresetBlendSpeed is the exponential ease rate used when
         // switching presets on a state edge.

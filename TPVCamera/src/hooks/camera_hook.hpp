@@ -11,10 +11,11 @@
  * head-visibility setter keeps the player head rendered from behind, and an
  * input-dispatcher hook powers the free-look orbit.
  */
-#ifndef KCD1_TPVCAMERA_CAMERA_HOOK_HPP
-#define KCD1_TPVCAMERA_CAMERA_HOOK_HPP
+#ifndef TPVCAMERA_CAMERA_HOOK_HPP
+#define TPVCAMERA_CAMERA_HOOK_HPP
 
 #include <DetourModKit/error.hpp>
+#include <DetourModKit/hook.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -39,13 +40,15 @@ namespace TPVCamera
      *          the first-person rig keeps the player head while the offset is active, and
      *          the input dispatcher for free-look orbit. The detours fast-path out while
      *          the offset is toggled off, so they are harmless when the view is first-person.
-     *          Every hook is owned by the DetourGate, which retires it at shutdown.
+     *          Every hook goes onto @p hooks, which shutdown() retires through the DetourGate.
      * @param module_base Base address of the target game module.
      * @param module_size Size of the target game module in bytes.
+     * @param hooks The mod's hook stack; every installed hook is pushed onto it.
      * @return An empty Result once the frustum hook is armed (the best-effort head/input hooks only warn), or
      *         the frustum hook's typed Error, which init() surfaces unchanged.
      */
-    [[nodiscard]] DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size);
+    [[nodiscard]] DMK::Result<void> initialize_camera(uintptr_t module_base, size_t module_size,
+                                                      DMK::hook::HookStack &hooks);
 
     /**
      * @brief Resolves the zoom hold bindings to BindingTokens and publishes them for the per-frame query.
@@ -63,9 +66,11 @@ namespace TPVCamera
 
     /**
      * @brief Asks the render thread to hand every per-frame game override back to the engine, and waits for it.
-     * @details The next frustum-builder call restores the keyboard move field and the game's intended head
-     *          visibility on the render thread (the thread the engine drives both on), then leaves the view to the
-     *          game until the hooks are retired. Call at teardown, before the DetourGate retires the hooks.
+     * @details The next game-view frustum build (shadow and reflection builds only wait) restores the keyboard move
+     *          field and the game's intended head visibility, and switches the native turn animation off (the
+     *          camera-changed event, so an idle locomotion action drops its LockBodyTurn reference), all on the render
+     *          thread the engine drives them on. It then leaves the view to the game until the hooks are retired.
+     *          Call at teardown, before the DetourGate retires the hooks.
      * @param budget Bound on the wait for the render thread to run that frame.
      * @return True once the render thread acknowledged; false when no frame ran within @p budget.
      * @note Setup/control-plane only: it waits.
@@ -82,4 +87,4 @@ namespace TPVCamera
 
 } // namespace TPVCamera
 
-#endif // KCD1_TPVCAMERA_CAMERA_HOOK_HPP
+#endif // TPVCAMERA_CAMERA_HOOK_HPP

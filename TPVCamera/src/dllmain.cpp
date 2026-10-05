@@ -21,7 +21,7 @@
 
 // In the two-DLL dev build the logic is loaded by the resident loader ASI, which owns the
 // entry points (see src/dev/mod_logic.cpp). The production ASI uses DllMain.
-#ifndef KCD1_TPVCAMERA_DEV_BUILD
+#ifndef TPVCAMERA_DEV_BUILD
 
 namespace
 {
@@ -95,4 +95,4 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD ul_reason_for_call, LPVOID lp_rese
     return TRUE;
 }
 
-#endif // KCD1_TPVCAMERA_DEV_BUILD
+#endif // TPVCAMERA_DEV_BUILD

@@ -12,6 +12,7 @@
 
 #include <DetourModKit.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -88,9 +89,11 @@ namespace TPVCamera
             return opcode && *opcode == 0xE8 && call_site_target(static_cast<std::uintptr_t>(value), *image) != 0;
         }
 
-        /// A RipGlobal anchor over one ladder. Every rung anchors on an in-image instruction, so the byte tiers
-        /// sweep executable pages only: an identical byte run in .rdata or .data cannot alias or make a unique
-        /// code match ambiguous.
+        /**
+         * @brief A RipGlobal anchor over one ladder.
+         * @details Every rung anchors on an in-image instruction, so the byte tiers sweep executable pages only:
+         *          an identical byte run in .rdata or .data cannot alias or make a unique code match ambiguous.
+         */
         [[nodiscard]] Anchor code_ladder(std::string_view label, std::span<const Candidate> site) noexcept
         {
             return Anchor{
@@ -131,6 +134,9 @@ namespace TPVCamera
             code_ladder("MenuClose", {}),
             code_ladder("GetObjectsInBox", {}),
             code_ladder("CryActionFramework", Aob::k_cryActionFrameworkCandidates),
+            code_ladder("TurnTriggerIsThirdPersonReturn", Aob::k_turnTriggerReturnCandidates),
+            code_ladder("LockSyncIsThirdPersonReturn", Aob::k_lockSyncReturnCandidates),
+            code_ladder("UpdatePhysicalEntityMovement", Aob::k_physEntMovementCandidates),
         }};
 
         /// One independent call-site rung and the cascade it stands in for.
@@ -334,6 +340,18 @@ namespace TPVCamera
     std::span<const DMK::anchor::ResolvedAnchor> anchor_report() noexcept
     {
         return std::span<const DMK::anchor::ResolvedAnchor>(s_report.data(), s_report_count);
+    }
+
+    bool code_matches(std::uintptr_t address, std::span<const std::uint8_t> code) noexcept
+    {
+        std::array<std::uint8_t, 32> bytes{};
+        if (code.size() > bytes.size())
+        {
+            return false;
+        }
+        const auto read = std::span{bytes}.first(code.size());
+        return DMK::memory::read_into(DMK::Address{address}, std::as_writable_bytes(read)).has_value() &&
+               std::equal(read.begin(), read.end(), code.begin());
     }
 
 } // namespace TPVCamera

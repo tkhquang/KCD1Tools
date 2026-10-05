@@ -52,8 +52,11 @@ namespace TPVCamera::Presets
             return false;
         }
 
-        /// The editable PresetField with this key, or nullptr if none. Guards the shared-field machinery and the
-        /// JSON loader against a key that is not a real field (e.g. a stale entry in a hand-edited file).
+        /**
+         * @brief The editable PresetField with this key, or nullptr if none.
+         * @details Guards the shared-field machinery and the JSON loader against a key that is not a real field
+         *          (e.g. a stale entry in a hand-edited file).
+         */
         [[nodiscard]] const PresetField *find_field(std::string_view key) noexcept
         {
             for (const PresetField &field : fields())

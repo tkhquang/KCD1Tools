@@ -18,6 +18,7 @@
 #define TPVCAMERA_HOOKS_INTERACTION_HOOK_HPP
 
 #include <DetourModKit/error.hpp>
+#include <DetourModKit/hook.hpp>
 
 namespace TPVCamera
 {
@@ -25,11 +26,11 @@ namespace TPVCamera
     /**
      * @brief Installs the interaction look-ray redirect (the interactor selection hook).
      * @details Best-effort: on failure the feature simply no-ops (interaction stays vanilla) and the rest of
-     *          the mod is unaffected. KCD1 resolves the targets at runtime via AOB cascades. The hook is owned by
-     *          the DetourGate, which retires it at shutdown.
+     *          the mod is unaffected. KCD1 resolves the targets at runtime via AOB cascades. The hook is pushed
+     *          onto @p hooks, which shutdown() retires through the DetourGate.
      * @return An empty Result once the hook is armed, or the typed Error.
      */
-    [[nodiscard]] DMK::Result<void> initialize_interaction_hook();
+    [[nodiscard]] DMK::Result<void> initialize_interaction_hook(DMK::hook::HookStack &hooks);
 
 } // namespace TPVCamera
 
