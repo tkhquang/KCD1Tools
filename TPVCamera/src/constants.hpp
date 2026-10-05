@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "version.hpp"
 
@@ -502,6 +503,18 @@ namespace Constants
     // from the field resolve_movement_type_offset finds. An impulse's translation is a push, not a step, and the
     // turn-in-place detour never drops it.
     constexpr int32_t ANIMATED_CHARACTER_MOVEMENT_IMPULSE = 2;
+
+    // Crouched turn animation. The player's crouched turn fragments play CROUCHED_TURN_PLAYER_BLEND_SPACE. They are
+    // MotionTurn and MotionTurnBig with the tags stealth+player in kcd_male_database.adb. The right turns of that blend
+    // space break the pose late in the clip. The fault throws the skeleton up to a meter off the body for one to four
+    // frames. It hits about a third of the crouched right turns that play past 1.1 s of the 1.39 s clip. The
+    // first-person game never plays a turn, so the fault never shows there. Crouched NPCs play
+    // CROUCHED_TURN_NPC_BLEND_SPACE, which holds the same turns without that fault, and the native turn plays it
+    // instead (see detour_crouched_turn_animation). The game looks a clip's animation up by the 64-bit hash of its
+    // name in the character's CAnimationSet.
+    constexpr const char *ANIMATION_SET_RTTI_NAME = ".?AVCAnimationSet@@";
+    constexpr std::string_view CROUCHED_TURN_PLAYER_BLEND_SPACE = "1d_stealth_idle_bigturns_nw_player";
+    constexpr std::string_view CROUCHED_TURN_NPC_BLEND_SPACE = "1d_stealth_idle_bigturns_nw";
 
     // Game-state detection (see game_state.cpp)
     // Active-camera pointer on the wh::game::C_CameraManager. KCD1 stores the active camera at manager+0x10

@@ -249,6 +249,9 @@ namespace TPVCamera
             quorum("TurnInstalledState", k_turn_state_votes, 0, k_dword_field_range),
             code_operand("LockBodyTurnCount", Aob::k_lockBodyTurnCountCandidates, OperandKind::MemoryDisplacement, 1,
                          k_dword_field_range),
+            code_operand("AnimIdByCrcSlot", Aob::k_animIdByCrcCallCandidates, OperandKind::MemoryDisplacement, 0,
+                         k_vtable_offset_range),
+            call_site_ladder("AnimNameHashCall", Aob::k_animNameHashCallCandidates),
         }};
 
         /// True for a table entry that carries a ladder or quorum members; an empty RipGlobal is a placeholder.
@@ -271,9 +274,9 @@ namespace TPVCamera
             {AnchorId::OverlayHide, call_site_ladder("ActionFilterWorker.CallSite", Aob::k_actionFilterWorkerCallSite)},
         }};
 
-        // Room after the startup pass for the function-scoped anchors resolve_turn_decision_layout() (seven) and
+        // Room after the startup pass for the function-scoped anchors resolve_turn_decision_layout() (ten) and
         // resolve_movement_type_offset() (one) append.
-        constexpr std::size_t k_max_scoped_report = 8;
+        constexpr std::size_t k_max_scoped_report = 11;
         constexpr std::size_t k_max_report =
             k_anchor_count + std::tuple_size_v<decltype(k_call_site_fallbacks)> + k_max_scoped_report;
 
@@ -493,6 +496,37 @@ namespace TPVCamera
             }
             return entry->value;
         }
+
+        /**
+         * @brief Finds the instruction after the turn path's fragment-type choice (see k_turnKindCandidates).
+         * @details The decision test's `jnz` in @p body decodes to the turn path. The path must open exactly with the
+         *          choice, so the scope is the pattern's own length from the path's first byte. The instruction after
+         *          the choice must read the installed-turn state at @p installed_state, which ties the path to the same
+         *          action.
+         * @return The instruction's address, or 0 when any of that does not hold.
+         */
+        [[nodiscard]] std::uintptr_t resolve_turn_kind_site(const DMK::Region &body, std::int64_t installed_state)
+        {
+            const std::uintptr_t test =
+                scoped_address(code_ladder("TurnPathBranch", Aob::k_turnPathBranchCandidates), body);
+            if (test == 0)
+            {
+                return 0;
+            }
+            const auto path = DMK::scan::resolve_rip_relative(DMK::Address{test + 2}, 2, 6);
+            if (!path || !s_image_range.contains(*path))
+            {
+                return 0;
+            }
+            const DMK::Region path_scope{*path, ladder_reach(Aob::k_turnKindCandidates)};
+            const std::uintptr_t site = scoped_address(code_ladder("TurnKind", Aob::k_turnKindCandidates), path_scope);
+            const std::optional<std::int64_t> state_read =
+                site != 0 ? scoped_value(code_operand("TurnKind.StateRead", Aob::k_turnKindCandidates,
+                                                      OperandKind::MemoryDisplacement, 1, k_dword_field_range),
+                                         path_scope)
+                          : std::nullopt;
+            return state_read == installed_state ? site : 0;
+        }
     } // namespace
 
     void resolve_all_anchors(std::uintptr_t module_base, std::size_t module_size)
@@ -701,13 +735,22 @@ namespace TPVCamera
             return refuse("the movement action's spin-latch fields");
         }
 
-        logger.debug("Turn decision: site {}, spin latch +{:#x}, installed state +{:#x}, last sign +{:#x}",
-                     DMK::format::format_address(site), *spin_latch, *installed_state, *last_sign);
+        const std::uintptr_t kind_site = resolve_turn_kind_site(body, *installed_state);
+        if (kind_site == 0)
+        {
+            logger.warning("Turn decision: the turn path's fragment-type choice did not resolve");
+        }
+
+        logger.debug(
+            "Turn decision: site {}, spin latch +{:#x}, installed state +{:#x}, last sign +{:#x}, kind site {}",
+            DMK::format::format_address(site), *spin_latch, *installed_state, *last_sign,
+            DMK::format::format_address(kind_site));
         return TurnDecisionLayout{
             .site = site,
             .spin_latch_offset = static_cast<std::ptrdiff_t>(*spin_latch),
             .installed_state_offset = static_cast<std::ptrdiff_t>(*installed_state),
             .last_sign_offset = static_cast<std::ptrdiff_t>(*last_sign),
+            .kind_site = kind_site,
         };
     }
 
