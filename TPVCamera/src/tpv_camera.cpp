@@ -399,10 +399,10 @@ namespace TPVCamera
 
     /**
      * @brief Starts the INI hot-reload watcher.
-     * @details The bound setters re-apply the live settings on each reload. An INI reload is also the only place
-     *          the input bindings reshape at runtime (Input::rebind for an edited combo, a Consume transition),
-     *          which leaves the published zoom BindingTokens stale, so the callback republishes them on the
-     *          watcher thread, a control-plane thread, before reporting the outcome.
+     * @details The bound setters re-apply the live settings on each reload. A reload that runs them also rebinds
+     *          every key combo (Input::rebind) and re-applies each Consume flag, the only runtime reshapes of the
+     *          input bindings. A reshape leaves the published zoom BindingTokens stale, so the callback republishes
+     *          them on the watcher thread, a control-plane thread, before it reports the outcome.
      */
     static void enable_hot_reload(const DMK::config::Ini &ini)
     {
@@ -410,14 +410,15 @@ namespace TPVCamera
 
         const DMK::config::AutoReloadStatus status =
             ini.enable_auto_reload(std::chrono::milliseconds{250},
-                                   [](bool content_changed)
+                                   [](bool setters_ran)
                                    {
                                        refresh_zoom_binding_tokens();
                                        DMK::Logger &reload_logger = DMK::log();
-                                       if (content_changed)
+                                       if (setters_ran)
                                            reload_logger.info("INI auto-reload: live settings applied");
                                        else
-                                           reload_logger.info("INI auto-reload: no content change");
+                                           reload_logger.info("INI auto-reload: no setter ran (file unchanged or "
+                                                              "unreadable)");
                                    });
 
         if (status == DMK::config::AutoReloadStatus::Started)
@@ -487,7 +488,7 @@ namespace TPVCamera
         logger.info("Input engine started ({} wheel backend)",
                     wheel_host != nullptr ? "resident-host" : "local MessageHook");
 
-        // The bindings now live in the running engine, so resolve the per-frame zoom tokens for the first time.
+        // The input engine now holds the bindings, so resolve the per-frame zoom tokens for the first time.
         refresh_zoom_binding_tokens();
 
         enable_hot_reload(ini);
