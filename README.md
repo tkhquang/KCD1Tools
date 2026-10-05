@@ -8,7 +8,7 @@ A collection of mods for Kingdom Come: Deliverance that enhance gameplay and add
 A lightweight mod that adds a hotkey to toggle between first-person and third-person camera views in Kingdom Come: Deliverance.
 
 ### [TPVCamera](TPVCamera/)
-A full third-person camera mod (follow distance, over-the-shoulder offset, FOV control) ported from the KCD2 TPVCamera. Currently an MVP: core third-person view with a UI-aware toggle.
+A port of the KCD2 Proper Third Person View (TPV Camera): a standalone third-person camera that renders behind the player while aiming, looting, and combat keep working off the first-person frame. Includes free-look orbit, zoom, camera collision, and crosshair convergence.
 
 ## Installation
 
