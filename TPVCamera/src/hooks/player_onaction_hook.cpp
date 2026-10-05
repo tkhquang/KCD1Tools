@@ -14,6 +14,7 @@
 #include "hooks/player_onaction_hook.hpp"
 #include "aob_resolver.hpp"
 #include "constants.hpp"
+#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
@@ -23,7 +24,6 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include <exception>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -39,7 +39,7 @@ namespace TPVCamera
     using ActionDispatchFunc = uintptr_t(__fastcall *)(uintptr_t self, const char **action_name,
                                                        unsigned int activation, float value);
 
-    static ActionDispatchFunc s_action_dispatch_original = nullptr;
+    static std::atomic<ActionDispatchFunc> s_action_dispatch_original{nullptr};
     static std::atomic<bool> s_available{false};
 
     // Movement action names whose value magnitude signals locomotion intent, across input devices and ALL
@@ -195,7 +195,7 @@ namespace TPVCamera
      */
     static void maybe_log_action_name(const char *name, unsigned int activation, float value)
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
         if (!logger.is_enabled(DMK::LogLevel::Trace))
         {
             return;
@@ -221,12 +221,13 @@ namespace TPVCamera
     static float capture_movement_input(const char **action_name, unsigned int activation, float value)
     {
         s_last_move_axis = -1; // default: not a gamepad move axis this event (drives the re-assert decision below)
-        if (action_name == nullptr || !DMK::Memory::plausible_userspace_ptr(reinterpret_cast<uintptr_t>(action_name)))
+        if (action_name == nullptr ||
+            !DMK::memory::is_plausible_ptr(DMK::Address{reinterpret_cast<uintptr_t>(action_name)}))
         {
             return value;
         }
         const char *name = *action_name;
-        if (name == nullptr || !DMK::Memory::plausible_userspace_ptr(reinterpret_cast<uintptr_t>(name)))
+        if (name == nullptr || !DMK::memory::is_plausible_ptr(DMK::Address{reinterpret_cast<uintptr_t>(name)}))
         {
             return value;
         }
@@ -294,12 +295,16 @@ namespace TPVCamera
     }
 
     /**
-     * @brief Action-dispatcher detour: latch movement intent, then always forward to the original so the game's
-     *        action handling (and Lua Player:OnAction) is untouched. A fault while reading the event is
+     * @brief Body of the action-dispatcher detour: latch movement intent, then always forward to the original so
+     *        the game's action handling (and Lua Player:OnAction) is untouched. A fault while reading the event is
      *        swallowed and the original still runs.
+     * @details Split from detour_action_dispatch because its __try frames cannot share a function with the
+     *          detour's Pass (an object with a destructor, MSVC C2712). It runs only inside that Pass, so the
+     *          in-flight counter covers it.
      */
-    static uintptr_t __fastcall detour_action_dispatch(uintptr_t self, const char **action_name,
-                                                       unsigned int activation, float value)
+    TPV_DETOUR static uintptr_t dispatch_with_capture(ActionDispatchFunc original, uintptr_t self,
+                                                      const char **action_name, unsigned int activation,
+                                                      float value) noexcept
     {
         // forward_value is the value passed on to the engine: identical to the latched input except while the
         // full-turn orbit redirect is collapsing the gamepad move axes to pure-forward (see capture_movement_input).
@@ -321,8 +326,7 @@ namespace TPVCamera
             move_axis = -1;
         }
 
-        const uintptr_t ret =
-            s_action_dispatch_original ? s_action_dispatch_original(self, action_name, activation, forward_value) : 0;
+        const uintptr_t ret = original(self, action_name, activation, forward_value);
 
         // Keep the collapse FRESH across the change-only analog axes. A stick held at full deflection stops sending
         // its Changed events, so without this the engine retains the stale value -- a full-back stick keeps running
@@ -331,41 +335,38 @@ namespace TPVCamera
         // the collapse falling edge push the REAL stick once so a steady stick does not strand the forced-forward
         // value (e.g. sprint released while still holding back must back-pedal). Re-dispatch goes straight to the
         // original (no detour re-entry); engine-owned name reads -> guarded.
-        if (s_action_dispatch_original)
+        __try
         {
-            __try
+            if (collapse_active && move_axis == 1 && s_fwd_axis_name != nullptr)
             {
-                if (collapse_active && move_axis == 1 && s_fwd_axis_name != nullptr)
-                {
-                    const char *fwd = s_fwd_axis_name; // lateral event -> refresh forward axis to full forward
-                    s_action_dispatch_original(self, &fwd, k_activation_changed, 1.0f);
-                }
-                else if (collapse_active && move_axis == 0 && s_lat_axis_name != nullptr)
-                {
-                    const char *lat = s_lat_axis_name; // forward event -> refresh lateral axis to zero
-                    s_action_dispatch_original(self, &lat, k_activation_changed, 0.0f);
-                }
-                else if (!collapse_active && s_collapse_prev)
-                {
-                    float real_fwd = 0.0f;
-                    float real_lat = 0.0f;
-                    (void)player_onaction_gamepad_move_vector(real_fwd, real_lat); // latched REAL stick (pre-collapse)
-                    if (s_fwd_axis_name != nullptr)
-                    {
-                        const char *fwd = s_fwd_axis_name;
-                        s_action_dispatch_original(self, &fwd, k_activation_changed, real_fwd);
-                    }
-                    if (s_lat_axis_name != nullptr)
-                    {
-                        const char *lat = s_lat_axis_name;
-                        s_action_dispatch_original(self, &lat, k_activation_changed, real_lat);
-                    }
-                }
-                s_collapse_prev = collapse_active;
+                const char *fwd = s_fwd_axis_name; // lateral event -> refresh forward axis to full forward
+                original(self, &fwd, k_activation_changed, 1.0f);
             }
-            __except (EXCEPTION_EXECUTE_HANDLER)
+            else if (collapse_active && move_axis == 0 && s_lat_axis_name != nullptr)
             {
+                const char *lat = s_lat_axis_name; // forward event -> refresh lateral axis to zero
+                original(self, &lat, k_activation_changed, 0.0f);
             }
+            else if (!collapse_active && s_collapse_prev)
+            {
+                float real_fwd = 0.0f;
+                float real_lat = 0.0f;
+                (void)player_onaction_gamepad_move_vector(real_fwd, real_lat); // latched REAL stick (pre-collapse)
+                if (s_fwd_axis_name != nullptr)
+                {
+                    const char *fwd = s_fwd_axis_name;
+                    original(self, &fwd, k_activation_changed, real_fwd);
+                }
+                if (s_lat_axis_name != nullptr)
+                {
+                    const char *lat = s_lat_axis_name;
+                    original(self, &lat, k_activation_changed, real_lat);
+                }
+            }
+            s_collapse_prev = collapse_active;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
         }
 
         // Cache the dispatcher's `self` = the player's wh::entitymodule::C_PlayerInput. The keyboard turn-and-run
@@ -375,51 +376,44 @@ namespace TPVCamera
         return ret;
     }
 
-    bool initialize_player_onaction_hook()
+    /**
+     * @brief Action-dispatcher detour: counts itself in flight, then runs the capture-and-forward body.
+     */
+    TPV_DETOUR static uintptr_t __fastcall detour_action_dispatch(uintptr_t self, const char **action_name,
+                                                                  unsigned int activation, float value) noexcept
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
-        try
+        const DetourGate::Pass pass;
+        const ActionDispatchFunc original = s_action_dispatch_original.load(std::memory_order_acquire);
+        if (original == nullptr)
         {
-            const uintptr_t module_base = module_info().base;
-            if (module_base == 0)
-            {
-                logger.warning("PlayerOnAction: module base unknown; orbit move-detection disabled");
-                return false;
-            }
-            // ActionDispatch is a runtime AOB cascade (k_actionDispatchCandidates); a total cascade miss fails
-            // closed (orbit move-detection disabled).
-            const uintptr_t dispatch_addr = anchor_address(AnchorId::ActionDispatch);
-            if (dispatch_addr == 0)
-            {
-                logger.warning("PlayerOnAction: action dispatcher cascade unresolved; orbit move-detection off");
-                return false;
-            }
-
-            DMK::HookManager &hook_manager = DMK::HookManager::get_instance();
-            // Fail closed if the resolved entry leads with a call/breakpoint byte (a sibling mod's E9 jump hook
-            // does not trip this, so layering still works).
-            const DMK::HookConfig hook_config{.prologue_policy = DMK::InlineProloguePolicy::Fail};
-            auto result = hook_manager.create_inline_hook(
-                "PlayerOnActionDispatch", dispatch_addr, reinterpret_cast<void *>(detour_action_dispatch),
-                reinterpret_cast<void **>(&s_action_dispatch_original), hook_config);
-
-            if (!result.has_value())
-            {
-                logger.warning("PlayerOnAction: action dispatcher hook failed ({}); orbit move-detection disabled",
-                               DMK::Hook::error_to_string(result.error()));
-                return false;
-            }
-
-            s_available.store(true, std::memory_order_relaxed);
-            logger.info("PlayerOnAction: hooked action dispatcher at {} (orbit move-detection enabled)",
-                        DMK::Format::format_address(dispatch_addr));
-            return true;
+            return 0;
         }
-        catch (const std::exception &e)
+        return dispatch_with_capture(original, self, action_name, activation, value);
+    }
+
+    DMK::Result<void> initialize_player_onaction_hook()
+    {
+        DMK::Logger &logger = DMK::log();
+
+        // ActionDispatch is a runtime AOB cascade (k_actionDispatchCandidates); a total cascade miss fails closed
+        // (orbit move-detection disabled). The default hook::Options prologue policy is Fail (refuse a breakpoint
+        // first byte); a sibling mod's E9 jump hook does not trip it, so layering still works.
+        const uintptr_t dispatch_addr = anchor_address(AnchorId::ActionDispatch);
+        if (dispatch_addr == 0)
         {
-            logger.error("PlayerOnAction: initialization failed: {}", e.what());
-            return false;
+            logger.warning("PlayerOnAction: action dispatcher cascade unresolved; orbit move-detection off");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "player_onaction_hook/anchor"});
         }
+
+        DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "PlayerOnActionDispatch",
+                                                                         .target = DMK::Address{dispatch_addr}},
+                                                &detour_action_dispatch));
+        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_action_dispatch_original));
+
+        s_available.store(true, std::memory_order_relaxed);
+        logger.info("PlayerOnAction: hooked action dispatcher at {} (orbit move-detection enabled)",
+                    DMK::format::format_address(dispatch_addr));
+        return {};
     }
 
 } // namespace TPVCamera

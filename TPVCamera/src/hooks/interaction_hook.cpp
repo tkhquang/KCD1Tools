@@ -20,24 +20,24 @@
  *
  *          Gated on cursor-hidden (the main menu renders a camera with a RESOLVED player, so c_player / aim-pose
  *          validity do NOT distinguish it -- only the OS cursor does), InteractFromCamera, and a valid published
- *          aim pose. SEH-guarded throughout; v10 is restored on every path. Resolved at runtime via AOB cascades.
+ *          aim pose. Every v10 access is a DetourModKit guarded read/write; v10 is restored on every path.
+ *          Resolved at runtime via AOB cascades.
  */
 
 #include "interaction_hook.hpp"
 #include "aob_resolver.hpp"
 #include "config.hpp"
 #include "constants.hpp"
+#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
 
-#include <windows.h>
-
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <stdexcept>
-#include <string>
+#include <span>
 
 namespace TPVCamera
 {
@@ -49,7 +49,7 @@ namespace TPVCamera
         // the render camera + crosshair, then restore the engine view.
         using SelectionFunc = uintptr_t(__fastcall *)(uintptr_t interactor, uintptr_t out, uintptr_t flag,
                                                       uintptr_t out2, int mode);
-        SelectionFunc s_selection_original = nullptr;
+        std::atomic<SelectionFunc> s_selection_original{nullptr};
 
         // --- diagnostics (game thread only; atomic for the trace line) ---
         std::atomic<unsigned long long> s_redirects{0};
@@ -71,35 +71,35 @@ namespace TPVCamera
             {
                 return 0;
             }
-            const auto framework = DMK::Memory::seh_read<uintptr_t>(ctx_slot);
-            return (framework && DMK::Memory::plausible_userspace_ptr(*framework)) ? *framework : 0;
+            const auto framework = DMK::memory::read<uintptr_t>(DMK::Address{ctx_slot});
+            return (framework && DMK::memory::is_plausible_ptr(DMK::Address{*framework})) ? *framework : 0;
         }
 
         /**
          * @brief Resolves the framework view pose v10 (Vec3 position floats 0..2, CryEngine Quat floats 3..6).
-         * @return Address of the pose, or 0 if any link is unresolved. Uses DMK::Memory::seh_read (internally
+         * @return Address of the pose, or 0 if any link is unresolved. Uses DMK::memory::read (internally
          *         guarded) so this frame holds no SEH itself.
          */
         uintptr_t resolve_view_pose() noexcept
         {
             const uintptr_t framework = resolve_framework();
-            if (framework == 0 || !DMK::Memory::plausible_userspace_ptr(framework))
+            if (framework == 0 || !DMK::memory::is_plausible_ptr(DMK::Address{framework}))
             {
                 return 0;
             }
-            const auto view = DMK::Memory::seh_read<uintptr_t>(framework + Constants::FRAMEWORK_VIEW_OFFSET);
-            if (!view || !DMK::Memory::plausible_userspace_ptr(*view))
+            const auto view = DMK::memory::read<uintptr_t>(DMK::Address{framework + Constants::FRAMEWORK_VIEW_OFFSET});
+            if (!view || !DMK::memory::is_plausible_ptr(DMK::Address{*view}))
             {
                 return 0;
             }
-            const auto flag = DMK::Memory::seh_read<uint8_t>(*view + Constants::VIEW_POSE_ALT_FLAG_OFFSET);
+            const auto flag = DMK::memory::read<uint8_t>(DMK::Address{*view + Constants::VIEW_POSE_ALT_FLAG_OFFSET});
             if (!flag)
             {
                 return 0;
             }
             const uintptr_t pose =
                 *view + Constants::VIEW_POSE_OFFSET + (*flag != 0 ? Constants::VIEW_POSE_ALT_DELTA : 0);
-            return DMK::Memory::plausible_userspace_ptr(pose) ? pose : 0;
+            return DMK::memory::is_plausible_ptr(DMK::Address{pose}) ? pose : 0;
         }
 
         /**
@@ -144,59 +144,40 @@ namespace TPVCamera
         }
 
         /**
-         * @brief SEH-guarded: snapshot v10 (7 floats), then overwrite its position (0..2) with the camera origin
-         *        SLID forward to the eye's projection along the crosshair, and its quaternion (3..6) with the
-         *        crosshair orientation. false on fault.
+         * @brief Snapshots v10 (7 floats), then overwrites its position (0..2) with the camera origin SLID forward
+         *        to the eye's projection along the crosshair, and its quaternion (3..6) with the crosshair
+         *        orientation. false when the read or the write faults (v10 is then unchanged).
          * @details The render camera sits FollowDistance BEHIND the player, but the interactor's range cap is
          *          measured from the view position, so writing the raw camera origin culls every nearby usable as
          *          too far. saved[0..2] is the engine's current view position (the eye), so we slide the camera
          *          origin forward along the crosshair to the eye's projection onto that ray: the hit line is
          *          unchanged but the range now measures from ~eye. Mirrors the KCD2 redirect's origin slide.
+         *
+         *          Both halves are DetourModKit guarded accesses: read_into copies the snapshot under the fault
+         *          guard, and write_in_place stores the 28-byte pose as one span without ever changing page
+         *          protection, so this frame needs no SEH of its own. The pose is a heap member of the view
+         *          object, so the store cannot straddle a writability seam.
          */
-        bool save_and_overwrite_pose(uintptr_t pose, const float cam[3], const float dir[3], const float quat[4],
-                                     float saved[7]) noexcept
+        [[nodiscard]] bool save_and_overwrite_pose(uintptr_t pose, const float cam[3], const float dir[3],
+                                                   const float quat[4], std::array<float, 7> &saved) noexcept
         {
-            bool ok = false;
-            __try
+            if (!DMK::memory::read_into(DMK::Address{pose}, std::as_writable_bytes(std::span{saved})))
             {
-                float *v = reinterpret_cast<float *>(pose);
-                for (int i = 0; i < 7; ++i)
-                {
-                    saved[i] = v[i];
-                }
-                const float proj =
-                    (saved[0] - cam[0]) * dir[0] + (saved[1] - cam[1]) * dir[1] + (saved[2] - cam[2]) * dir[2];
-                const float adv = proj > 0.0f ? proj : 0.0f; // never slide backward past the camera
-                v[0] = cam[0] + dir[0] * adv;
-                v[1] = cam[1] + dir[1] * adv;
-                v[2] = cam[2] + dir[2] * adv;
-                v[3] = quat[0];
-                v[4] = quat[1];
-                v[5] = quat[2];
-                v[6] = quat[3];
-                ok = true;
+                return false;
             }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                ok = false;
-            }
-            return ok;
+            const float proj =
+                (saved[0] - cam[0]) * dir[0] + (saved[1] - cam[1]) * dir[1] + (saved[2] - cam[2]) * dir[2];
+            const float adv = proj > 0.0f ? proj : 0.0f; // never slide backward past the camera
+            const std::array<float, 7> redirected{
+                cam[0] + dir[0] * adv, cam[1] + dir[1] * adv, cam[2] + dir[2] * adv, quat[0], quat[1], quat[2], quat[3],
+            };
+            return DMK::memory::write_in_place(DMK::Address{pose}, redirected).has_value();
         }
 
-        /** @brief SEH-guarded: restore the snapshot taken by save_and_overwrite_pose. */
-        void restore_pose(uintptr_t pose, const float saved[7]) noexcept
+        /** @brief Restores the snapshot taken by save_and_overwrite_pose (guarded; a fault leaves v10 as is). */
+        void restore_pose(uintptr_t pose, const std::array<float, 7> &saved) noexcept
         {
-            __try
-            {
-                float *v = reinterpret_cast<float *>(pose);
-                for (int i = 0; i < 7; ++i)
-                {
-                    v[i] = saved[i];
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
+            (void)DMK::memory::write_in_place(DMK::Address{pose}, saved);
         }
 
         /** @brief Rate-limited (2 s) trace line; only while InteractFromCamera is on (caller checks that). */
@@ -208,7 +189,8 @@ namespace TPVCamera
                 return;
             }
             s_last_log = now;
-            DMK::Logger::get_instance().trace(
+            (void)DMK::log().try_log(
+                DMK::LogLevel::Trace,
                 "InteractionHook[run]: redirects={} lastReason={} | cam=({}, {}, {}) crosshair=({}, {}, {})",
                 s_redirects.load(std::memory_order_relaxed), s_last_reason, px, py, pz, dx, dy, dz);
         }
@@ -217,9 +199,16 @@ namespace TPVCamera
          * @brief Selection detour: wrap sub_1803E51EC, overwriting v10 with the camera+crosshair pose for the
          *        duration of the call so the ray AND the candidate projection are both camera-consistent.
          */
-        uintptr_t __fastcall selection_detour(uintptr_t interactor, uintptr_t out, uintptr_t flag, uintptr_t out2,
-                                              int mode)
+        TPV_DETOUR uintptr_t __fastcall selection_detour(uintptr_t interactor, uintptr_t out, uintptr_t flag,
+                                                         uintptr_t out2, int mode) noexcept
         {
+            const DetourGate::Pass pass;
+            const SelectionFunc original = s_selection_original.load(std::memory_order_acquire);
+            if (original == nullptr)
+            {
+                return 0;
+            }
+
             // Stay inert outside active gameplay. interaction_aim_pose().is_valid() is true ONLY while the TPV
             // offset is actually applied; every UI/menu state (main menu, in-game menu, inventory, map, dialogue)
             // raises an Overlay action filter that suppresses the offset (SuppressTPVState=Overlay), which
@@ -227,20 +216,20 @@ namespace TPVCamera
             if (!settings().interact_from_camera.load(std::memory_order_relaxed) ||
                 !interaction_aim_pose().is_valid())
             {
-                return s_selection_original(interactor, out, flag, out2, mode);
+                return original(interactor, out, flag, out2, mode);
             }
 
             float px, py, pz, dx, dy, dz;
             if (!interaction_aim_pose().load(px, py, pz, dx, dy, dz))
             {
                 s_last_reason = "aim pose unreadable";
-                return s_selection_original(interactor, out, flag, out2, mode);
+                return original(interactor, out, flag, out2, mode);
             }
             const float fl = std::sqrt(dx * dx + dy * dy + dz * dz);
             if (fl < 1e-4f)
             {
                 s_last_reason = "degenerate crosshair dir";
-                return s_selection_original(interactor, out, flag, out2, mode);
+                return original(interactor, out, flag, out2, mode);
             }
             dx /= fl;
             dy /= fl;
@@ -250,18 +239,18 @@ namespace TPVCamera
             if (pose == 0)
             {
                 s_last_reason = "view pose unresolved";
-                return s_selection_original(interactor, out, flag, out2, mode);
+                return original(interactor, out, flag, out2, mode);
             }
 
             float quat[4];
             quat_from_vdir(dx, dy, dz, quat);
             const float pos[3] = {px, py, pz};
             const float dir[3] = {dx, dy, dz};
-            float saved[7];
+            std::array<float, 7> saved{};
             if (!save_and_overwrite_pose(pose, pos, dir, quat, saved))
             {
                 s_last_reason = "view overwrite faulted (unchanged)";
-                return s_selection_original(interactor, out, flag, out2, mode);
+                return original(interactor, out, flag, out2, mode);
             }
 
             s_redirects.fetch_add(1, std::memory_order_relaxed);
@@ -269,56 +258,34 @@ namespace TPVCamera
             maybe_log_status(px, py, pz, dx, dy, dz);
 
             // Run the full selection against the camera-consistent view, then ALWAYS restore the engine view.
-            const uintptr_t result = s_selection_original(interactor, out, flag, out2, mode);
+            const uintptr_t result = original(interactor, out, flag, out2, mode);
             restore_pose(pose, saved);
             return result;
         }
 
     } // namespace
 
-    bool initialize_interaction_hook()
+    DMK::Result<void> initialize_interaction_hook()
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
-
-        // Fail closed if the resolved entry leads with a call/breakpoint byte; a sibling mod's E9 jump-hook does
-        // not trip this gate, so layering still works.
-        const DMK::HookConfig hook_config{.prologue_policy = DMK::InlineProloguePolicy::Fail};
-
-        try
+        // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates); a total cascade miss fails
+        // closed. The default hook::Options prologue policy is Fail (refuse a breakpoint first byte); a sibling
+        // mod's E9 jump-hook does not trip it, so layering still works.
+        const uintptr_t hook_addr = anchor_address(AnchorId::InteractorLookRay);
+        if (hook_addr == 0)
         {
-            const uintptr_t module_base = module_info().base;
-            if (module_base == 0)
-            {
-                throw std::runtime_error("module base unknown");
-            }
+            DMK::log().error("InteractionHook: InteractorLookRay cascade unresolved (interaction selection)");
+            return std::unexpected(DMK::Error{DMK::ErrorCode::NoMatch, "interaction_hook/anchor"});
+        }
 
-            // InteractorLookRay is a runtime AOB cascade (k_interactorLookRayCandidates); a total cascade miss
-            // fails closed.
-            const uintptr_t hook_addr = anchor_address(AnchorId::InteractorLookRay);
-            if (hook_addr == 0)
-            {
-                throw std::runtime_error("InteractorLookRay cascade unresolved (interaction selection)");
-            }
+        DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "InteractionSelection",
+                                                                         .target = DMK::Address{hook_addr}},
+                                                &selection_detour));
+        DMK_TRY_VOID(DetourGate::arm(std::move(installed), s_selection_original));
 
-            auto result = DMK::HookManager::get_instance().create_inline_hook(
-                "InteractionSelection", hook_addr, reinterpret_cast<void *>(selection_detour),
-                reinterpret_cast<void **>(&s_selection_original), hook_config);
-            if (!result.has_value())
-            {
-                throw std::runtime_error("Failed to create interaction selection hook: " +
-                                         std::string(DMK::Hook::error_to_string(result.error())));
-            }
-
-            logger.info("InteractionHook: hooked interactor selection at {} (view-consistent camera-space "
+        DMK::log().info("InteractionHook: hooked interactor selection at {} (view-consistent camera-space "
                         "interaction enabled)",
-                        DMK::Format::format_address(hook_addr));
-            return true;
-        }
-        catch (const std::exception &e)
-        {
-            logger.error("InteractionHook: Initialization failed: {}", e.what());
-            return false;
-        }
+                        DMK::format::format_address(hook_addr));
+        return {};
     }
 
 } // namespace TPVCamera

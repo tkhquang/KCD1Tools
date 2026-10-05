@@ -45,9 +45,9 @@ well; the only differences are the game (KC:D 1) and the binary folder above.
 
 ## Building from Source
 
-Requires Visual Studio 2022 (MSVC) and CMake 3.28+. DetourModKit is reused from the sibling
-checkout until a per-mod `external/DetourModKit` submodule is added; initialize submodules
-first or pass `-DKCD1_DMK_DIR=<path>`.
+Requires Visual Studio 2022 (MSVC) and CMake 3.28+. DetourModKit v4.3.0 is the
+`external/DetourModKit` submodule; initialize submodules first, or pass
+`-DKCD1_DMK_DIR=<path>` to build against another checkout.
 
 ```bash
 git submodule update --init --recursive
@@ -55,6 +55,25 @@ cmake --preset msvc-release
 cmake --build --preset msvc-release
 # -> build/release-msvc/KCD1_TPVCamera.asi
 ```
+
+### Developer hot-reload build (optional)
+
+The `msvc-dev` preset builds DetourModKit's staged-reload pair: a resident loader
+(`KCD1_TPVCamera.asi`) and the mod logic (`KCD1_TPVCamera.logic.dll`). Set
+`KCD1_TPVCAMERA_GAME_DIR` to the game's `Bin/Win64` folder and both deploy there.
+
+```bash
+cmake --preset msvc-dev -DKCD1_TPVCAMERA_GAME_DIR="<game>/Bin/Win64"
+cmake --build --preset msvc-dev
+```
+
+Rebuild while the game runs, then press **Numpad 0** with the game focused. The loader
+retires the current generation and loads a uniquely named copy of the new build
+(`KCD1_TPVCamera.genNNNN.logic.dll`). It records each decision, including the build
+revision, in `KCD1_TPVCamera.loader.log`. A generation that cannot prove its hooks and
+workers quiescent stays loaded but inert. The loader never re-initializes it, and asks
+for a game restart when its retention budget runs out. See DetourModKit's
+[hot-reload guide](https://github.com/tkhquang/DetourModKit/blob/main/docs/guides/hot-reload/README.md).
 
 The C++ sources follow DetourModKit's coding conventions
 ([AGENTS.md](https://github.com/tkhquang/DetourModKit/blob/main/AGENTS.md)).

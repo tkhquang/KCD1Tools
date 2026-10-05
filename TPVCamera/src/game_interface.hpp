@@ -9,6 +9,8 @@
 #ifndef TPVCAMERA_GAME_INTERFACE_HPP
 #define TPVCAMERA_GAME_INTERFACE_HPP
 
+#include <DetourModKit/error.hpp>
+
 namespace TPVCamera
 {
 
@@ -18,10 +20,11 @@ namespace TPVCamera
      *          cascade; a total cascade miss fails closed. The resolved storage slot is published to
      *          g_global_context_ptr_address for the game-state camera
      *          reads (game_state.cpp); without this call those reads find no state.
-     * @return true if the module base is known and the context slot was published, false otherwise.
+     * @return An empty Result once the context slot is published; InvalidArg when the module base is not yet
+     *         known, or NoMatch when the Context cascade did not resolve.
      * @note Call after the game module base/size is recorded in module_info().
      */
-    [[nodiscard]] bool initialize_game_interface();
+    [[nodiscard]] DMK::Result<void> initialize_game_interface();
 
     /**
      * @brief Clean up game interface resources.

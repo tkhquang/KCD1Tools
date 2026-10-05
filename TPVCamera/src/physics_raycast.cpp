@@ -34,11 +34,11 @@ namespace TPVCamera
     // RWI function pointer is confirmed to live inside the game image with a branch-only contains() test (no
     // syscall): a stale or reallocated world pointer yields a vtable slot that does not point into the image, and
     // calling through it must be rejected before the indirect call.
-    static DMK::Memory::ModuleRange s_game_module{};
+    static DMK::Region s_game_module{};
 
     bool initialize_physics_raycast(uintptr_t module_base, size_t module_size, uintptr_t g_env)
     {
-        DMK::Logger &logger = DMK::Logger::get_instance();
+        DMK::Logger &logger = DMK::log();
 
         if (g_env == 0)
         {
@@ -49,11 +49,11 @@ namespace TPVCamera
         // p_physical_world is a member of the g_env struct (see PHYSICAL_WORLD_OFFSET); deriving its
         // slot from the patch-resiliently resolved g_env base avoids a second hardcoded address.
         s_physical_world_global_addr = g_env + Constants::PHYSICAL_WORLD_OFFSET;
-        s_game_module = {module_base, module_base + module_size};
+        s_game_module = DMK::Region{DMK::Address{module_base}, module_size};
 
         logger.info("PhysicsRaycast: RayWorldIntersection via world vtable slot {}, p_physical_world slot at {}",
-                    DMK::Format::format_address(static_cast<uintptr_t>(Constants::RWI_VTABLE_OFFSET)),
-                    DMK::Format::format_address(s_physical_world_global_addr));
+                    DMK::format::format_address(static_cast<uintptr_t>(Constants::RWI_VTABLE_OFFSET)),
+                    DMK::format::format_address(s_physical_world_global_addr));
         return true;
     }
 
@@ -77,14 +77,15 @@ namespace TPVCamera
     std::optional<RayHit> ray_world_intersection(const Vector3 &origin, const Vector3 &direction, int objtypes,
                                                  unsigned int flags, const uintptr_t *skip_ents, int n_skip_ents)
     {
+        DMK_PROFILE_SCOPE("camera.ray_world_intersection");
         if (s_physical_world_global_addr == 0)
         {
             return std::nullopt;
         }
 
         // Resolve the physical world fresh; bail cleanly while it is null (no level / loading).
-        const auto world_value = DMK::Memory::seh_read<uintptr_t>(s_physical_world_global_addr);
-        if (!world_value || *world_value == 0 || !DMK::Memory::plausible_userspace_ptr(*world_value))
+        const auto world_value = DMK::memory::read<uintptr_t>(DMK::Address{s_physical_world_global_addr});
+        if (!world_value || *world_value == 0 || !DMK::memory::is_plausible_ptr(DMK::Address{*world_value}))
         {
             return std::nullopt;
         }
@@ -93,14 +94,15 @@ namespace TPVCamera
         // RayWorldIntersection is resolved from the LIVE world vtable (slot RWI_VTABLE_OFFSET), not a static
         // address: KCD1 has no AOB-resolvable inline helper, and the vtable slot is the patch-stable anchor. Each
         // step is screened (in-image, plausible pointer) so a stale world cannot reach the indirect call.
-        const auto vtable = DMK::Memory::seh_read<uintptr_t>(world);
-        if (!vtable || !DMK::Memory::plausible_userspace_ptr(*vtable) || !DMK::Memory::contains(s_game_module, *vtable))
+        const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{world});
+        if (!vtable || !DMK::memory::is_plausible_ptr(DMK::Address{*vtable}) ||
+            !s_game_module.contains(DMK::Address{*vtable}))
         {
             return std::nullopt;
         }
-        const auto fn_slot = DMK::Memory::seh_read<uintptr_t>(*vtable + Constants::RWI_VTABLE_OFFSET);
-        if (!fn_slot || !DMK::Memory::plausible_userspace_ptr(*fn_slot) ||
-            !DMK::Memory::contains(s_game_module, *fn_slot))
+        const auto fn_slot = DMK::memory::read<uintptr_t>(DMK::Address{*vtable + Constants::RWI_VTABLE_OFFSET});
+        if (!fn_slot || !DMK::memory::is_plausible_ptr(DMK::Address{*fn_slot}) ||
+            !s_game_module.contains(DMK::Address{*fn_slot}))
         {
             return std::nullopt;
         }
@@ -216,7 +218,7 @@ namespace TPVCamera
         {
             auto *prw = *reinterpret_cast<volatile long **>(params + Constants::SPWI_OFF_LOCK_PRW);
             const long active = *reinterpret_cast<volatile long *>(params + Constants::SPWI_OFF_LOCK_IACTIVE);
-            if (prw && DMK::Memory::plausible_userspace_ptr(reinterpret_cast<uintptr_t>(prw)) && active != 0)
+            if (prw && DMK::memory::is_plausible_ptr(DMK::Address{reinterpret_cast<uintptr_t>(prw)}) && active != 0)
             {
                 _InterlockedExchangeAdd(prw, -active);
             }
@@ -229,6 +231,7 @@ namespace TPVCamera
     std::optional<RayHit> sphere_world_sweep(const Vector3 &origin, float radius, const Vector3 &sweep, int objtypes,
                                              const uintptr_t *p_skip_ents, int n_skip_ents)
     {
+        DMK_PROFILE_SCOPE("camera.sphere_world_sweep");
         // One-time resolution diagnostics so the log can tell "PWI unavailable" (call path broken) apart from
         // "PWI ran but missed". First failure reason and first success each logged once.
         static bool s_logged_ok = false;
@@ -238,7 +241,7 @@ namespace TPVCamera
             if (!s_logged_fail)
             {
                 s_logged_fail = true;
-                DMK::Logger::get_instance().debug("Sphere sweep unavailable: {}", reason);
+                DMK::log().debug("Sphere sweep unavailable: {}", reason);
             }
         };
 
@@ -249,8 +252,8 @@ namespace TPVCamera
         }
 
         // Resolve the physical world fresh; bail cleanly while it is null (no level / loading).
-        const auto world_value = DMK::Memory::seh_read<uintptr_t>(s_physical_world_global_addr);
-        if (!world_value || *world_value == 0 || !DMK::Memory::plausible_userspace_ptr(*world_value))
+        const auto world_value = DMK::memory::read<uintptr_t>(DMK::Address{s_physical_world_global_addr});
+        if (!world_value || *world_value == 0 || !DMK::memory::is_plausible_ptr(DMK::Address{*world_value}))
         {
             log_fail_once("physical world null (no level / loading)");
             return std::nullopt;
@@ -259,15 +262,17 @@ namespace TPVCamera
 
         // PWI is resolved from the LIVE world vtable (slot PHYS_WORLD_VTABLE_PWI_OFFSET), screened in-image like
         // RWI. The slot wraps the impl with the world lock, so calling it from the render thread is safe.
-        const auto vtable = DMK::Memory::seh_read<uintptr_t>(world);
-        if (!vtable || !DMK::Memory::plausible_userspace_ptr(*vtable) || !DMK::Memory::contains(s_game_module, *vtable))
+        const auto vtable = DMK::memory::read<uintptr_t>(DMK::Address{world});
+        if (!vtable || !DMK::memory::is_plausible_ptr(DMK::Address{*vtable}) ||
+            !s_game_module.contains(DMK::Address{*vtable}))
         {
             log_fail_once("world vtable unreadable or outside the game image");
             return std::nullopt;
         }
-        const auto fn_slot = DMK::Memory::seh_read<uintptr_t>(*vtable + Constants::PHYS_WORLD_VTABLE_PWI_OFFSET);
-        if (!fn_slot || !DMK::Memory::plausible_userspace_ptr(*fn_slot) ||
-            !DMK::Memory::contains(s_game_module, *fn_slot))
+        const auto fn_slot =
+            DMK::memory::read<uintptr_t>(DMK::Address{*vtable + Constants::PHYS_WORLD_VTABLE_PWI_OFFSET});
+        if (!fn_slot || !DMK::memory::is_plausible_ptr(DMK::Address{*fn_slot}) ||
+            !s_game_module.contains(DMK::Address{*fn_slot}))
         {
             log_fail_once("PWI vtable slot unresolved or outside the game image");
             return std::nullopt;
@@ -276,9 +281,8 @@ namespace TPVCamera
         if (!s_logged_ok)
         {
             s_logged_ok = true;
-            DMK::Logger::get_instance().debug("Sphere sweep: PWI RESOLVED (world={}, fn={})",
-                                              DMK::Format::format_address(world),
-                                              DMK::Format::format_address(reinterpret_cast<uintptr_t>(fn)));
+            DMK::log().debug("Sphere sweep: PWI RESOLVED (world={}, fn={})", DMK::format::format_address(world),
+                             DMK::format::format_address(reinterpret_cast<uintptr_t>(fn)));
         }
 
         // primitives::sphere { Vec3 center; float r; } in WORLD space (CryEngine PWI primitives are world).

@@ -39,6 +39,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <exception>
+#include <optional>
+#include <stop_token>
 
 #pragma comment(lib, "winmm.lib")
 
@@ -52,7 +55,6 @@ namespace TPVCamera::Overlay::Detail
     {
 
         std::atomic<bool> s_overlay_visible{false};
-        std::atomic<bool> s_shutdown_requested{false};
         std::atomic<bool> s_ready{false};
 
         // Input-capture intent, published by the render thread each frame and read by the game thread via
@@ -83,7 +85,11 @@ namespace TPVCamera::Overlay::Detail
         HBITMAP s_mem_dc_old_bitmap = nullptr;
         void *s_dib_pixels = nullptr;
 
-        HANDLE s_render_thread = nullptr;
+        // The render thread, a DetourModKit StoppableWorker: its stop_token replaces a hand-rolled shutdown flag,
+        // its destructor requests stop and joins, and it holds a counted module reference (ModulePinReason::Worker)
+        // for exactly as long as the body can run, so a failed join keeps this image mapped and the dev loader's
+        // retirement check sees it.
+        std::optional<DMK::StoppableWorker> s_render_worker;
 
         constexpr wchar_t k_overlay_class[] = L"TPVCameraOverlay";
 
@@ -392,12 +398,12 @@ namespace TPVCamera::Overlay::Detail
          * @brief Waits for the game window to resolve, returning it.
          * @return The game HWND, or nullptr if shutdown was requested while waiting.
          */
-        HWND wait_for_game_window(DMK::Logger &logger)
+        HWND wait_for_game_window(DMK::Logger &logger, const std::stop_token &stop)
         {
             logger.info("[overlay] Waiting for game window...");
             for (int tick = 0;; ++tick)
             {
-                if (s_shutdown_requested.load(std::memory_order_relaxed))
+                if (stop.stop_requested())
                     return nullptr;
                 if (HWND hwnd = find_game_hwnd())
                 {
@@ -409,7 +415,7 @@ namespace TPVCamera::Overlay::Detail
                     // loading window is "stable" too, which is exactly the size we must not lock onto.)
                     while (!TPVCamera::game_world_ready().load(std::memory_order_relaxed))
                     {
-                        if (s_shutdown_requested.load(std::memory_order_relaxed))
+                        if (stop.stop_requested())
                             return nullptr;
                         Sleep(150);
                     }
@@ -429,9 +435,9 @@ namespace TPVCamera::Overlay::Detail
         /**
          * @brief Render thread entry: builds resources, runs the per-frame loop, tears down.
          */
-        DWORD WINAPI render_thread(LPVOID)
+        void render_thread(const std::stop_token &stop)
         {
-            DMK::Logger &logger = DMK::Logger::get_instance();
+            DMK::Logger &logger = DMK::log();
 
             // Make THIS overlay thread per-monitor (v2) DPI aware before any window creation or size query, so
             // the layered overlay window, its GetClientRect/GetWindowRect reads, and the UpdateLayeredWindow
@@ -450,9 +456,9 @@ namespace TPVCamera::Overlay::Detail
                     (void)set_thread_dpi(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)));
             }
 
-            s_game_hwnd = wait_for_game_window(logger);
+            s_game_hwnd = wait_for_game_window(logger, stop);
             if (!s_game_hwnd)
-                return 0;
+                return;
 
             RECT gr{};
             GetClientRect(s_game_hwnd, &gr);
@@ -475,7 +481,7 @@ namespace TPVCamera::Overlay::Detail
             {
                 logger.error("[overlay] Window creation failed");
                 UnregisterClassW(k_overlay_class, wc.hInstance);
-                return 0;
+                return;
             }
 
             ShowWindow(s_overlay_hwnd, SW_SHOWNOACTIVATE);
@@ -490,7 +496,7 @@ namespace TPVCamera::Overlay::Detail
                 DestroyWindow(s_overlay_hwnd);
                 s_overlay_hwnd = nullptr;
                 UnregisterClassW(k_overlay_class, wc.hInstance);
-                return 0;
+                return;
             }
 
             if (!create_targets(gw, gh))
@@ -503,7 +509,7 @@ namespace TPVCamera::Overlay::Detail
                 DestroyWindow(s_overlay_hwnd);
                 s_overlay_hwnd = nullptr;
                 UnregisterClassW(k_overlay_class, wc.hInstance);
-                return 0;
+                return;
             }
 
             // ImGui (direct, no ReShade function table).
@@ -543,7 +549,7 @@ namespace TPVCamera::Overlay::Detail
             // clear pixels ImGui vacated (closed popup, dismissed tooltip).
             RECT prev_dirty{0, 0, 0, 0};
 
-            while (!s_shutdown_requested.load(std::memory_order_relaxed))
+            while (!stop.stop_requested())
             {
                 MSG msg{};
                 while (PeekMessageW(&msg, s_overlay_hwnd, 0, 0, PM_REMOVE))
@@ -735,35 +741,34 @@ namespace TPVCamera::Overlay::Detail
                 s_overlay_hwnd = nullptr;
             }
             UnregisterClassW(k_overlay_class, GetModuleHandleW(nullptr));
-            return 0;
         }
 
     } // namespace
 
     bool dx_start()
     {
-        if (s_render_thread)
+        if (s_render_worker.has_value())
             return true;
-        s_shutdown_requested.store(false, std::memory_order_relaxed);
-        s_render_thread = CreateThread(nullptr, 0, render_thread, nullptr, 0, nullptr);
-        return s_render_thread != nullptr;
+        try
+        {
+            s_render_worker.emplace("KCD1_TPVCamera.overlay", [](std::stop_token stop) { render_thread(stop); });
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            // No thread and no module reference were left behind by the failed construction.
+            DMK::log().error("[overlay] Render worker did not start: {}", e.what());
+            return false;
+        }
     }
 
     void dx_stop() noexcept
     {
-        s_shutdown_requested.store(true, std::memory_order_release);
-        if (s_render_thread)
-        {
-            // Only reclaim the handle if the render thread actually exited. On a timeout the thread is still
-            // running (e.g. a hung driver/GDI call); closing its handle then, or letting it run teardown after
-            // the module begins unloading, is the worse hazard, so leak the handle instead (teardown runs on a
-            // worker thread off the loader lock, so the wait itself is safe to take).
-            if (WaitForSingleObject(s_render_thread, 5000) == WAIT_OBJECT_0)
-            {
-                CloseHandle(s_render_thread);
-                s_render_thread = nullptr;
-            }
-        }
+        // Requests stop and joins the render thread, which tears its D3D/ImGui/window objects down on its own
+        // thread before it returns. The join has no timeout: the loop polls its stop_token every frame, so it
+        // exits within one frame. Under the loader lock (process teardown) the worker detaches instead of
+        // blocking and keeps its module reference, so the code it runs stays mapped.
+        s_render_worker.reset();
         s_overlay_visible.store(false, std::memory_order_relaxed);
     }
 

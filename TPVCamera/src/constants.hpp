@@ -47,7 +47,7 @@ namespace Constants
         return std::string(MOD_NAME) + PRESETS_FILE_SUFFIX;
     }
 
-    /** @brief Log file name passed to DMK::Bootstrap (string-view-safe literal). */
+    /** @brief Log file name passed to the DetourModKit Session through ModInfo (string-view-safe literal). */
     constexpr const char *LOG_FILE_NAME = "KCD1_TPVCamera.log";
     /** @brief Per-PID instance-mutex prefix so duplicate ASI loads bail cleanly. */
     constexpr const char *INSTANCE_MUTEX_PREFIX = "KCD1_TPVCamera_";
@@ -66,9 +66,9 @@ namespace Constants
 
     // RTTI type-descriptor name of the CView class. The frustum-builder detour confirms a
     // camera belongs to a game view by matching the embedding object's vtable against this
-    // name (via DMK::Rtti), then caches that vtable address for a fast per-camera qword
-    // compare. Anchoring on the ASLR-invariant RTTI name rather than a hardcoded vtable
-    // address keeps the game-view gate working across game patches.
+    // name through the cached class identity (rtti_types, GameClass::View), so the steady
+    // state is a single qword compare. Anchoring on the ASLR-invariant RTTI name rather than
+    // a hardcoded vtable address keeps the game-view gate working across game patches.
     constexpr const char *CVIEW_RTTI_NAME = ".?AVCView@@";
 
     // Player look/aim orientation chain. Used to LEVEL the aim pitch while free-look orbit is active
