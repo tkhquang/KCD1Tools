@@ -521,6 +521,30 @@ namespace TPVCamera
                               Pattern::literal("0F 2F 35 ?? ?? ?? ?? | 0F 97 C1 E9")),
         };
 
+        // The branch into the game's turn path: `test cl, cl; jnz` right after the last-sign store, taken when the
+        // decision is a turn. The near `jnz` encoding is literal because its rel32 is decoded to find the path.
+        inline const Candidate k_turnPathBranchCandidates[] = {
+            Candidate::direct("TurnPathBranch_P1_TestJump",
+                              Pattern::literal("F3 0F 11 97 ?? ?? ?? ?? | 84 C9 0F 85 ?? ?? ?? ??")),
+        };
+
+        // The turn path (the branch target, in the cold fragment), matched exactly at its first byte. It picks the
+        // turn fragment type into esi:
+        //   comiss xmm1, xmm6            90 degrees against |angle|
+        //   jae                          to `mov esi, 1` (a small turn)
+        //   cmp dword [rdi+disp32], -1   the large-turn fragment id
+        //   mov esi, 2                   a large turn
+        //   jne                          over `mov esi, 1`
+        //   mov esi, 1                   a small turn, also for an action without a large-turn fragment
+        // The `|` is the next instruction, `mov eax, [rdi+disp32]` (the installed-turn state). esi holds the choice
+        // there on every path. The short branch distances are literal, because they prove that.
+        inline const Candidate k_turnKindCandidates[] = {
+            Candidate::direct(
+                "TurnKind_P1_ChoiceThroughStateRead",
+                Pattern::literal("0F 2F CE 73 0E 83 BF ?? ?? ?? ?? FF BE 02 00 00 00 75 05 BE 01 00 00 00 "
+                                 "| 8B 87 ?? ?? ?? ??")),
+        };
+
         // ComputeMoveState's turn-angle output pointer: `mov r12, rdx` in the prologue (searched within the prologue
         // length the unwind info declares) and `test r12, r12; jz; movss [r12], xmm` storing through it.
         inline const Candidate k_turnOutputSaveCandidates[] = {
@@ -536,6 +560,32 @@ namespace TPVCamera
             Candidate::direct("MovementType_P1_CompareAbsolute", Pattern::literal("| 83 BB ?? ?? ?? ?? 01 44 8D 60 02")),
         };
 
+        // CActionScope::InstallAnimation's lookup of a clip's animation:
+        //   mov rdx, [rbx]      the clip's 64-bit name hash
+        //   mov rcx, rax        the scope character's CAnimationSet
+        //   mov r8, [rax]       its vtable
+        //   call [r8+disp8]     GetAnimIDByCRC
+        //   mov edi, eax
+        //   test eax, eax; js   a negative id, an animation the set does not hold
+        // The `|` is the call. Its displacement is GetAnimIDByCRC's vtable byte offset.
+        inline const Candidate k_animIdByCrcCallCandidates[] = {
+            Candidate::direct("AnimIdByCrc_P1_InstallAnimation",
+                              Pattern::literal("48 8B 13 48 8B C8 4C 8B 00 | 41 FF 50 ?? 8B F8 85 C0 0F 88")),
+        };
+
+        // CAnimationSet::GetAnimIDByName's call to the game's animation-name hash (name, length):
+        //   cmp [rdx+rax], bl; jnz               the end of the strlen loop over the name
+        //   mov edx, eax                         the length
+        //   mov rcx, r8                          the name
+        //   call rel32                           the name hash, at the `|`
+        //   mov r9, rax; mov [rsp+disp8], rax
+        //   mov rdx, 0CBF29CE484222325h          the FNV-1a offset basis that buckets the hash in the name map
+        inline const Candidate k_animNameHashCallCandidates[] = {
+            Candidate::direct("AnimNameHash_P1_GetAnimIDByName",
+                              Pattern::literal("38 1C 02 75 F8 8B D0 49 8B C8 | E8 ?? ?? ?? ?? 4C 8B C8 48 89 44 24 ?? "
+                                               "48 BA 25 23 22 84 E4 9C F2 CB")),
+        };
+
         // Identity checks on a vtable slot's target, searched within its first bytes (see read_checked_vtable_slot in
         // camera_hook.cpp). IsThirdPerson asks the active camera (`mov rcx,rax; mov rdx,[rax]; call [rdx+disp8]`);
         // C_CameraObserver's update reads the view camera through ISystem (`call [rax+3A0h]`).
@@ -546,6 +596,13 @@ namespace TPVCamera
         // C_Player::HandleEvent's dispatch of the camera-changed event (see handle_event_dispatch()), searched within
         // its first 0x100 bytes.
         inline constexpr std::size_t k_handleEventBodyWindow = 0x100;
+        // CAnimationSet's GetAnimIDByCRC slot holds a thunk, matched at its first byte: `add rcx, imm8` (to the name
+        // map), then `jmp rel32` (to the map lookup).
+        inline constexpr Pattern k_animIdByCrcThunk = Pattern::literal("48 83 C1 ?? E9");
+        // The animation-name hash, matched at its first byte before the mod calls it: the prologue, `mov esi, edx`
+        // (the length), `mov rbx, rcx` (the name), then `cmp edx, 20h` (its first branch on the length).
+        inline constexpr Pattern k_animNameHashBody =
+            Pattern::literal("48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 50 8B F2 48 8B D9 83 FA 20");
 
         // I3DEngine's two octree queries, read from the live engine vtable (see render_occlusion.cpp
         // refresh_brush_query). Both slots are the same small wrapper: it builds a PodArray on the stack, calls the
@@ -569,8 +626,9 @@ namespace TPVCamera
      *          HeadVisibility, InputDispatch, ActionDispatch, InteractorLookRay, OverlayHide (the action-filter
      *          worker), MenuOpen (the menu toggle), TurnTriggerReturn, LockSyncReturn and PhysEntMovement ids carry a
      *          cascade; every other id up to PhysEntMovement resolves to 0 (its consumer reaches the target via a gEnv
-     *          member / vtable slot, or is stubbed). The ids after PhysEntMovement are KCD1-specific scalars decoded
-     *          from game code (anchor_value()), not addresses.
+     *          member / vtable slot, or is stubbed). The ids from IsThirdPersonSlot to AnimIdByCrcSlot are
+     *          KCD1-specific scalars decoded from game code (anchor_value()), not addresses. AnimNameHashCall is a
+     *          call site, and its consumer decodes the callee.
      */
     enum class AnchorId : std::size_t
     {
@@ -599,6 +657,8 @@ namespace TPVCamera
         CameraEventFlags,     // camera-changed SGameObjectEvent target/flags word (the sender)
         TurnInstalledState,   // C_PlayerMovementAction installed-turn state offset (quorum: trigger, OnEvent)
         LockBodyTurnCount,    // C_Player LockBodyTurn reference-count offset (LockBodyTurn itself; log only)
+        AnimIdByCrcSlot,      // CAnimationSet GetAnimIDByCRC vtable byte offset (CActionScope::InstallAnimation)
+        AnimNameHashCall,     // the call to the animation-name hash in CAnimationSet::GetAnimIDByName
         Count,
     };
 
@@ -613,6 +673,8 @@ namespace TPVCamera
         std::ptrdiff_t installed_state_offset = 0;
         /// The previous evaluation's gap sign (float; 0 = none).
         std::ptrdiff_t last_sign_offset = 0;
+        /// The instruction after the turn path's fragment-type choice, where esi holds the choice (0 = unresolved).
+        std::uintptr_t kind_site = 0;
     };
 
     /**
@@ -654,8 +716,11 @@ namespace TPVCamera
      *          - `mov r12, rdx` lies in the prologue and the output store in the same fragment as the trigger;
      *          - the spin latch and last sign are 2-of-2 quorums inside that fragment, and the installed state is
      *            the TurnInstalledState anchor.
+     *          - optionally, the `jnz` after the decision test decodes to the turn path. The path must open exactly
+     *            with the fragment-type choice (k_turnKindCandidates) and read the same installed-state field. A
+     *            failure leaves kind_site 0 and logs a warning, and the layout still holds.
      *          Each scoped anchor is appended to anchor_report(). Logs the first proof that fails.
-     * @return The layout, or std::nullopt when any proof fails.
+     * @return The layout, or std::nullopt when any required proof fails.
      * @note Setup/control-plane only. Call on the init thread after resolve_all_anchors().
      */
     [[nodiscard]] std::optional<TurnDecisionLayout> resolve_turn_decision_layout(std::uintptr_t trigger_return);

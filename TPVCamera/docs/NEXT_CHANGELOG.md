@@ -2,6 +2,7 @@
 
 - Henry now turns on the spot with the game's own turn animations in third person, and the camera stays still while he turns
 - The turn animation is on by default, adjustable in the INI, and switched off automatically in combat, aiming, riding, conversations, minigames and while sitting or lying
+- Turns on the spot play cleanly, with no pose glitches when crouched or when the camera swings behind Henry
 - Steadier camera: it no longer sways with Henry's head bob, hits and landings (new StableAimBasis and AimBasisSmoothing options, both on by default)
 - The camera no longer ends up inside Henry's head in tight spots such as low doorways, and switches to first person until there is room again
 - Fixed nearby people vanishing in third person, such as someone asleep in a house or standing inside a shop
