@@ -16,8 +16,9 @@
 #ifndef TPVCAMERA_PLAYER_ONACTION_HOOK_HPP
 #define TPVCAMERA_PLAYER_ONACTION_HOOK_HPP
 
+#include "hook_set.hpp"
+
 #include <DetourModKit/error.hpp>
-#include <DetourModKit/hook.hpp>
 
 #include <cstdint>
 
@@ -28,10 +29,10 @@ namespace TPVCamera
      * @brief Installs the player OnAction / action-dispatcher hook from the pre-resolved anchor.
      * @return An empty Result once the dispatcher is hooked, or the typed Error (NoMatch for an unresolved
      *         anchor, otherwise the install / enable code).
-     * @note Call after resolve_all_anchors(); the hook target is read via anchor_address(). The hook is pushed
-     *       onto @p hooks, which shutdown() retires through the DetourGate.
+     * @param hooks The mod's hook set. Each handle is stored before its arm.
+     * @note Call after resolve_all_anchors(); the hook target is read through the MoveIntent gate.
      */
-    [[nodiscard]] DMK::Result<void> initialize_player_onaction_hook(DMK::hook::HookStack &hooks);
+    [[nodiscard]] DMK::Result<void> initialize_player_onaction_hook(HookSet &hooks);
 
     /** @brief Whether the OnAction hook resolved (callers use the input signal only when true). */
     [[nodiscard]] bool player_onaction_available();

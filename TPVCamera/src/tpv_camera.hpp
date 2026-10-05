@@ -5,11 +5,10 @@
 #ifndef TPVCAMERA_TPV_CAMERA_HPP
 #define TPVCAMERA_TPV_CAMERA_HPP
 
+#include "hooks/hook_set.hpp"
+
 #include <DetourModKit.hpp>
 #include <DetourModKit/abi/wheel_host.h>
-
-#include <cstdint>
-#include <string_view>
 
 namespace TPVCamera
 {
@@ -38,42 +37,24 @@ namespace TPVCamera
      */
     [[nodiscard]] DMK::Result<void> init(DMK::Session &session, const WheelHostTable *wheel_host = nullptr);
 
-    /// The outcome of shutdown(). Only Retired authorizes unmapping the image that holds the mod's code.
-    enum class ShutdownVerdict : std::uint8_t
-    {
-        /// Workers joined, every hook caller proven quiescent, and every hook backend reclaimed.
-        Retired,
-        /**
-         * @brief A hook could not be disabled, or a game thread was still inside or entering a detour.
-         * @details The hooks stay installed (disabled where possible) and their trampolines alive. A later
-         *          shutdown() retries.
-         */
-        CallersActive,
-        /// A mod worker did not join and keeps its module reference. Latched.
-        WorkerRetained,
-        /// DetourModKit retained a hook backend at teardown, so a detour stays reachable. Latched.
-        HookRetained,
-    };
-
-    /// Short label for a ShutdownVerdict, for log lines.
-    [[nodiscard]] std::string_view to_string(ShutdownVerdict verdict) noexcept;
-
     /**
-     * @brief Tears the mod down: stops the INI watcher and the overlay worker, retires every hook, and resets the
-     *        game interface.
-     * @return The teardown verdict. Anything but Retired means code in this image can still run, so the module
-     *         hosting it must NOT be unloaded.
-     * @details Follows DetourModKit's logic-DLL shutdown order: stop and join the mod's workers, have the render thread
-     *          hand its per-frame game overrides back to the engine (game-thread cleanup completes before its route
-     *          is retired), then retire the external callback sources (the game-thread detours) through the
-     *          DetourGate, which disables every hook, proves its callers quiescent, and only then destroys it. The
-     * input bindings and config setters are NOT drained here: the release build's ~Session and the dev build's
-     *          prepare_logic_dll_unload_all() own that, after this returns. Idempotent and retryable: a step that
-     *          completed is not repeated, and a CallersActive verdict resumes from the hook retirement.
+     * @brief Tears the mod down: joins the mod's workers, hands the per-frame game overrides back, and retires every
+     *        hook.
+     * @return Retired when every worker joined and every hooked prologue was restored. Busy when a game thread stayed
+     *         inside a detour: the hooks stay disabled, and a later call can finish. Failed when a worker did not join
+     *         or a hook failed to disable or restore its target: the module must then stay mapped for the process.
+     * @details Follows DetourModKit's logic-DLL shutdown order:
+     *          - join the mod's workers.
+     *          - have the render thread hand its per-frame game overrides back to the engine.
+     *          - retire the game-thread detours through the hook set. The set disables every hook, waits until no
+     *            game thread is inside a detour, and only then destroys the handles.
+     *          The input bindings and config setters are NOT drained here: the release build's ~Session and the dev
+     *          build's prepare_logic_dll_unload_all() own that, after this returns. Every step is idempotent, so a
+     *          call after Busy resumes the teardown.
      * @note Run it OFF the loader lock. Under the loader lock every join and hook mutation fails closed, which
-     *       reports WorkerRetained or CallersActive and changes nothing.
+     *       reports Busy or Failed and changes nothing.
      */
-    [[nodiscard]] ShutdownVerdict shutdown();
+    [[nodiscard]] RetireStatus shutdown();
 
 } // namespace TPVCamera
 

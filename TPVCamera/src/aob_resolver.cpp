@@ -1,15 +1,17 @@
 /**
  * @file aob_resolver.cpp
- * @brief Declarative anchor table, one-pass resolution, and the resolved-address store.
+ * @brief Declarative anchor table, signature-file overlay, one-pass resolution, feature gates, and the resolved-value
+ *        store.
  *
- * The candidate ladders in aob_resolver.hpp enter a DetourModKit anchor registry as RipGlobal, CodeOperand and
- * Quorum entries, together with the independent call-site rungs. resolve_all_anchors() resolves the whole table in
- * a single parallel pass at startup and records each result; anchor_address() and anchor_value() hand it, or
- * nothing on a miss, to the call sites. The resolve_* helpers then prove the native-turn hook sites inside the
- * functions those anchors found, with anchors scoped to each function's .pdata range.
+ * The candidate ladders in aob_resolver.hpp enter a DetourModKit anchor registry as RipGlobal, CodeOperand and Quorum
+ * entries, each with the validator of what it names. resolve_all_anchors() resolves the whole table in a single
+ * parallel pass at startup, replaces any row the signature file repairs, records each result, and evaluates one gate
+ * per feature. The resolve_* helpers then prove the native-turn hook sites inside the functions those anchors found,
+ * with anchors scoped to each function's .pdata range.
  */
 
 #include "aob_resolver.hpp"
+#include "constants.hpp"
 
 #include <DetourModKit.hpp>
 
@@ -19,11 +21,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
-#include <tuple>
+#include <system_error>
+#include <utility>
+#include <vector>
 
 namespace TPVCamera
 {
@@ -32,92 +38,150 @@ namespace TPVCamera
         using DMK::anchor::Anchor;
         using DMK::anchor::AnchorKind;
         using DMK::anchor::AnchorStatus;
+        using DMK::anchor::GateVerdict;
         using DMK::anchor::ResolvedAnchor;
         using DMK::scan::Candidate;
         using DMK::scan::OperandKind;
         using DMK::scan::Pages;
 
         constexpr std::size_t k_anchor_count = static_cast<std::size_t>(AnchorId::Count);
+        constexpr std::size_t k_feature_count = static_cast<std::size_t>(Feature::Count);
+
+        /// What an address anchor names, which decides the validator it must pass.
+        enum class Role : std::uint8_t
+        {
+            /// A function entry the mod hooks or calls.
+            Entry,
+            /// An instruction inside a function, such as a return address the mod compares against.
+            Site,
+            /// A `call rel32` whose target the mod calls.
+            CallSite,
+            /// A global the mod reads through.
+            Data,
+        };
 
         // The WHGame.dll image the table resolves against, filled by resolve_all_anchors() before the sweep and
-        // handed to every anchor's validator as its opaque context.
+        // handed to every address validator as its opaque context.
         DMK::Region s_image_range{};
 
-        /**
-         * @brief Post-resolve validator: the resolved value must land inside the game image.
-         * @details The scan SCOPE constrains where a candidate's bytes are FOUND, not where the value it decodes
-         *          POINTS. A RipRelative candidate resolves an absolute address from a disp32, and a Direct
-         *          candidate applies a signed walk-back, so either can compute a target outside WHGame.dll from a
-         *          freak match. Every anchor in this table names something inside the game image (a function
-         *          entry or a data slot the image owns), so a target outside it is proof the match was wrong.
-         *          Returning false resets the value to 0 and reports Failed, exactly like a backend miss, so the
-         *          consumer degrades instead of hooking or reading a bogus address.
-         * @param value The resolved address.
-         * @param context The image Region, forwarded verbatim from Anchor::validator_context.
-         */
-        [[nodiscard]] bool anchor_target_in_image(std::int64_t value, const void *context) noexcept
+        [[nodiscard]] bool in_image(std::int64_t value, const void *context) noexcept
         {
             const auto *image = static_cast<const DMK::Region *>(context);
-            if (image == nullptr || image->size == 0 || value <= 0)
+            return image != nullptr && image->size != 0 && value > 0 &&
+                   image->contains(DMK::Address{static_cast<std::uintptr_t>(value)});
+        }
+
+        /**
+         * @brief True when @p address lies on a committed, executable, non-guard page.
+         * @details DetourModKit exposes no page-class query, so this is one VirtualQuery, at setup time only.
+         */
+        [[nodiscard]] bool on_executable_page(std::uintptr_t address) noexcept
+        {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) == 0)
             {
                 return false;
             }
-            return image->contains(DMK::Address{static_cast<std::uintptr_t>(value)});
+            constexpr DWORD executable =
+                PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+            return info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 && (info.Protect & executable) != 0;
         }
 
         /**
-         * @brief Decodes the callee of the 5-byte `E8 rel32` at @p site, confined to the game image.
-         * @return The callee entry, or 0 when the rel32 cannot be read or decodes outside the image.
+         * @brief Validator of a function entry: inside the image, on an executable page, opening like a function, and
+         *        at the start of its .pdata entry.
+         * @details The scan scope bounds where a candidate's bytes are FOUND, not where a walk-back or disp32 POINTS,
+         *          so a freak match is caught here and fails the anchor closed. A body rung's fixed walk-back can turn
+         *          stale while its bytes still match. Where unwind data covers the target, its recorded function start
+         *          must agree, because a plausible opcode inside an instruction is not an entry. A leaf function
+         *          without unwind data keeps the byte probe as its evidence. scan::is_likely_function_prologue accepts
+         *          a jump, so an entry that another mod hooked first still passes.
          */
-        [[nodiscard]] std::uintptr_t call_site_target(std::uintptr_t site, const DMK::Region &image) noexcept
+        [[nodiscard]] bool entry_valid(std::int64_t value, const void *context) noexcept
         {
-            const auto target = DMK::scan::resolve_rip_relative(DMK::Address{site}, 1, 5);
-            if (!target || !image.contains(*target))
-            {
-                return 0;
-            }
-            return target->raw();
-        }
-
-        /**
-         * @brief Post-resolve validator for a call-site rung: the site must be an E8 whose callee lies in the image.
-         * @details The site itself is in the image by construction of the scope; what proves the rung matched the
-         *          intended call is that its rel32 decodes back into WHGame.dll.
-         */
-        [[nodiscard]] bool call_site_targets_image(std::int64_t value, const void *context) noexcept
-        {
-            if (!anchor_target_in_image(value, context))
+            if (!in_image(value, context))
             {
                 return false;
             }
-            const auto *image = static_cast<const DMK::Region *>(context);
-            const auto opcode = DMK::memory::read<std::uint8_t>(DMK::Address{static_cast<std::uintptr_t>(value)});
-            return opcode && *opcode == 0xE8 && call_site_target(static_cast<std::uintptr_t>(value), *image) != 0;
+            const auto address = static_cast<std::uintptr_t>(value);
+            if (!on_executable_page(address) || !DMK::scan::is_likely_function_prologue(DMK::Address{address}))
+            {
+                return false;
+            }
+            DWORD64 image_base = 0;
+            const RUNTIME_FUNCTION *entry = RtlLookupFunctionEntry(static_cast<DWORD64>(address), &image_base, nullptr);
+            return entry == nullptr || image_base + entry->BeginAddress == static_cast<DWORD64>(address);
+        }
+
+        /// Validator of an instruction site: inside the image and on an executable page.
+        [[nodiscard]] bool site_valid(std::int64_t value, const void *context) noexcept
+        {
+            return in_image(value, context) && on_executable_page(static_cast<std::uintptr_t>(value));
         }
 
         /**
-         * @brief A RipGlobal anchor over one ladder.
-         * @details Every rung anchors on an in-image instruction, so the byte tiers sweep executable pages only:
-         *          an identical byte run in .rdata or .data cannot alias or make a unique code match ambiguous.
+         * @brief Validator of a call site: an instruction site holding a `call rel32` whose target is a valid function
+         *        entry.
+         * @details scan::Candidate::rip_relative decodes a RIP-relative memory operand, never a branch, so the anchor
+         *          resolves the call itself, and its consumer decodes the target with scan::resolve_rip_relative. This
+         *          proves that decode first, so the consumer never calls into the middle of a function.
          */
-        [[nodiscard]] Anchor code_ladder(std::string_view label, std::span<const Candidate> site) noexcept
+        [[nodiscard]] bool call_site_valid(std::int64_t value, const void *context) noexcept
+        {
+            if (!site_valid(value, context))
+            {
+                return false;
+            }
+            const DMK::Address site{static_cast<std::uintptr_t>(value)};
+            const auto opcode = DMK::memory::read<std::uint8_t>(site);
+            const auto callee = DMK::scan::resolve_rip_relative(site, 1, 5);
+            return opcode && *opcode == 0xE8 && callee &&
+                   entry_valid(static_cast<std::int64_t>(callee->raw()), context);
+        }
+
+        /// Validator of a global: inside the image, readable, and not on an executable page.
+        [[nodiscard]] bool data_valid(std::int64_t value, const void *context) noexcept
+        {
+            const auto address = static_cast<std::uintptr_t>(value);
+            return in_image(value, context) &&
+                   DMK::memory::is_readable(DMK::Region{DMK::Address{address}, sizeof(std::uintptr_t)}) &&
+                   !on_executable_page(address);
+        }
+
+        [[nodiscard]] DMK::anchor::AnchorValidator validator_for(Role role) noexcept
+        {
+            switch (role)
+            {
+            case Role::Entry:
+                return entry_valid;
+            case Role::Site:
+                return site_valid;
+            case Role::CallSite:
+                return call_site_valid;
+            case Role::Data:
+            default:
+                return data_valid;
+            }
+        }
+
+        /**
+         * @brief A RipGlobal anchor over one ladder, validated by @p role.
+         * @details Every rung anchors on an in-image instruction (a function entry, a callable helper, or the
+         *          instruction whose disp32 names a data slot), so the byte tiers sweep executable pages only: an
+         *          identical byte run in .rdata or .data cannot alias or make a unique code match ambiguous.
+         *          require_validator fails the row closed if it ever lacks its validator.
+         */
+        [[nodiscard]] Anchor code_ladder(std::string_view label, std::span<const Candidate> site, Role role) noexcept
         {
             return Anchor{
                 .label = label,
                 .kind = AnchorKind::RipGlobal,
                 .site = site,
-                .validator = anchor_target_in_image,
+                .validator = validator_for(role),
                 .validator_context = &s_image_range,
+                .require_validator = true,
                 .pages = Pages::Executable,
             };
-        }
-
-        /// The call-site form of code_ladder(): the same sweep, with the E8 + in-image callee validator.
-        [[nodiscard]] Anchor call_site_ladder(std::string_view label, std::span<const Candidate> site) noexcept
-        {
-            Anchor anchor = code_ladder(label, site);
-            anchor.validator = call_site_targets_image;
-            return anchor;
         }
 
         /// The values a decoded scalar may take: a closed range and an alignment.
@@ -133,7 +197,8 @@ namespace TPVCamera
         // A member offset inside a game object, for a uint8 field and for an int32 or float field.
         constexpr ScalarRange k_byte_field_range{1, 0x4000, 1};
         constexpr ScalarRange k_dword_field_range{4, 0x4000, 4};
-        // An SGameObjectEvent id. HandleEvent compares it as `cmp eax, imm8`, which only encodes 0..0x7F.
+        // An SGameObjectEvent id. C_Player::HandleEvent compares it as `cmp eax, imm8`, whose sign-extended immediate
+        // only encodes 0..0x7F as a positive id.
         constexpr ScalarRange k_event_id_range{1, 0x7F, 1};
         // The event's target/flags word, a non-zero uint32.
         constexpr ScalarRange k_event_flags_range{1, 0xFFFFFFFF, 1};
@@ -153,7 +218,7 @@ namespace TPVCamera
 
         /**
          * @brief A CodeOperand anchor: decodes operand @p operand_index of the instruction its ladder lands on.
-         * @param byte_width 0 keeps the decoded value; 4 reads an imm32 as a sign-extended int32.
+         * @param byte_width 0 keeps the decoded value, and 4 reads an imm32 as a sign-extended int32.
          */
         [[nodiscard]] Anchor code_operand(std::string_view label, std::span<const Candidate> site, OperandKind kind,
                                           std::uint8_t operand_index, const ScalarRange &range,
@@ -168,12 +233,13 @@ namespace TPVCamera
                 .byte_width = byte_width,
                 .validator = scalar_in_range,
                 .validator_context = &range,
+                .require_validator = true,
             };
         }
 
         /**
          * @brief A Quorum anchor over independent CodeOperand members.
-         * @param threshold How many members must resolve to the same value; 0 means all of them.
+         * @param threshold How many members must resolve to the same value. 0 means all of them.
          */
         [[nodiscard]] Anchor quorum(std::string_view label, std::span<const Anchor *const> members,
                                     std::size_t threshold, const ScalarRange &range) noexcept
@@ -188,7 +254,48 @@ namespace TPVCamera
             };
         }
 
+        /// One Data vote per rung of @p ladder, so every rung is a separate vote of a root quorum.
+        template <std::size_t N>
+        [[nodiscard]] std::array<Anchor, N> single_rung_votes(std::string_view label,
+                                                              const Candidate (&ladder)[N]) noexcept
+        {
+            std::array<Anchor, N> votes{};
+            for (std::size_t i = 0; i < N; ++i)
+            {
+                votes[i] = code_ladder(label, std::span<const Candidate>{&ladder[i], 1}, Role::Data);
+            }
+            return votes;
+        }
+
+        /**
+         * @brief A 2-of-N Quorum over the Data votes of a root global.
+         * @details g_env, the global context and the game framework are the roots every other read goes through, so a
+         *          coincidental match after a patch must fool two independent code sites at once (`[B-52]`). DMK
+         *          rejects the quorum when two winning spans overlap, so every vote is a separate code site.
+         */
+        [[nodiscard]] Anchor root_quorum(std::string_view label, std::span<const Anchor *const> members) noexcept
+        {
+            return Anchor{
+                .label = label,
+                .kind = AnchorKind::Quorum,
+                .validator = data_valid,
+                .validator_context = &s_image_range,
+                .quorum_members = members,
+                .quorum_threshold = 2,
+            };
+        }
+
         // Quorum members. Each is resolved only through its quorum, never on its own, so none is a table entry.
+        const auto k_context_votes = single_rung_votes("GlobalContextPtr", Aob::k_contextCandidates);
+        const Anchor *const k_context_vote_ptrs[] = {&k_context_votes[0], &k_context_votes[1], &k_context_votes[2]};
+
+        const auto k_genv_votes = single_rung_votes("Genv", Aob::k_genvCandidates);
+        const Anchor *const k_genv_vote_ptrs[] = {&k_genv_votes[0], &k_genv_votes[1], &k_genv_votes[2]};
+
+        const auto k_cry_action_votes = single_rung_votes("CryActionFramework", Aob::k_cryActionFrameworkCandidates);
+        const Anchor *const k_cry_action_vote_ptrs[] = {&k_cry_action_votes[0], &k_cry_action_votes[1],
+                                                        &k_cry_action_votes[2]};
+
         const Anchor k_is_third_person_slot_trigger =
             code_operand("IsThirdPersonSlot.Trigger", Aob::k_isThirdPersonSlotTriggerCandidates,
                          OperandKind::MemoryDisplacement, 0, k_vtable_offset_range);
@@ -217,29 +324,21 @@ namespace TPVCamera
                          OperandKind::MemoryDisplacement, 0, k_dword_field_range);
         const Anchor *const k_turn_state_votes[] = {&k_turn_state_trigger, &k_turn_state_on_event};
 
-        // The registry, indexed by AnchorId. The enumerator order IS this order. An empty ladder ({}) marks an
-        // anchor KCD1 does not pattern-resolve (its consumer reaches the target via a gEnv member / vtable slot,
-        // or is stubbed); resolve_all_anchors() skips it and records 0.
-        const std::array<Anchor, k_anchor_count> k_anchor_table = {{
-            code_ladder("Context", Aob::k_contextCandidates),
-            code_ladder("Genv", Aob::k_genvCandidates),
-            code_ladder("CameraFrustumBuild", Aob::k_frustumCandidates),
-            code_ladder("SetHeadHidden", Aob::k_headVisibilityCandidates),
-            code_ladder("InputDispatch", Aob::k_inputDispatchCandidates),
-            code_ladder("ActionDispatch", Aob::k_actionDispatchCandidates),
-            code_ladder("RayWorldIntersection", {}),
-            code_ladder("InteractionRayBuild", {}),
-            code_ladder("InteractorLookRay", Aob::k_interactorLookRayCandidates),
-            code_ladder("InteractionOnScreen", {}),
-            code_ladder("ActionFilterWorker", Aob::k_actionFilterWorkerCandidates),
-            code_ladder("OverlayShow", {}),
-            code_ladder("MenuToggle", Aob::k_menuToggleCandidates),
-            code_ladder("MenuClose", {}),
-            code_ladder("GetObjectsInBox", {}),
-            code_ladder("CryActionFramework", Aob::k_cryActionFrameworkCandidates),
-            code_ladder("TurnTriggerIsThirdPersonReturn", Aob::k_turnTriggerReturnCandidates),
-            code_ladder("LockSyncIsThirdPersonReturn", Aob::k_lockSyncReturnCandidates),
-            code_ladder("UpdatePhysicalEntityMovement", Aob::k_physEntMovementCandidates),
+        // The registry, indexed by AnchorId. The enumerator order IS this order.
+        const Anchor k_anchors[] = {
+            root_quorum("GlobalContextPtr", k_context_vote_ptrs),
+            root_quorum("Genv", k_genv_vote_ptrs),
+            code_ladder("CameraFrustumBuild", Aob::k_frustumCandidates, Role::Entry),
+            code_ladder("SetHeadVisibility", Aob::k_headVisibilityCandidates, Role::Entry),
+            code_ladder("CameraInputDispatch", Aob::k_inputDispatchCandidates, Role::Entry),
+            code_ladder("PlayerOnActionDispatch", Aob::k_actionDispatchCandidates, Role::Entry),
+            code_ladder("InteractorLookRay", Aob::k_interactorLookRayCandidates, Role::Entry),
+            code_ladder("ActionFilterWorker", Aob::k_actionFilterWorkerCandidates, Role::Entry),
+            code_ladder("MenuToggle", Aob::k_menuToggleCandidates, Role::Entry),
+            root_quorum("CryActionFramework", k_cry_action_vote_ptrs),
+            code_ladder("TurnTriggerIsThirdPersonReturn", Aob::k_turnTriggerReturnCandidates, Role::Site),
+            code_ladder("LockSyncIsThirdPersonReturn", Aob::k_lockSyncReturnCandidates, Role::Site),
+            code_ladder("UpdatePhysicalEntityMovement", Aob::k_physEntMovementCandidates, Role::Entry),
             quorum("IsThirdPersonSlot", k_is_third_person_slot_votes, 0, k_vtable_offset_range),
             code_operand("HandleEventSlot", Aob::k_cameraEventSendSlotCandidates, OperandKind::MemoryDisplacement, 0,
                          k_vtable_offset_range),
@@ -251,56 +350,131 @@ namespace TPVCamera
                          k_dword_field_range),
             code_operand("AnimIdByCrcSlot", Aob::k_animIdByCrcCallCandidates, OperandKind::MemoryDisplacement, 0,
                          k_vtable_offset_range),
-            call_site_ladder("AnimNameHashCall", Aob::k_animNameHashCallCandidates),
-        }};
+            code_ladder("AnimNameHashCall", Aob::k_animNameHashCallCandidates, Role::CallSite),
+        };
+        static_assert(std::size(k_anchors) == k_anchor_count, "k_anchors must hold one entry per AnchorId.");
 
-        /// True for a table entry that carries a ladder or quorum members; an empty RipGlobal is a placeholder.
-        [[nodiscard]] bool is_wired(const Anchor &anchor) noexcept
-        {
-            return !anchor.site.empty() || !anchor.quorum_members.empty();
-        }
+        // The anchors each feature depends on. A feature is enabled only through its gate over exactly these.
+        constexpr AnchorId k_camera_anchors[] = {AnchorId::Frustum};
+        constexpr AnchorId k_game_state_anchors[] = {AnchorId::Context};
+        constexpr AnchorId k_engine_anchors[] = {AnchorId::Genv};
+        constexpr AnchorId k_framework_anchors[] = {AnchorId::CryActionFramework};
+        constexpr AnchorId k_head_visibility_anchors[] = {AnchorId::HeadVisibility};
+        constexpr AnchorId k_orbit_anchors[] = {AnchorId::InputDispatch};
+        constexpr AnchorId k_move_intent_anchors[] = {AnchorId::ActionDispatch};
+        constexpr AnchorId k_interaction_anchors[] = {AnchorId::InteractorLookRay, AnchorId::Context};
+        constexpr AnchorId k_overlay_state_anchors[] = {AnchorId::OverlayHide};
+        constexpr AnchorId k_menu_state_anchors[] = {AnchorId::MenuOpen};
+        constexpr AnchorId k_native_turn_anchors[] = {
+            AnchorId::TurnTriggerReturn, AnchorId::LockSyncReturn, AnchorId::IsThirdPersonSlot,
+            AnchorId::HandleEventSlot,   AnchorId::CameraEventId,  AnchorId::CameraEventFlags,
+        };
+        constexpr AnchorId k_turn_decision_anchors[] = {AnchorId::TurnInstalledState};
+        constexpr AnchorId k_turn_steps_anchors[] = {AnchorId::PhysEntMovement};
+        constexpr AnchorId k_crouched_animation_anchors[] = {AnchorId::AnimIdByCrcSlot, AnchorId::AnimNameHashCall};
 
-        /// One independent call-site rung and the cascade it stands in for.
-        struct CallSiteFallback
+        /// One feature gate: its log name and the anchors it depends on.
+        struct FeatureSpec
         {
-            AnchorId target;
-            Anchor site;
+            std::string_view name;
+            std::span<const AnchorId> anchors;
         };
 
-        const std::array<CallSiteFallback, 4> k_call_site_fallbacks = {{
-            {AnchorId::Frustum, call_site_ladder("CameraFrustumBuild.CallSite", Aob::k_frustumCallSite)},
-            {AnchorId::HeadVisibility, call_site_ladder("SetHeadHidden.CallSite", Aob::k_headVisibilityCallSite)},
-            {AnchorId::MenuOpen, call_site_ladder("MenuToggle.CallSite", Aob::k_menuToggleCallSite)},
-            {AnchorId::OverlayHide, call_site_ladder("ActionFilterWorker.CallSite", Aob::k_actionFilterWorkerCallSite)},
+        // Indexed by Feature. The enumerator order IS this order.
+        constexpr std::array<FeatureSpec, k_feature_count> k_features = {{
+            {"Camera", k_camera_anchors},
+            {"GameState", k_game_state_anchors},
+            {"Engine", k_engine_anchors},
+            {"Framework", k_framework_anchors},
+            {"HeadVisibility", k_head_visibility_anchors},
+            {"Orbit", k_orbit_anchors},
+            {"MoveIntent", k_move_intent_anchors},
+            {"Interaction", k_interaction_anchors},
+            {"OverlayState", k_overlay_state_anchors},
+            {"MenuState", k_menu_state_anchors},
+            {"NativeTurn", k_native_turn_anchors},
+            {"TurnDecision", k_turn_decision_anchors},
+            {"TurnSteps", k_turn_steps_anchors},
+            {"CrouchedAnimations", k_crouched_animation_anchors},
         }};
 
-        // Room after the startup pass for the function-scoped anchors resolve_turn_decision_layout() (ten) and
+        constexpr std::size_t k_max_feature_anchors = 6;
+        static_assert(std::ranges::all_of(k_features,
+                                          [](const FeatureSpec &spec)
+                                          {
+                                              return !spec.name.empty() && !spec.anchors.empty() &&
+                                                     spec.anchors.size() <= k_max_feature_anchors;
+                                          }),
+                      "k_features must hold one named, non-empty entry per Feature within k_max_feature_anchors.");
+
+        // The hooked anchors: a repaired signature for one of them authorizes a code write.
+        constexpr AnchorId k_hooked_anchors[] = {
+            AnchorId::Frustum,           AnchorId::HeadVisibility, AnchorId::InputDispatch, AnchorId::ActionDispatch,
+            AnchorId::InteractorLookRay, AnchorId::OverlayHide,    AnchorId::MenuOpen,      AnchorId::PhysEntMovement,
+        };
+
+        // The largest code window code_window_matches() reads in one guarded copy.
+        constexpr std::size_t k_max_code_window = 0x80;
+
+        // Room after the startup pass for the function-scoped anchors resolve_turn_decision_layout() (seven) and
         // resolve_movement_type_offset() (one) append.
-        constexpr std::size_t k_max_scoped_report = 11;
-        constexpr std::size_t k_max_report =
-            k_anchor_count + std::tuple_size_v<decltype(k_call_site_fallbacks)> + k_max_scoped_report;
+        constexpr std::size_t k_max_scoped_report = 8;
+        constexpr std::size_t k_max_report = k_anchor_count + k_max_scoped_report;
 
-        // Resolved absolute addresses, indexed by AnchorId; 0 means unresolved or a scalar anchor. Zero-initialized
+        // Resolved absolute addresses, indexed by AnchorId. 0 means unresolved or a scalar anchor. Zero-initialized
         // (constant init, no static-init-order hazard). Written once by resolve_all_anchors() on the init thread
-        // before any consumer reads, then read-only, so no synchronization is required.
+        // before any consumer reads, then read-only, so no synchronization is required. The same holds for every
+        // store below.
         std::array<std::uintptr_t, k_anchor_count> s_resolved_addresses{};
-        // Every resolved value, address and scalar anchors alike, under the same discipline.
+        // Every resolved value, address and scalar anchors alike.
         std::array<std::optional<std::int64_t>, k_anchor_count> s_resolved_values{};
+        // Each feature's gate result. False until resolve_all_anchors() evaluates it, so a feature fails closed.
+        std::array<bool, k_feature_count> s_feature_ready{};
 
-        // The per-anchor report (wired cascades first, then the call-site rungs, then the function-scoped anchors),
-        // written on the init thread only and read after init, so the shutdown diagnostics snapshot can roll it up
-        // through diagnostics::collect() instead of the mod recomputing it.
+        // The per-anchor report (the startup table first, then the function-scoped anchors), retained so the
+        // gates and the shutdown diagnostics snapshot read it. The startup slice is indexed by AnchorId.
         std::array<ResolvedAnchor, k_max_report> s_report{};
         std::size_t s_report_count = 0;
+
+        // The merged signatures: the in-code rows with the signature file's repairs on top (manifest::overlay).
+        // Quorum rows have no file form and stay out. Kept for export_signatures().
+        std::vector<DMK::manifest::Signature> s_signatures;
+        // The signature file's header, which the trust gate checks a repair's contract revision against.
+        DMK::manifest::ManifestHeader s_file_header{};
+
+        [[nodiscard]] constexpr std::size_t index_of(AnchorId id) noexcept
+        {
+            return static_cast<std::size_t>(id);
+        }
+
+        [[nodiscard]] bool is_hooked(std::size_t index) noexcept
+        {
+            return std::ranges::any_of(k_hooked_anchors, [index](AnchorId id) { return index_of(id) == index; });
+        }
+
+        /// The table index of the row labelled @p label, or k_anchor_count when none is.
+        [[nodiscard]] std::size_t index_of_label(std::string_view label) noexcept
+        {
+            const auto *row = std::ranges::find_if(k_anchors, [label](const Anchor &a) { return a.label == label; });
+            return static_cast<std::size_t>(row - std::begin(k_anchors));
+        }
+
+        /// A file beside the ASI, named after the mod.
+        [[nodiscard]] std::filesystem::path runtime_file(std::string_view suffix)
+        {
+            return std::filesystem::path(DMK::filesystem::get_runtime_directory()) /
+                   (std::string(Constants::MOD_NAME) + std::string(suffix));
+        }
 
         /**
          * @brief Grades every candidate pattern in the table and reports the weak ones.
          * @details sighealth is offline and side-effect-free: it reads the COMPILED pattern bytes and mask and
          *          scores atom rarity, byte entropy, and expected ambiguity in a nominal module. It touches no
-         *          process memory and never gates resolution, so this runs before the sweep and only reports.
-         *          Its value is on patch day: a cascade that stops resolving against a new WHGame.dll is usually
-         *          a signature that was already weakly selective, and this line says which rung was, without a
-         *          disassembler.
+         *          process memory and never gates resolution (`[B-57]`), so this runs before the sweep and only
+         *          reports. Its value is on patch day: a cascade that stops resolving against a new WHGame.dll is
+         *          usually a signature that was already weakly selective, and this line says which rung was, without
+         *          a disassembler. Quorum members are graded with their quorum.
+         * @param anchors The declarative table.
          */
         void report_signature_health(std::span<const Anchor> anchors)
         {
@@ -308,9 +482,9 @@ namespace TPVCamera
             std::size_t fragile = 0;
             std::size_t unusable = 0;
 
-            const auto grade_ladder = [&](const Anchor &entry)
+            const auto grade_ladder = [&](std::string_view label, std::span<const Candidate> ladder)
             {
-                for (const Candidate &candidate : entry.site)
+                for (const Candidate &candidate : ladder)
                 {
                     const DMK::scan::Pattern *pattern = nullptr;
                     if (const auto *direct = candidate.as_direct())
@@ -329,21 +503,21 @@ namespace TPVCamera
                     const DMK::sighealth::PatternHealth health = DMK::sighealth::analyze_pattern(*pattern);
                     if (health.grade == DMK::sighealth::Grade::Robust)
                     {
-                        logger.trace("Signature health: {}/{} Robust", entry.label, candidate.name());
+                        logger.trace("Signature health: {}/{} Robust", label, candidate.name());
                         continue;
                     }
                     (health.grade == DMK::sighealth::Grade::Unusable ? ++unusable : ++fragile);
-                    logger.debug("Signature health: {}/{} {} - {}", entry.label, candidate.name(),
+                    logger.debug("Signature health: {}/{} {} - {}", label, candidate.name(),
                                  DMK::sighealth::to_string(health.grade),
                                  DMK::sighealth::format_report(health, candidate.name()));
                 }
             };
             for (const Anchor &entry : anchors)
             {
-                grade_ladder(entry);
+                grade_ladder(entry.label, entry.site);
                 for (const Anchor *member : entry.quorum_members)
                 {
-                    grade_ladder(*member);
+                    grade_ladder(entry.label, member->site);
                 }
             }
 
@@ -356,6 +530,150 @@ namespace TPVCamera
             else
             {
                 logger.info("Signature health: {} fragile candidate(s), 0 unusable", fragile);
+            }
+        }
+
+        /**
+         * @brief Loads the signature file's repairs.
+         * @details A missing file changes nothing. A file for another signature-contract revision is ignored with a
+         *          warning, so a stale repair can never override a ladder this build corrected. A malformed entry is
+         *          named here and falls back to its in-code row in the overlay, which is fail-soft.
+         * @return The file's records, or none.
+         */
+        [[nodiscard]] std::vector<DMK::manifest::SignatureRecord> load_signature_repairs()
+        {
+            DMK::Logger &logger = DMK::log();
+            const std::filesystem::path path = runtime_file(Constants::SIGNATURE_FILE_SUFFIX);
+            std::error_code exists_error;
+            if (!std::filesystem::exists(path, exists_error))
+            {
+                return {};
+            }
+            auto loaded = DMK::manifest::load(path);
+            if (!loaded)
+            {
+                logger.error("Signatures: {} could not be read ({}); the built-in signatures stand",
+                             path.filename().string(), loaded.error().message());
+                return {};
+            }
+            if (!DMK::manifest::revision_compatible(loaded->header, Constants::SIGNATURE_REVISION))
+            {
+                logger.warning("Signatures: {} targets signature revision {}, this build is revision {}; the file is "
+                               "ignored. Delete it, or set revision = {} only after re-verifying every entry",
+                               path.filename().string(), loaded->header.revision, Constants::SIGNATURE_REVISION,
+                               Constants::SIGNATURE_REVISION);
+                return {};
+            }
+            s_file_header = loaded->header;
+            for (const DMK::manifest::SignatureRecord &record : loaded->records)
+            {
+                logger.info("Signatures: [sig.{}] from {} {}", record.label, path.filename().string(),
+                            DMK::manifest::Signature::compile(record) ? "is a repair candidate"
+                                                                      : "is malformed; the built-in signature stands");
+            }
+            return std::move(loaded->records);
+        }
+
+        /**
+         * @brief Merges the in-code rows with the signature file's repairs into s_signatures.
+         * @details A Quorum row has no file form (it composes its members by pointer), so it stays out of the overlay
+         *          and resolves from its in-code row.
+         */
+        void merge_signatures(std::span<const DMK::manifest::SignatureRecord> repairs)
+        {
+            std::vector<Anchor> serializable;
+            serializable.reserve(k_anchor_count);
+            for (const Anchor &row : k_anchors)
+            {
+                if (row.kind != AnchorKind::Quorum)
+                {
+                    serializable.push_back(row);
+                }
+            }
+            auto merged = DMK::manifest::overlay(serializable, repairs);
+            if (!merged)
+            {
+                DMK::log().error("Signatures: merging failed ({}); the built-in signatures stand",
+                                 merged.error().message());
+                s_signatures.clear();
+                return;
+            }
+            s_signatures = std::move(*merged);
+        }
+
+        /**
+         * @brief Replaces the report entry of every row the signature file repaired.
+         * @details A merged signature whose fingerprint differs from its built-in row came from the file. It counts
+         *          only after it resolves and passes the manifest trust gate. A repaired hook target authorizes a code
+         *          write, so it needs the complete baseline set (GatePolicy::mutation_strict, `[B-54]`). A repair that
+         *          does not pass reports Failed, so its features stay off rather than run on an untrusted address.
+         */
+        void apply_signature_repairs(const DMK::Region &range)
+        {
+            DMK::Logger &logger = DMK::log();
+            for (const DMK::manifest::Signature &signature : s_signatures)
+            {
+                const std::size_t index = index_of_label(signature.label());
+                if (index >= k_anchor_count)
+                {
+                    continue;
+                }
+                const auto builtin = DMK::manifest::Signature::adopt(k_anchors[index]);
+                if (!builtin || builtin->current_fingerprint() == signature.current_fingerprint())
+                {
+                    continue;
+                }
+                logger.warning("Signatures: {} uses the repair from the signature file", signature.label());
+
+                ResolvedAnchor resolved = signature.resolve(range);
+                if (resolved.status == AnchorStatus::Resolved)
+                {
+                    const DMK::manifest::GatePolicy policy =
+                        is_hooked(index) ? DMK::manifest::GatePolicy::mutation_strict() : DMK::manifest::GatePolicy{};
+                    const DMK::manifest::GateResult gate =
+                        DMK::manifest::resolve_and_gate(std::span<const DMK::manifest::Signature>{&signature, 1},
+                                                        s_file_header, Constants::SIGNATURE_REVISION, policy, range);
+                    if (gate.find(signature.label()) == nullptr)
+                    {
+                        logger.warning(
+                            "Signatures: the repair of {} resolved but is not trusted ({}); it counts as unresolved",
+                            signature.label(),
+                            gate.rejected.empty() ? std::string_view{"rejected"}
+                                                  : DMK::manifest::gate_reason_to_string(gate.rejected.front().reason));
+                        resolved.status = AnchorStatus::Failed;
+                        resolved.value = 0;
+                    }
+                }
+                // The report keeps the table's label view, which outlives the merged signature.
+                resolved.label = k_anchors[index].label;
+                s_report[index] = resolved;
+            }
+        }
+
+        /// Evaluates every feature's gate over its anchors' report entries and logs the verdict.
+        void evaluate_feature_gates()
+        {
+            DMK::Logger &logger = DMK::log();
+            for (std::size_t f = 0; f < k_feature_count; ++f)
+            {
+                const FeatureSpec &spec = k_features[f];
+                std::array<ResolvedAnchor, k_max_feature_anchors> entries{};
+                std::size_t count = 0;
+                for (const AnchorId id : spec.anchors)
+                {
+                    entries[count++] = s_report[index_of(id)];
+                }
+                const GateVerdict verdict = DMK::anchor::evaluate_gate(std::span{entries.data(), count});
+                s_feature_ready[f] = verdict != GateVerdict::Fail;
+                if (verdict == GateVerdict::Pass)
+                {
+                    logger.debug("Feature gate: {} Pass", spec.name);
+                }
+                else
+                {
+                    logger.warning("Feature gate: {} {}{}", spec.name, DMK::anchor::gate_verdict_to_string(verdict),
+                                   s_feature_ready[f] ? "; enabled" : "; the feature is off");
+                }
             }
         }
 
@@ -380,7 +698,7 @@ namespace TPVCamera
         {
             /// The RUNTIME_FUNCTION range that holds the address: one fragment of a possibly split function.
             DMK::Region fragment;
-            /// The function's entry fragment, reached through chained unwind info; it starts with the prologue.
+            /// The function's entry fragment, reached through chained unwind info. It starts with the prologue.
             DMK::Region entry;
             /// The prologue length the entry's unwind info declares.
             std::size_t prologue_size = 0;
@@ -392,7 +710,7 @@ namespace TPVCamera
          * @details A compiler can split a function into an entry fragment and cold fragments, each with its own
          *          RUNTIME_FUNCTION. A cold fragment's UNWIND_INFO carries UNW_FLAG_CHAININFO and ends, after its
          *          unwind codes (padded to an even count), with its parent's RUNTIME_FUNCTION. DetourModKit exposes no
-         *          function-bounds API, so this walks the same table the OS unwinder does; every UNWIND_INFO read is
+         *          function-bounds API, so this walks the same table the OS unwinder does. Every UNWIND_INFO read is
          *          guarded.
          * @return The bounds, or std::nullopt when @p address has no entry or its unwind chain cannot be read.
          */
@@ -496,89 +814,38 @@ namespace TPVCamera
             }
             return entry->value;
         }
-
-        /**
-         * @brief Finds the instruction after the turn path's fragment-type choice (see k_turnKindCandidates).
-         * @details The decision test's `jnz` in @p body decodes to the turn path. The path must open exactly with the
-         *          choice, so the scope is the pattern's own length from the path's first byte. The instruction after
-         *          the choice must read the installed-turn state at @p installed_state, which ties the path to the same
-         *          action.
-         * @return The instruction's address, or 0 when any of that does not hold.
-         */
-        [[nodiscard]] std::uintptr_t resolve_turn_kind_site(const DMK::Region &body, std::int64_t installed_state)
-        {
-            const std::uintptr_t test =
-                scoped_address(code_ladder("TurnPathBranch", Aob::k_turnPathBranchCandidates), body);
-            if (test == 0)
-            {
-                return 0;
-            }
-            const auto path = DMK::scan::resolve_rip_relative(DMK::Address{test + 2}, 2, 6);
-            if (!path || !s_image_range.contains(*path))
-            {
-                return 0;
-            }
-            const DMK::Region path_scope{*path, ladder_reach(Aob::k_turnKindCandidates)};
-            const std::uintptr_t site = scoped_address(code_ladder("TurnKind", Aob::k_turnKindCandidates), path_scope);
-            const std::optional<std::int64_t> state_read =
-                site != 0 ? scoped_value(code_operand("TurnKind.StateRead", Aob::k_turnKindCandidates,
-                                                      OperandKind::MemoryDisplacement, 1, k_dword_field_range),
-                                         path_scope)
-                          : std::nullopt;
-            return state_read == installed_state ? site : 0;
-        }
     } // namespace
 
     void resolve_all_anchors(std::uintptr_t module_base, std::size_t module_size)
     {
         DMK::Logger &logger = DMK::log();
 
-        // Confine resolution to the WHGame.dll image. The DMK default DMK::Region::host() is the host EXE
-        // (KingdomCome.exe), not WHGame.dll, so the region is built explicitly from the scanned base/size. The
-        // same region is published to the per-anchor validators, which reject a resolved target outside it.
+        // Confine resolution to the WHGame.dll image. The DMK default Region::host() is the host EXE, not
+        // WHGame.dll, so the region is built explicitly from the scanned base/size. The same region is published
+        // to the per-anchor validators, which reject a resolved target outside the image.
         const DMK::Region range{DMK::Address{module_base}, module_size};
         s_image_range = range;
         s_resolved_addresses.fill(0);
         s_resolved_values.fill(std::nullopt);
-
-        // Resolve only the anchors that carry a ladder or quorum members, plus every call-site rung, in one parallel
-        // pass. The rest stay 0 (gEnv / vtable / stub consumers). wired_index maps each pass slot back to its
-        // AnchorId.
-        std::array<Anchor, k_max_report> pass{};
-        std::array<std::size_t, k_anchor_count> wired_index{};
-        std::size_t wired_count = 0;
-        for (std::size_t i = 0; i < k_anchor_count; ++i)
-        {
-            if (is_wired(k_anchor_table[i]))
-            {
-                pass[wired_count] = k_anchor_table[i];
-                wired_index[wired_count] = i;
-                ++wired_count;
-            }
-        }
-        std::size_t pass_count = wired_count;
-        for (const CallSiteFallback &fallback : k_call_site_fallbacks)
-        {
-            pass[pass_count++] = fallback.site;
-        }
+        s_feature_ready.fill(false);
 
         // Offline signature grading first: it needs no game memory and says which rungs are structurally weak
         // BEFORE the sweep reports which ones missed, so the two lines read together on a patch-day log.
-        report_signature_health(std::span<const Anchor>(pass.data(), pass_count));
+        report_signature_health(k_anchors);
 
-        // resolve_all_parallel writes s_report[i] for pass[i], in input order.
-        s_report_count =
-            DMK::anchor::resolve_all_parallel(std::span<const Anchor>(pass.data(), pass_count),
-                                              std::span<ResolvedAnchor>(s_report.data(), pass_count), range);
+        s_report_count = DMK::anchor::resolve_all_parallel(k_anchors, std::span{s_report}.first(k_anchor_count), range);
 
-        for (std::size_t j = 0; j < s_report_count && j < wired_count; ++j)
+        merge_signatures(load_signature_repairs());
+        apply_signature_repairs(range);
+
+        // resolve_all_parallel writes s_report[i] for k_anchors[i], so the report index is the AnchorId.
+        for (std::size_t i = 0; i < s_report_count; ++i)
         {
-            const ResolvedAnchor &entry = s_report[j];
-            const std::size_t slot = wired_index[j];
+            const ResolvedAnchor &entry = s_report[i];
             if (entry.status == AnchorStatus::Resolved)
             {
-                s_resolved_values[slot] = entry.value;
-                // Per-anchor values are for RE / external tooling, not routine status, so keep them at Debug; the
+                s_resolved_values[i] = entry.value;
+                // Per-anchor values are for RE / external tooling, not routine status, so they stay at Debug. The
                 // one-line quality summary below is the default-level health check, and a failure still warns.
                 if (entry.domain == DMK::anchor::ResultDomain::Scalar)
                 {
@@ -586,9 +853,8 @@ namespace TPVCamera
                 }
                 else
                 {
-                    s_resolved_addresses[slot] = static_cast<std::uintptr_t>(entry.value);
-                    logger.debug("Anchor {} -> {}", entry.label,
-                                 DMK::format::format_address(s_resolved_addresses[slot]));
+                    s_resolved_addresses[i] = static_cast<std::uintptr_t>(entry.value);
+                    logger.debug("Anchor {} -> {}", entry.label, DMK::format::format_address(s_resolved_addresses[i]));
                 }
             }
             else
@@ -598,65 +864,72 @@ namespace TPVCamera
             }
         }
 
-        // The call-site rungs stand in for a target only when its own cascade missed. When both resolved, the
-        // two independent sites must agree; a disagreement means one of them matched the wrong code, so it is
-        // reported (the in-function cascade is kept, exactly as the first-match-wins ladder ordered it before).
-        for (std::size_t k = 0; k < k_call_site_fallbacks.size() && wired_count + k < s_report_count; ++k)
-        {
-            const ResolvedAnchor &entry = s_report[wired_count + k];
-            const std::size_t slot = static_cast<std::size_t>(k_call_site_fallbacks[k].target);
-            if (entry.status != AnchorStatus::Resolved)
-            {
-                logger.debug("Anchor {} unresolved ({})", entry.label,
-                             DMK::anchor::anchor_status_to_string(entry.status));
-                continue;
-            }
-            const std::uintptr_t callee = call_site_target(static_cast<std::uintptr_t>(entry.value), range);
-            if (s_resolved_addresses[slot] == 0 && callee != 0)
-            {
-                s_resolved_addresses[slot] = callee;
-                s_resolved_values[slot] = static_cast<std::int64_t>(callee);
-                logger.warning("Anchor {} recovered through its call site -> {}", k_anchor_table[slot].label,
-                               DMK::format::format_address(callee));
-            }
-            else if (callee != s_resolved_addresses[slot])
-            {
-                logger.warning("Anchor {} disagrees with its call site ({} vs {}); keeping the in-function match",
-                               k_anchor_table[slot].label, DMK::format::format_address(s_resolved_addresses[slot]),
-                               DMK::format::format_address(callee));
-            }
-        }
+        evaluate_feature_gates();
 
         const DMK::anchor::AnchorQuality quality = DMK::anchor::assess_quality(anchor_report());
-        logger.info("Anchor resolution: {}/{} resolved, {} failed, {} unsupported (KCD1: other anchors use gEnv "
-                    "member / vtable slot / stub)",
-                    quality.resolved, quality.total, quality.failed, quality.unsupported);
+        logger.info("Anchor resolution: {}/{} resolved ({} corroborated), {} failed, {} unsupported", quality.resolved,
+                    quality.total, quality.corroborated, quality.failed, quality.unsupported);
+    }
 
-        // The library's startup gate under its default, strictest policy: Pass means every wired cascade and
-        // every call-site rung resolved. A lesser verdict is logged, not enforced: each consumer already fails
-        // closed on its own anchor, and the optional features degrade independently of the camera.
-        const DMK::anchor::GateVerdict gate = DMK::anchor::evaluate_gate(quality);
-        if (gate == DMK::anchor::GateVerdict::Pass)
+    void export_signatures()
+    {
+        DMK::Logger &logger = DMK::log();
+        std::vector<DMK::manifest::SignatureRecord> records;
+        records.reserve(s_signatures.size());
+        for (const DMK::manifest::Signature &signature : s_signatures)
         {
-            logger.info("Anchor gate: {}", DMK::anchor::gate_verdict_to_string(gate));
+            auto copy = DMK::manifest::Signature::compile(signature.record());
+            if (!copy)
+            {
+                continue;
+            }
+            if (auto captured = copy->recapture(s_image_range); !captured)
+            {
+                logger.debug("Signatures: [sig.{}] exported without a content baseline ({})", copy->label(),
+                             captured.error().message());
+            }
+            records.push_back(copy->record());
+        }
+        const std::filesystem::path path = runtime_file(Constants::SIGNATURE_EXPORT_SUFFIX);
+        const DMK::manifest::Manifest manifest{
+            .header =
+                {
+                    .schema = DMK::manifest::SCHEMA_VERSION,
+                    .revision = Constants::SIGNATURE_REVISION,
+                },
+            .records = std::move(records),
+        };
+        if (auto saved = DMK::manifest::save(path, manifest); saved)
+        {
+            logger.info("Signatures: exported {} signature(s) to {}", manifest.records.size(), path.string());
         }
         else
         {
-            logger.warning("Anchor gate: {} (see the unresolved anchors above)",
-                           DMK::anchor::gate_verdict_to_string(gate));
+            logger.warning("Signatures: export to {} failed ({})", path.string(), saved.error().message());
         }
     }
 
-    std::uintptr_t anchor_address(AnchorId id) noexcept
+    bool feature_ready(Feature feature) noexcept
     {
-        const std::size_t index = static_cast<std::size_t>(id);
-        return (index < k_anchor_count) ? s_resolved_addresses[index] : 0;
+        const std::size_t index = static_cast<std::size_t>(feature);
+        return index < k_feature_count && s_feature_ready[index];
+    }
+
+    std::uintptr_t gated_anchor_address(Feature feature, AnchorId id) noexcept
+    {
+        const std::size_t index = index_of(id);
+        return feature_ready(feature) && index < k_anchor_count ? s_resolved_addresses[index] : 0;
+    }
+
+    std::optional<std::int64_t> gated_anchor_value(Feature feature, AnchorId id) noexcept
+    {
+        return feature_ready(feature) ? anchor_value(id) : std::nullopt;
     }
 
     std::optional<std::int64_t> anchor_value(AnchorId id) noexcept
     {
-        const std::size_t index = static_cast<std::size_t>(id);
-        return (index < k_anchor_count) ? s_resolved_values[index] : std::nullopt;
+        const std::size_t index = index_of(id);
+        return index < k_anchor_count ? s_resolved_values[index] : std::nullopt;
     }
 
     std::optional<TurnDecisionLayout> resolve_turn_decision_layout(std::uintptr_t trigger_return)
@@ -667,6 +940,13 @@ namespace TPVCamera
             logger.warning("Turn decision: {} did not resolve", proof);
             return std::nullopt;
         };
+
+        const std::optional<std::int64_t> installed_state =
+            gated_anchor_value(Feature::TurnDecision, AnchorId::TurnInstalledState);
+        if (!installed_state)
+        {
+            return refuse("the movement action's installed-turn state");
+        }
 
         const std::optional<FunctionBounds> bounds = function_bounds(trigger_return);
         if (!bounds || !s_image_range.contains(bounds->entry.base) ||
@@ -680,15 +960,15 @@ namespace TPVCamera
         // it and the match must start at the scope's base.
         const std::size_t contract_length = ladder_reach(Aob::k_turnContractCandidates);
         const DMK::Region contract_scope{DMK::Address{trigger_return - contract_length}, contract_length};
-        if (scoped_address(code_ladder("TurnContract", Aob::k_turnContractCandidates), contract_scope) !=
+        if (scoped_address(code_ladder("TurnContract", Aob::k_turnContractCandidates, Role::Site), contract_scope) !=
             contract_scope.base.raw())
         {
             return refuse("the register contract before the IsThirdPerson call");
         }
 
-        // The test, branch and idle clear start exactly at the return address; the join follows them.
+        // The test, branch and idle clear start exactly at the return address, and the join follows them.
         const std::size_t join_length = ladder_reach(Aob::k_turnJoinCandidates);
-        if (scoped_address(code_ladder("TurnJoin", Aob::k_turnJoinCandidates),
+        if (scoped_address(code_ladder("TurnJoin", Aob::k_turnJoinCandidates, Role::Site),
                            DMK::Region{DMK::Address{trigger_return}, join_length}) != trigger_return)
         {
             return refuse("the IsThirdPerson test, branch and idle clear");
@@ -704,7 +984,7 @@ namespace TPVCamera
             return refuse("the branch to the decision chunk");
         }
         const std::uintptr_t site =
-            scoped_address(code_ladder("TurnDecisionSite", Aob::k_turnDecisionSiteCandidates),
+            scoped_address(code_ladder("TurnDecisionSite", Aob::k_turnDecisionSiteCandidates, Role::Site),
                            DMK::Region{*chunk, ladder_reach(Aob::k_turnDecisionSiteCandidates)});
         if (site == 0)
         {
@@ -718,9 +998,9 @@ namespace TPVCamera
 
         // r12 holds the turn-angle output pointer from the prologue to the store through it.
         if (bounds->prologue_size == 0 ||
-            scoped_address(code_ladder("TurnOutputSave", Aob::k_turnOutputSaveCandidates),
+            scoped_address(code_ladder("TurnOutputSave", Aob::k_turnOutputSaveCandidates, Role::Site),
                            DMK::Region{bounds->entry.base, bounds->prologue_size}) == 0 ||
-            scoped_address(code_ladder("TurnOutputStore", Aob::k_turnOutputStoreCandidates), body) == 0)
+            scoped_address(code_ladder("TurnOutputStore", Aob::k_turnOutputStoreCandidates, Role::Site), body) == 0)
         {
             return refuse("the turn-angle output pointer in r12");
         }
@@ -729,28 +1009,18 @@ namespace TPVCamera
             scoped_value(quorum("TurnSpinLatch", k_turn_latch_votes, 0, k_byte_field_range), body);
         const std::optional<std::int64_t> last_sign =
             scoped_value(quorum("TurnLastSign", k_turn_sign_votes, 0, k_dword_field_range), body);
-        const std::optional<std::int64_t> installed_state = anchor_value(AnchorId::TurnInstalledState);
-        if (!spin_latch || !last_sign || !installed_state)
+        if (!spin_latch || !last_sign)
         {
             return refuse("the movement action's spin-latch fields");
         }
 
-        const std::uintptr_t kind_site = resolve_turn_kind_site(body, *installed_state);
-        if (kind_site == 0)
-        {
-            logger.warning("Turn decision: the turn path's fragment-type choice did not resolve");
-        }
-
-        logger.debug(
-            "Turn decision: site {}, spin latch +{:#x}, installed state +{:#x}, last sign +{:#x}, kind site {}",
-            DMK::format::format_address(site), *spin_latch, *installed_state, *last_sign,
-            DMK::format::format_address(kind_site));
+        logger.debug("Turn decision: site {}, spin latch +{:#x}, installed state +{:#x}, last sign +{:#x}",
+                     DMK::format::format_address(site), *spin_latch, *installed_state, *last_sign);
         return TurnDecisionLayout{
             .site = site,
             .spin_latch_offset = static_cast<std::ptrdiff_t>(*spin_latch),
             .installed_state_offset = static_cast<std::ptrdiff_t>(*installed_state),
             .last_sign_offset = static_cast<std::ptrdiff_t>(*last_sign),
-            .kind_site = kind_site,
         };
     }
 
@@ -775,26 +1045,52 @@ namespace TPVCamera
         return static_cast<std::ptrdiff_t>(*offset);
     }
 
-    std::span<const DMK::anchor::ResolvedAnchor> anchor_report() noexcept
+    bool dispatches_camera_event(std::uintptr_t handle_event, std::uint8_t event_id)
     {
-        return std::span<const DMK::anchor::ResolvedAnchor>(s_report.data(), s_report_count);
-    }
-
-    bool code_matches(std::uintptr_t address, const DMK::scan::Pattern &pattern) noexcept
-    {
-        std::array<std::byte, 64> bytes{};
-        const std::size_t length = pattern.max_match_length();
-        if (length > bytes.size())
+        const std::optional<FunctionBounds> bounds = function_bounds(handle_event);
+        if (!bounds || !s_image_range.contains(DMK::Address{handle_event}) ||
+            bounds->fragment.base.raw() != handle_event)
         {
             return false;
         }
-        const auto window = std::span{bytes}.first(length);
-        return DMK::memory::read_into(DMK::Address{address}, window).has_value() && pattern.matches_at(window);
+        // The k_cameraEventHandleEventIdCandidates shape with the id the quorum accepted in place of its wildcard.
+        const DMK::Result<DMK::scan::Pattern> dispatch =
+            DMK::scan::Pattern::compile(std::format("41 8B 46 08 83 F8 {:02X} [2-6] 41 83 7E 08", event_id));
+        return dispatch.has_value() && DMK::scan::scan(*dispatch, bounds->fragment, 1, Pages::Executable).has_value();
     }
 
-    DMK::Result<DMK::scan::Pattern> handle_event_dispatch(std::uint8_t event_id)
+    std::span<const ResolvedAnchor> anchor_report() noexcept
     {
-        return DMK::scan::Pattern::compile(std::format("41 8B 46 08 83 F8 {:02X} [2-6] 41 83 7E 08", event_id));
+        return std::span<const ResolvedAnchor>(s_report.data(), s_report_count);
+    }
+
+    bool code_window_matches(std::uintptr_t target, const DMK::scan::Pattern &signature, std::size_t window,
+                             const DMK::Region &image) noexcept
+    {
+        std::array<std::byte, k_max_code_window> bytes{};
+        const std::size_t length = signature.min_match_length();
+        if (target == 0 || length == 0 || window < length || window > bytes.size())
+        {
+            return false;
+        }
+        const DMK::Address base{target};
+        if (!image.contains(base) || !image.contains(base.offset(static_cast<std::ptrdiff_t>(window) - 1)))
+        {
+            return false;
+        }
+        const auto head = std::span{bytes}.first(window);
+        if (!DMK::memory::read_into(base, head).has_value())
+        {
+            return false;
+        }
+        for (std::size_t at = 0; at + length <= window; ++at)
+        {
+            if (signature.matches_at(head.subspan(at)))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
 } // namespace TPVCamera

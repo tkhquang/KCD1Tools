@@ -16,18 +16,13 @@ project(KCD1_TPVCamera VERSION ${_ver_major}.${_ver_minor}.${_ver_patch} LANGUAG
 # Re-run configure when the version header changes so PROJECT_VERSION stays current.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_version_header}")
 
-# The one name every artifact derives from: the ASI, the dev loader and logic DLL, the staged
-# generation copies, and the logs. The dev pair also receives it as a compile definition.
-set(TPVCAMERA_MOD_NAME "KCD1_TPVCamera")
-
 # --- Build Options ---
 # TPVCAMERA_DEV_BUILD OFF (default): a single production ASI built from the logic
-# plus dllmain.cpp. ON: the DetourModKit staged-reload pair (see src/dev/): a resident
-# loader ASI plus a logic DLL it replaces on Numpad 0 by loading a uniquely named copy
-# of each rebuild.
-option(TPVCAMERA_DEV_BUILD "Build the two-DLL hot-reload dev configuration (resident loader ASI + logic DLL)" OFF)
+# plus dllmain.cpp. ON: a thin loader ASI plus a logic DLL, enabling DetourModKit
+# hot-reload for fast iteration (the loader reloads the logic in place; see src/dev/).
+option(TPVCAMERA_DEV_BUILD "Build the two-DLL hot-reload dev configuration (thin loader ASI + logic DLL)" OFF)
 set(TPVCAMERA_GAME_DIR "" CACHE PATH
-  "Game Bin\\Win64 directory to deploy into (the dev build deploys the loader and the logic DLL there)")
+  "Directory to deploy the built mod into (the game's mod-loader/plugins directory). Used by the dev build for hot-reload.")
 
 # --- Standard and Compiler Options ---
 set(CMAKE_CXX_STANDARD 23)
@@ -129,7 +124,6 @@ endif()
 set(COMMON_SOURCES
   src/aob_resolver.cpp
   src/config.cpp
-  src/detour_gate.cpp
   src/game_interface.cpp
   src/game_state.cpp
   src/global_state.cpp
@@ -140,6 +134,7 @@ set(COMMON_SOURCES
   src/tpv_camera.cpp
   src/version.cpp
   src/hooks/camera_hook.cpp
+  src/hooks/hook_set.cpp
   src/hooks/ui_menu_hooks.cpp
   src/hooks/ui_overlay_hooks.cpp
   src/hooks/interaction_hook.cpp
@@ -177,7 +172,7 @@ if(NOT TPVCAMERA_DEV_BUILD)
   add_library(${PROJECT_NAME}-ASI SHARED ${COMMON_SOURCES} src/dllmain.cpp)
   configure_logic_target(${PROJECT_NAME}-ASI)
   set_target_properties(${PROJECT_NAME}-ASI PROPERTIES
-    OUTPUT_NAME "${TPVCAMERA_MOD_NAME}-temp-asi"
+    OUTPUT_NAME "KCD1_TPVCamera-temp-asi"
     SUFFIX ".asi"
     PREFIX ""
   )
@@ -198,7 +193,7 @@ if(NOT TPVCAMERA_DEV_BUILD)
   add_custom_command(TARGET ${PROJECT_NAME}-ASI POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy
       $<TARGET_FILE:${PROJECT_NAME}-ASI>
-      ${CMAKE_CURRENT_BINARY_DIR}/${TPVCAMERA_MOD_NAME}.asi
+      ${CMAKE_CURRENT_BINARY_DIR}/KCD1_TPVCamera.asi
     COMMENT "Renaming ASI output to final name"
   )
 
@@ -206,25 +201,25 @@ if(NOT TPVCAMERA_DEV_BUILD)
   if(TPVCAMERA_GAME_DIR)
     add_custom_command(TARGET ${PROJECT_NAME}-ASI POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CMAKE_CURRENT_BINARY_DIR}/${TPVCAMERA_MOD_NAME}.asi
-        "${TPVCAMERA_GAME_DIR}/${TPVCAMERA_MOD_NAME}.asi"
+        ${CMAKE_CURRENT_BINARY_DIR}/KCD1_TPVCamera.asi
+        "${TPVCAMERA_GAME_DIR}/KCD1_TPVCamera.asi"
       COMMENT "Deploying ASI to ${TPVCAMERA_GAME_DIR}"
     )
   endif()
 
-  message(STATUS "${TPVCAMERA_MOD_NAME} (${PROJECT_VERSION}) - production ASI build -> ${TPVCAMERA_MOD_NAME}.asi")
+  message(STATUS "KCD1_TPVCamera (${PROJECT_VERSION}) - production ASI build -> KCD1_TPVCamera.asi")
 else()
-  # --- Dev Build: DetourModKit's staged-reload pair (docs/guides/hot-reload in DetourModKit) ---
+  # --- Dev Build: a thin loader ASI plus a logic DLL it hot-reloads in place ---
 
-  # Resident loader ASI: owns the reload control thread and the process-lifetime wheel host, and maps
-  # each logic generation from a uniquely named copy. It links the resident wheel host ONLY, never the
-  # full archive: hosting wheel capture in a module that is never unloaded is what lets the logic DLL
-  # keep mouse-wheel bindings and still unmap, because the permanent wheel keepalive is booked here.
+  # Thin loader ASI: loads the logic DLL and reloads it from the staging/ subdir
+  # on a Numpad 0 press. Links only the Win32 libraries (no DetourModKit).
   add_library(${PROJECT_NAME}-loader SHARED src/dev/mod_loader.cpp)
   target_compile_options(${PROJECT_NAME}-loader PRIVATE /W4)
+  # The loader links the resident wheel host ONLY, never the full archive. Hosting wheel capture here -
+  # in a module that is never unloaded - is what lets the logic DLL keep mouse-wheel bindings and still
+  # unmap: the permanent MessageHookKeepalive is booked against this module instead of that one.
   target_link_libraries(${PROJECT_NAME}-loader PRIVATE DetourModKit::WheelHost kernel32 user32)
   target_include_directories(${PROJECT_NAME}-loader PRIVATE src)
-  target_compile_definitions(${PROJECT_NAME}-loader PRIVATE TPVCAMERA_MOD_NAME="${TPVCAMERA_MOD_NAME}")
 
   # Guard the property above. Linking the full archive here would give the loader its own DetourModKit
   # instance, which is exactly the arrangement the library's unload proofs exclude.
@@ -236,20 +231,17 @@ else()
     message(FATAL_ERROR "${PROJECT_NAME}-loader must not link the full DetourModKit archive.")
   endif()
   set_target_properties(${PROJECT_NAME}-loader PROPERTIES
-    OUTPUT_NAME "${TPVCAMERA_MOD_NAME}"
+    OUTPUT_NAME "KCD1_TPVCamera"
     SUFFIX ".asi"
     PREFIX ""
   )
 
-  # Logic DLL: the mod logic plus the Init / Shutdown / Revision exports the loader drives. It links the
-  # full archive exactly like the production ASI, so every reload exercises the production teardown.
+  # Logic DLL: all mod logic plus the exported Init/Shutdown entry points.
   add_library(${PROJECT_NAME}-logic SHARED ${COMMON_SOURCES} src/dev/mod_logic.cpp)
   configure_logic_target(${PROJECT_NAME}-logic)
-  target_compile_definitions(${PROJECT_NAME}-logic PRIVATE
-    TPVCAMERA_DEV_BUILD
-    TPVCAMERA_MOD_NAME="${TPVCAMERA_MOD_NAME}")
+  target_compile_definitions(${PROJECT_NAME}-logic PRIVATE TPVCAMERA_DEV_BUILD)
   set_target_properties(${PROJECT_NAME}-logic PROPERTIES
-    OUTPUT_NAME "${TPVCAMERA_MOD_NAME}.logic"
+    OUTPUT_NAME "KCD1_TPVCamera.logic"
     PREFIX ""
   )
   # /Zi emits a PDB; /DEBUG /INCREMENTAL:NO keep each rebuild a clean, reloadable DLL.
@@ -257,33 +249,35 @@ else()
   target_link_options(${PROJECT_NAME}-logic PRIVATE /DEBUG /INCREMENTAL:NO)
 
   if(TPVCAMERA_GAME_DIR)
-    # The loader changes rarely and stays mapped for the game session, so it is expected to land while the
-    # game is closed.
+    # Loader ASI deploys straight into the game directory. copy_if_different
+    # tolerates a running game holding it open; the loader changes rarely, so it
+    # is expected to land while the game is closed.
     add_custom_command(TARGET ${PROJECT_NAME}-loader POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:${PROJECT_NAME}-loader>
-        "${TPVCAMERA_GAME_DIR}/${TPVCAMERA_MOD_NAME}.asi"
+        "${TPVCAMERA_GAME_DIR}/KCD1_TPVCamera.asi"
       COMMENT "Deploying loader ASI to ${TPVCAMERA_GAME_DIR}"
     )
 
-    # The logic DLL (+PDB) deploys straight beside the loader. The loader never maps this file: each
-    # generation loads a uniquely named copy (<mod>.genNNNN.logic.dll), so a rebuild can replace it while
-    # the game runs.
+    # Logic DLL (+PDB) deploys into staging/. The loader promotes it into the game
+    # directory on startup and on each Numpad 0 reload, so the build never writes a
+    # file the running game holds open.
     add_custom_command(TARGET ${PROJECT_NAME}-logic POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${TPVCAMERA_GAME_DIR}/staging"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:${PROJECT_NAME}-logic>
-        "${TPVCAMERA_GAME_DIR}/${TPVCAMERA_MOD_NAME}.logic.dll"
+        "${TPVCAMERA_GAME_DIR}/staging/KCD1_TPVCamera.logic.dll"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_PDB_FILE:${PROJECT_NAME}-logic>
-        "${TPVCAMERA_GAME_DIR}/${TPVCAMERA_MOD_NAME}.logic.pdb"
-      COMMENT "Deploying logic DLL+PDB beside the loader (Numpad 0 stages and loads a fresh copy)"
+        "${TPVCAMERA_GAME_DIR}/staging/KCD1_TPVCamera.logic.pdb"
+      COMMENT "Deploying logic DLL+PDB to staging (loader promotes on startup / Numpad 0)"
     )
   else()
     message(STATUS "TPVCAMERA_GAME_DIR not set: dev build will not auto-deploy. "
-                   "Set -DTPVCAMERA_GAME_DIR=<game Bin/Win64> to enable hot-reload deploy.")
+                   "Set -DTPVCAMERA_GAME_DIR=<game plugins dir> to enable hot-reload deploy.")
   endif()
 
-  message(STATUS "${TPVCAMERA_MOD_NAME} (${PROJECT_VERSION}) - DEV (staged-reload pair) build")
-  message(STATUS "    - ${PROJECT_NAME}-loader -> ${TPVCAMERA_MOD_NAME}.asi (resident loader)")
-  message(STATUS "    - ${PROJECT_NAME}-logic  -> ${TPVCAMERA_MOD_NAME}.logic.dll (mod logic)")
+  message(STATUS "KCD1_TPVCamera (${PROJECT_VERSION}) - DEV (two-DLL hot-reload) build")
+  message(STATUS "    - ${PROJECT_NAME}-loader -> KCD1_TPVCamera.asi (thin loader)")
+  message(STATUS "    - ${PROJECT_NAME}-logic  -> KCD1_TPVCamera.logic.dll (mod logic)")
 endif()

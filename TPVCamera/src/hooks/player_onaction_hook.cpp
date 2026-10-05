@@ -14,7 +14,6 @@
 #include "hooks/player_onaction_hook.hpp"
 #include "aob_resolver.hpp"
 #include "constants.hpp"
-#include "detour_gate.hpp"
 #include "global_state.hpp"
 
 #include <DetourModKit.hpp>
@@ -258,8 +257,8 @@ namespace TPVCamera
         // held - the sprint gate is the failsafe against a stranded flag disabling normal strafing/back-pedal.
         // The signed latch below stays the REAL stick (the camera detour reads it to set the body-turn angle), so
         // only the value forwarded to the engine is rewritten - no feedback into the angle.
-        const bool collapse = s_force_forward_axes.load(std::memory_order_relaxed) &&
-                              s_sprint_active.load(std::memory_order_relaxed);
+        const bool collapse =
+            s_force_forward_axes.load(std::memory_order_relaxed) && s_sprint_active.load(std::memory_order_relaxed);
         float forward_value = value;
 
         for (size_t i = 0; i < k_move_count; ++i)
@@ -267,7 +266,7 @@ namespace TPVCamera
             if (k_move_actions[i] == name_view)
             {
                 s_move_values[i].store(std::fabs(value), std::memory_order_relaxed); // magnitude (move-detect)
-                s_move_signed[i].store(value, std::memory_order_relaxed);             // signed (follow-stick vector)
+                s_move_signed[i].store(value, std::memory_order_relaxed);            // signed (follow-stick vector)
                 // Cache the engine CryString + axis kind for the GAMEPAD analog axes only (4=xi_movey /
                 // 6=movement_y forward, 5=xi_movex / 7=movement_x lateral) so the detour can re-assert the OTHER
                 // axis between change-only events. Keyboard digital keys (0..3) are never collapsed or cached.
@@ -316,8 +315,8 @@ namespace TPVCamera
         __try
         {
             forward_value = capture_movement_input(action_name, activation, value);
-            collapse_active = s_force_forward_axes.load(std::memory_order_relaxed) &&
-                              s_sprint_active.load(std::memory_order_relaxed);
+            collapse_active =
+                s_force_forward_axes.load(std::memory_order_relaxed) && s_sprint_active.load(std::memory_order_relaxed);
             move_axis = s_last_move_axis;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -383,7 +382,7 @@ namespace TPVCamera
     static uintptr_t __fastcall detour_action_dispatch(uintptr_t self, const char **action_name,
                                                        unsigned int activation, float value) noexcept
     {
-        const DetourGate::Pass pass;
+        const DetourScope in_flight;
         const ActionDispatchFunc original = s_action_dispatch_original.load(std::memory_order_acquire);
         if (original == nullptr)
         {
@@ -392,14 +391,14 @@ namespace TPVCamera
         return dispatch_with_capture(original, self, action_name, activation, value);
     }
 
-    DMK::Result<void> initialize_player_onaction_hook(DMK::hook::HookStack &hooks)
+    DMK::Result<void> initialize_player_onaction_hook(HookSet &hooks)
     {
         DMK::Logger &logger = DMK::log();
 
-        // ActionDispatch is a runtime AOB cascade (k_actionDispatchCandidates); a total cascade miss fails closed
-        // (orbit move-detection disabled). The default hook::Options prologue policy is Fail (refuse a breakpoint
-        // first byte); a sibling mod's E9 jump hook does not trip it, so layering still works.
-        const uintptr_t dispatch_addr = anchor_address(AnchorId::ActionDispatch);
+        // ActionDispatch is a runtime AOB cascade (k_actionDispatchCandidates), read through the MoveIntent gate. A
+        // failed gate turns orbit move-detection off. The default hook::Options prologue policy is Fail (refuse a
+        // breakpoint first byte). A sibling mod's E9 jump hook does not trip it, so layering still works.
+        const uintptr_t dispatch_addr = gated_anchor_address(Feature::MoveIntent, AnchorId::ActionDispatch);
         if (dispatch_addr == 0)
         {
             logger.warning("PlayerOnAction: action dispatcher cascade unresolved; orbit move-detection off");
@@ -409,7 +408,10 @@ namespace TPVCamera
         DMK_TRY(installed, DMK::hook::inline_at(DMK::hook::InlineRequest{.name = "PlayerOnActionDispatch",
                                                                          .target = DMK::Address{dispatch_addr}},
                                                 &detour_action_dispatch));
-        DMK_TRY_VOID(DetourGate::arm(hooks, std::move(installed), s_action_dispatch_original));
+        // Publish the trampoline and store the handle BEFORE enable() arms the patch, so the set owns a hook whose arm
+        // fails with the patch live.
+        s_action_dispatch_original.store(installed.original<ActionDispatchFunc>(), std::memory_order_release);
+        DMK_TRY_VOID(hooks.push(std::move(installed)).enable());
 
         s_available.store(true, std::memory_order_relaxed);
         logger.info("PlayerOnAction: hooked action dispatcher at {} (orbit move-detection enabled)",
