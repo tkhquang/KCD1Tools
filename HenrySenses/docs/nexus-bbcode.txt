@@ -1,0 +1,241 @@
+[size=5]Foreword[/size]
+[b]Henry's Senses[/b] is a port of my Kingdom Come: Deliverance II mod of the same name. Press a key to highlight nearby loot and herbs with outlines and fills. It uses the game's own silhouette effect, a CryEngine feature that Kingdom Come: Deliverance still ships but never uses.
+
+It is still early days. If something doesn't highlight, looks wrong or doesn't work properly, please report it with your game/mod versions, settings and log. Thank you for giving it a try!
+
+[size=5]Key Features[/size]
+[list]
+[*]Highlight nearby lootable bodies, animal carcasses, dropped items, containers and herbs[/*]
+[*]Outlines and fills, visible through walls and grass; optional visible-surfaces-only mode[/*]
+[*]Optional groups for living NPCs, animals and interactive objects such as doors, beds and workstations[/*]
+[*]Configurable colours, styles, range, duration and hotkeys per group[/*]
+[*]Pulse, Toggle, Hold and Always activation modes[/*]
+[*]Filters for stolen, empty, locked and other tagged objects, using the game's own loot checks[/*]
+[*]Keyboard and XInput controller bindings, including modifier combinations[/*]
+[*]Live configuration reload when you save the INI[/*]
+[*][url=https://github.com/tkhquang/KCD1Tools]Open-source[/url], built on the [url=https://github.com/tkhquang/DetourModKit]DetourModKit[/url] modding framework[/*]
+[/list]
+
+[size=5]Requirements[/size]
+[list]
+[*]Kingdom Come: Deliverance on PC; built around Steam 1.9.8[/*]
+[*]An ASI loader - [b]not included[/b] (see Step 1 below)[/*]
+[/list]
+
+[size=5]Installation[/size]
+This is an [b].asi[/b] plugin and requires an [b]ASI loader[/b], which is [b]not bundled[/b] in the download.
+
+[size=4]Find the installation folder[/size]
+Open your KC:D installation folder, then open the Bin/Win64 subfolder that contains [b]WHGame.dll[/b]. On Steam this is:
+[code]<KC:D installation folder>/Bin/Win64/[/code]
+Use WHGame.dll to identify the correct folder. The loader and mod files go directly into this folder.
+
+[size=4]Step 1: Install an ASI loader[/size]
+If you already have a working ASI loader for KC:D, skip to Step 2. The same loader can load Henry's Senses, TPVCamera and other ASI mods.
+
+Download [b]one x64[/b] variant of [url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases]Ultimate ASI Loader[/url] by ThirteenAG:
+[list]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/dinput8-x64.zip][b]dinput8.dll[/b][/url] - Usual choice if dinput8.dll is unused.[/*]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/version-x64.zip][b]version.dll[/b][/url] - Alternative when dinput8.dll is already used, including by KCSE.[/*]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/x64-latest/winmm-x64.zip][b]winmm.dll[/b][/url] - Another alternative if version.dll is also used or does not load.[/*]
+[/list]
+Extract the DLL from the chosen ZIP directly beside WHGame.dll. Use the [b]x64[/b] build, not Win32, and install only one Ultimate ASI Loader variant. Do not overwrite a DLL belonging to another mod.
+
+[b]Using [url=https://www.nexusmods.com/kingdomcomedeliverance/mods/2244]Kingdom Come Script Extender (KCSE)[/url]?[/b] KCSE uses [b]dinput8.dll[/b]. Keep KCSE's file and install Ultimate ASI Loader as [b]version.dll[/b] or [b]winmm.dll[/b] in the same folder. Choose an unused name from the downloads above; do not rename or replace KCSE's DLL.
+
+[size=4]Step 2: Install the mod[/size]
+Download the Henry's Senses release archive from the Files tab or [url=https://github.com/tkhquang/KCD1Tools/releases]GitHub Releases[/url]. Extract its contents directly into the [b]same folder[/b] beside WHGame.dll and your loader DLL, without an extra archive-named subfolder.
+[list]
+[*][b]KCD1_HenrySenses.asi[/b] - The mod.[/*]
+[*][b]KCD1_HenrySenses.ini[/b] - Settings.[/*]
+[*][b]KCD1_HenrySenses.particles.xml[/b] - Optional custom particle effects. Keep it beside the ASI if you use a HenrySenses.* effect in a group; no group uses particles by default.[/*]
+[/list]
+Henry's Senses does not use the Mods folder.
+
+[b]Folder layout:[/b]
+[code]
+Bin/Win64/
+|-- WHGame.dll                         (game file, already present)
+|-- dinput8.dll                        (ASI loader; see KCSE note above)
+|-- KCD1_HenrySenses.asi                (this mod)
+|-- KCD1_HenrySenses.ini                (settings)
+|-- KCD1_HenrySenses.particles.xml      (optional particle effects)
+\-- KCD1_HenrySenses.log                (created when the mod loads)
+[/code]
+With KCSE, dinput8.dll in this example belongs to KCSE; your chosen ASI loader, version.dll or winmm.dll, sits alongside it.
+
+[size=4]Step 3: Launch and verify[/size]
+Launch the game, load a save and press [b]H[/b] (or hold [b]RB + press Start[/b]) to highlight loot. [b]Left Shift + H[/b] (or hold [b]RB + press Back[/b]) highlights herbs.
+
+Check for [b]KCD1_HenrySenses.log[/b] beside the ASI. If it is missing, check that the ASI and x64 loader DLL are directly beside WHGame.dll, then try another unused loader variant and relaunch. Replace only the Ultimate ASI Loader DLL you installed; keep KCSE and other mods' DLLs. On Wine/Proton, also check the override below.
+
+When updating, back up your customized INI before extracting the new archive, then reapply your settings to the supplied INI.
+
+[size=5]Linux / Steam Deck (Wine/Proton)[/size]
+Add an override for your chosen loader DLL in the game's [b]Properties -> Launch Options[/b] on Steam:
+[code]WINEDLLOVERRIDES="dinput8=n,b" %command%[/code]
+Use version=n,b or winmm=n,b instead when using that loader name. If you also use KCSE's dinput8.dll with the version.dll loader, retain both overrides:
+[code]WINEDLLOVERRIDES="dinput8,version=n,b" %command%[/code]
+For a command-line launch, set the same WINEDLLOVERRIDES value before your launch command. Keep any overrides your other mods need.
+
+[size=5]Default Controls[/size]
+All keys are rebindable in KCD1_HenrySenses.ini.
+[list]
+[*][b]Highlight loot:[/b] H, or hold RB + press Start on a controller.[/*]
+[*][b]Highlight herbs:[/b] Left Shift + H, or hold RB + press Back on a controller.[/*]
+[/list]
+Highlights pulse for [b]5 seconds[/b], then fade over [b]1 second[/b], within [b]20 metres[/b]. Loot and Herbs start enabled; the other groups start disabled. The Loot group excludes empty and stolen targets. Highlights hide during [b]dialogue[/b] by default. Group hotkeys also work while menus are open.
+
+[size=5]Configuration[/size]
+Open [b]KCD1_HenrySenses.ini[/b] beside the ASI with a text editor such as Notepad. Save the file to apply changes while playing. Lines starting with a semicolon are comments explaining the options.
+
+[size=4]Shared settings and highlight groups[/size]
+A [b]highlight group[/b] is a set of things you want to see together. Each Highlight.<Name> section can have its own colour, key, range and behaviour. [b]You can create your own groups freely.[/b] Replace <Name> with a unique label of your choice, such as [Highlight.Gathering], and combine any supported target types in Targets. The name is just a label; Targets, Only and Except define what the group highlights. Names must be unique, ignoring case.
+
+The supplied groups are working examples you can edit, rename, remove or use as starting points for your own combinations:
+[list]
+[*][b]Loot (enabled):[/b] corpses, carcasses, items and containers, excluding empty or stolen targets.[/*]
+[*][b]Locked (disabled):[/b] locked, non-empty containers.[/*]
+[*][b]Stolen (disabled):[/b] stolen items, containers, corpses and carcasses, excluding empty targets.[/*]
+[*][b]Herbs (enabled):[/b] unpicked herbs and mushrooms, outlined.[/*]
+[*][b]Places (disabled):[/b] doors, workstations, beds, use spots and other usable objects. Experimental.[/*]
+[*][b]Living (disabled):[/b] living NPCs and animals, with separate colours for horses and dogs.[/*]
+[*][b]Hostiles (disabled):[/b] bandits, Cumans and other public enemies.[/*]
+[/list]
+
+The [b]Settings[/b] section provides shared defaults. A value inside a group's section overrides that default [b]for that group only[/b]. For example, changing Key under Settings changes the Loot binding, but Herbs keeps its own LShift+H,Gamepad_RB+Gamepad_Back binding. Filters belong to individual groups.
+
+Give several groups the same [b]Key[/b] to activate them together while keeping separate colours, filters and styles.
+
+Edit the existing sections for these common changes:
+[list]
+[*][b]See farther:[/b] increase Radius under Settings (metres; default 20). A group's own Radius takes priority.[/*]
+[*][b]Keep a pulse visible longer:[/b] increase Duration under Settings (seconds; default 5).[/*]
+[*][b]Highlight stolen loot in red:[/b] set Enabled = true under Highlight.Stolen. The normal Loot group continues to skip stolen loot.[/*]
+[*][b]Show living people and animals:[/b] enable Highlight.Living.[/*]
+[*][b]Highlight public enemies separately:[/b] enable Highlight.Hostiles; it overrides Living for hostile NPCs.[/*]
+[*][b]Show doors, beds and workstations:[/b] enable Highlight.Places. This detection is experimental.[/*]
+[*][b]Hide highlights behind walls and grass:[/b] set SeeThrough = false under Render.[/*]
+[*][b]Hide highlights during minigames too:[/b] set HideIn = Dialogue, Minigame under Settings.[/*]
+[/list]
+
+[size=4]What each group shows[/size]
+[b]Enabled = true[/b] turns a group on; false turns it off. [b]Targets[/b] lists what it highlights, separated by commas:
+[list]
+[*][b]Loot:[/b] Corpses, Carcasses, Items, Containers, Herbs[/*]
+[*][b]Living creatures:[/b] NPCs, Animals, Horses, Dogs, Critters[/*]
+[*][b]Interactive objects:[/b] Doors, Workstations, Beds, Seats, UseSpots, Objects[/*]
+[/list]
+
+[b]Only[/b] restricts the group to matching objects; [b]Except[/b] leaves matching objects out. Available tags are Stolen, Locked, Empty, Hostile and Unconscious. For example, Targets = Containers with Only = Locked shows locked containers, while Except = Empty skips empty ones. With multiple filters, every Only entry must match and no Except entry may match.
+
+The Stolen tag follows the game's loot window. A citizen's body and owned livestock are Stolen. A bandit's or Cuman's body is not. Wild game is Stolen only without the hunting permit perk. A carcass that nobody has looted yet is not Empty.
+
+For custom selections, Class:, Name: and Model: match an object's class, name or model filename. Matches are case-insensitive; an asterisk matches any text and a question mark matches one character. [b]Targets = Model:*barrel*[/b] selects models whose filenames contain "barrel". These selections do not apply lootability checks.
+
+[size=4]Behaviour and appearance[/size]
+Set a group's [b]Mode[/b] to choose how its key works:
+[list]
+[*][b]Pulse:[/b] press once to show highlights for Duration seconds. Press again to restart the timer.[/*]
+[*][b]Toggle:[/b] press once to turn highlights on, then again to turn them off.[/*]
+[*][b]Hold:[/b] highlights stay visible while you hold the key.[/*]
+[*][b]Always:[/b] highlights stay on without a keypress.[/*]
+[/list]
+
+[b]FadeOut[/b] controls how many seconds they take to disappear; the default is [b]1 second[/b]. [b]HideIn[/b] accepts Dialogue, Combat and Minigame and defaults to [b]Dialogue[/b]. Add Combat or Minigame to hide highlights in those situations too. Group hotkeys also work while menus are open.
+
+[b]Style[/b] chooses Outline (edges), Fill (tint) or OutlineFill (both). The game draws one shared fill for every highlighted object, so it shows while any active group uses Fill or OutlineFill. The shared Render Style is [b]OutlineFill[/b]; Herbs overrides it with [b]Outline[/b].
+
+The main appearance settings under Render are:
+[list]
+[*][b]Strength:[/b] highlight brightness, from 0 (invisible) to 1 (full colour).
+Default: 1.0[/*]
+[*][b]FillOpacity:[/b] fill opacity, from 0 (invisible) to 1 (opaque).
+Default: 0.35[/*]
+[*][b]MinOpacity:[/b] minimum brightness during distance fading. Lower it to enable fading.
+Default: 1.0 (no distance fading)[/*]
+[/list]
+
+When enabled, distance fading starts at FadeStart (12 metres) and reaches MinOpacity at the group's Radius. FadePower (1.0) shapes the fade; higher values keep highlights brighter farther out.
+
+[size=4]Colours[/size]
+[b]Color[/b] sets the colour of targets without their own colour. Use [b]RRGGBB[/b] or [b]RRGGBBAA[/b] hex: FF8000 and FF8000FF both give orange. Pick or convert a colour with the [url=https://www.fleevio.com/en/tools/color-picker]colour picker[/url], copy [b]HEX (no #)[/b] or [b]HEX + alpha (no #)[/b], then paste it into Color or after a target's colon:
+[code]
+Color = FF8000FF
+Targets = Items:FF8000FF, Containers:FFD000FF
+[/code]
+
+The final AA byte is ignored for highlights. Use FillOpacity under Render to adjust fill transparency and Style to choose outline or fill. Darker colours give fainter highlights.
+
+When active groups overlap, the [b]last group in the file wins[/b] for that object. Put a general group first and a more specific one after it, for example, Loot followed by Stolen.
+
+[size=4]Particle effects[/size]
+Add [b]Effect = HenrySenses.sparks[/b] or [b]Effect = HenrySenses.glow[/b] to a group for particles that show through walls; these require KCD1_HenrySenses.particles.xml beside the INI. Game effects such as particles_smithery.particles_smithery.sharpening are hidden by walls. [b]EffectScale = 1.0[/b] sets the size multiplier (0.1 to 10; default 1.0). An empty Effect = or Effect = None disables particles.
+
+[b]Effect[/b] and [b]EffectScale[/b] are separate setting keys. To enable sparks for loot, add these lines inside the existing [b]Highlight.Loot[/b] section. Leave off the leading semicolon used for comments in the template:
+[code]
+Effect = HenrySenses.sparks
+EffectScale = 1.0
+[/code]
+
+[size=4]Example: create your own gathering group[/size]
+Add this new section at the end of the INI to combine dropped items and herbs under one toggle. You can copy it again with another unique name and choose different targets, filters and controls:
+[code]
+[Highlight.Gathering]
+Enabled = true
+Targets = Items:FF8000FF, Herbs:40FF40FF
+Style = Outline
+Key = F8,Gamepad_RB+Gamepad_DpadLeft
+Key.Consume = true
+Mode = Toggle
+Radius = 40
+[/code]
+
+After saving, [b]F8[/b] or [b]RB + D-pad left[/b] toggles orange item outlines and green herb outlines within [b]40 metres[/b]. The group inherits shared settings such as FadeOut and HideIn. Add [b]Except = Stolen[/b] to this section if you want it to skip stolen items. As the last group in the file, it takes priority over earlier active groups for overlapping targets.
+
+[size=5]Keyboard & Controllers[/size]
+Set [b]Key[/b] under Settings for shared controls, or inside a group for independent controls. Named keys such as H, F7 and Mouse4 work; LShift+H is a combination. Leave it empty or use NONE to remove a binding.
+
+The shared binding defaults to [b]H[/b] or [b]RB + Start[/b]. To replace the controller combination with [b]RB + D-pad left[/b], use these entries under Settings:
+[code]
+Key = H,Gamepad_RB+Gamepad_DpadLeft
+Key.Consume = true
+[/code]
+
+The comma means "either binding"; the plus means "hold the first button and press the second". Herbs has its own Key, defaulting to [b]Left Shift + H[/b] or [b]RB + Back[/b], so edit that section separately to change its controls.
+
+[b]Key.Consume = true[/b] hides the combination's last button from the game while held, so D-pad left does not also trigger its game action. It is [b]on by default[/b] for the shared binding and Herbs. Only digital controller buttons and the mouse wheel can be consumed; modifiers, keyboard keys and analog triggers still reach the game.
+
+Controller input uses [b]XInput[/b]. For other controllers, use Steam Input or an XInput translation layer. See the [url=https://github.com/tkhquang/DetourModKit?tab=readme-ov-file#supported-input-names]Supported Input Names[/url] and [url=https://github.com/tkhquang/DetourModKit?tab=readme-ov-file#gamepad-compatibility]Gamepad Compatibility[/url] references.
+
+The INI documents all settings, defaults and further examples.
+
+[size=5]Known Limitations[/size]
+[list]
+[*]Interactive-object detection is experimental; some objects may be missed or highlighted incorrectly.[/*]
+[*]Objects without a model of their own, such as wash tubs and benches, cannot be outlined.[/*]
+[*]The game draws one fill for every highlighted object, so a group's Style only switches that shared fill on or off.[/*]
+[*]Corner brackets (Box style) and the focus darkening of the KCD2 version are not available in KCD1.[/*]
+[*]KCD1 has no butchering, so there is no Butcher group.[/*]
+[*]Game updates may require a mod update if detection or rendering stops working.[/*]
+[/list]
+
+[size=5]Troubleshooting[/size]
+[list]
+[*]Set LogLevel = DEBUG under Settings, save the INI and reproduce the problem.[/*]
+[*]Check KCD1_HenrySenses.log beside the ASI. It records detection decisions and a state report when you save the INI.[/*]
+[/list]
+Please [url=https://github.com/tkhquang/KCD1Tools/issues]report issues[/url] with the log, INI, game/mod versions and reproduction steps. A screenshot and location help with incorrect highlights.
+
+[size=5]Credits & Source Code[/size]
+Built with [url=https://github.com/tkhquang/DetourModKit]DetourModKit[/url] for core functionality.
+[list]
+[*][url=https://github.com/ThirteenAG/Ultimate-ASI-Loader]Ultimate ASI Loader[/url] by ThirteenAG - ASI loading layer[/*]
+[*][url=https://github.com/cursey/safetyhook]SafetyHook[/url] by cursey - hooking[/*]
+[*][url=https://github.com/zyantific/zydis]Zydis[/url] / [url=https://github.com/zyantific/zycore-c]Zycore[/url] by Florian Bernd & Joel Hoener - disassembly used by SafetyHook[/*]
+[*][url=https://github.com/brofield/simpleini]SimpleIni[/url] by Brodie Thiesfield - INI configuration[/*]
+[*][url=https://github.com/microsoft/DirectXMath]DirectXMath[/url] by Microsoft - math primitives[/*]
+[*]Warhorse Studios - Kingdom Come: Deliverance[/*]
+[/list]
+
+Source code for this port is in the [url=https://github.com/tkhquang/KCD1Tools]KCD1Tools GitHub repository[/url]. The original KCD2 mod lives in [url=https://github.com/tkhquang/KCD2Tools]KCD2Tools[/url].
