@@ -2,6 +2,11 @@
 
 All notable changes to the HenrySenses mod will be documented in this file.
 
+## [1.0.1] - Highlights Reach the Full Radius
+
+- Fixed small items such as food, tankards and dice only being highlighted up close.
+- Everything within Radius is now highlighted, even items the game normally hides at that distance.
+
 ## [1.0.0] - First Release
 
 - Press a key to highlight nearby loot: bodies, animal carcasses, dropped items and containers
@@ -17,4 +22,5 @@ All notable changes to the HenrySenses mod will be documented in this file.
 - Settings apply as soon as you save the INI
 - If a game update breaks one feature, only that feature turns off and the log names it
 
+[1.0.1]: https://github.com/tkhquang/KCD1Tools/releases/tag/HenrySenses-v1.0.1
 [1.0.0]: https://github.com/tkhquang/KCD1Tools/releases/tag/HenrySenses-v1.0.0
