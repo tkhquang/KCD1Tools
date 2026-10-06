@@ -1,5 +1,5 @@
 [size=5]Foreword[/size]
-[b]Henry's Senses[/b] is a port of my Kingdom Come: Deliverance II mod of the same name. Press a key to highlight nearby loot and herbs with outlines and fills. It uses the game's own silhouette effect, a CryEngine feature that Kingdom Come: Deliverance still ships but never uses.
+[b]Henry's Senses[/b] is a port of my [url=https://www.nexusmods.com/kingdomcomedeliverance2/mods/3767]Kingdom Come: Deliverance II mod[/url] of the same name. Press a key to highlight nearby loot and herbs with outlines and fills. It uses the game's own silhouette effect, a CryEngine feature that Kingdom Come: Deliverance still ships but never uses.
 
 It is still early days. If something doesn't highlight, looks wrong or doesn't work properly, please report it with your game/mod versions, settings and log. Thank you for giving it a try!
 
@@ -109,7 +109,7 @@ Give several groups the same [b]Key[/b] to activate them together while keeping 
 
 Edit the existing sections for these common changes:
 [list]
-[*][b]See farther:[/b] increase Radius under Settings (metres; default 20). A group's own Radius takes priority.[/*]
+[*][b]See farther:[/b] increase Radius under Settings (metres; default 20, maximum 100). A group's own Radius takes priority. Highlighted objects are drawn out to the full Radius, even small items that the game normally hides after a few metres, so a large Radius costs more performance.[/*]
 [*][b]Keep a pulse visible longer:[/b] increase Duration under Settings (seconds; default 5).[/*]
 [*][b]Highlight stolen loot in red:[/b] set Enabled = true under Highlight.Stolen. The normal Loot group continues to skip stolen loot.[/*]
 [*][b]Show living people and animals:[/b] enable Highlight.Living.[/*]

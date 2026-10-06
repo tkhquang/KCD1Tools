@@ -1,5 +1,4 @@
-## [Title for next release]
+## Highlights Reach the Full Radius
 
-- New feature
-- Bug fix
-- Improvement
+- Fixed small items such as food, tankards and dice only being highlighted up close.
+- Everything within Radius is now highlighted, even items the game normally hides at that distance.

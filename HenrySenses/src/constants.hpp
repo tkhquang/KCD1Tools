@@ -208,6 +208,15 @@ namespace HenrySenses::constants
     // IRenderNode members. [KCD2 flags are a uint64 at +0x28]
     inline constexpr std::ptrdiff_t RENDERNODE_RNDFLAGS_OFFSET = 0x34;    // uint32 render flags (ERF_*)
     inline constexpr std::ptrdiff_t RENDERNODE_OCTREE_NODE_OFFSET = 0x20; // the octree node, 0 when unregistered
+    // float m_fWSMaxViewDist: the node is not drawn past this camera distance, whether it sits in the octree or in the
+    // always-visible list (that list skips only the occlusion test). RegisterEntity (0x180374B20) sets it from
+    // GetMaxViewDist (vtable slot 48) on its full path. [KCD2 +0x48, slot 45]
+    inline constexpr std::ptrdiff_t RENDERNODE_MAX_VIEW_DIST_OFFSET = 0x30;
+    // u8 m_ucViewDistRatio. GetMaxViewDist of CRenderProxy and CBrush is max(e_ViewDistMin, size * e_ViewDistRatio *
+    // ratio / 100), except that 255 counts as 10000 %: a small item is then drawn out to hundreds of metres.
+    // (CRenderProxy 0x1804D5D90, CBrush 0x1804D51A4) [KCD2 +0x4D]
+    inline constexpr std::ptrdiff_t RENDERNODE_VIEW_DIST_RATIO_OFFSET = 0x40;
+    inline constexpr std::uint8_t VIEW_DIST_RATIO_FAR = 255;
     inline constexpr std::uint32_t ERF_RENDER_ALWAYS = 0x10;
     // IRenderNode::Hide (vtable slot 22) toggles this bit of the uint32 flags. [KCD2 uint64 bit]
     inline constexpr std::uint32_t ERF_HIDDEN = 0x100;
