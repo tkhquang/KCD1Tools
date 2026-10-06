@@ -1,0 +1,208 @@
+// Henry's Senses silhouette composite.
+//
+// Replaces DeferredSilhouettesOptimised (PostEffectsGame.cfx) for the highlight composite. The stock technique
+// multiplies every outline pixel by a two-row interlace (1.2 / 0.8) and a screen vignette, and finds edges with three
+// asymmetric taps, so fills show crawling scanlines and outlines come out thick on some sides and thin on others.
+// This one draws a uniform outer outline from a ring of samples, a flat interior, no interlace and no vignette.
+//
+// Mask texel (the object's custom render pass, $SceneNormalsMap, RGBA8): rgb = the highlight colour bytes, already
+// faded. The pass writes them exactly because the mod forces its depth fade to 1. The alpha is 1 where the colour is
+// not black, else 0.
+//
+// Each word also carries a style code in its colour bytes. The low two bits of red and green hold the code, and the
+// low bit of blue is set. Code 1 is Outline, 2 is Fill, 3 is OutlineFill. A texel that fails this check (two words
+// mixed, or a game word) counts as Outline.
+//
+// The mask holds the render resolution. Every read is a Load of one exact texel, never a filtered sample, so the code
+// bits survive. The composite is blended additively (ONE / ONE), so a highlight adds exactly its colour.
+//
+// No #include: the game checks a shader binary's CRC, which covers every included file, on each load, so an include
+// would tie this shader to one game build. The few helpers it needs are defined here.
+
+float Script : STANDARDSGLOBAL
+<
+  string Script =
+           "NoPreview;"
+           "LocalConstants;"
+           "ShaderDrawType = Custom;"
+           "ShaderType = FX;"
+>;
+
+// The effect's own constants (PostEffectsLib.cfi declares them the same way). The mod sets three registers.
+//   [0] x: outline strength, y: interior tint of OutlineFill words, z: outline width, w: edge softness (both in mask
+//       texels).
+//   [1] x: 1 paints the decoded style codes (debug view), zw: the mask viewport size in texels (width, height).
+//   [2] unused, 0.
+float4 psParams[16] < register = c50; >;
+
+// The full-resolution highlight mask ($SceneNormalsMap).
+Texture2D<float4> HSMask  : register(t0);
+// The view's linear depth ($ZTarget). Where two highlighted objects meet it says which one is in front, so the nearer
+// one keeps its outline over the farther one. Unbound, it reads 0 and no outline crosses another object.
+Texture2D<float4> HSDepth : register(t1);
+
+struct pixout
+{
+  float4 Color : COLOR0;
+};
+
+// The vertices of DrawFullScreenTri (P3F_C4B_T2F), as PostEffectsLib.cfi's vtxIn declares them.
+struct vtxInHSSilhouette
+{
+  float4 Position : POSITION;
+  float2 baseTC   : TEXCOORD0;
+  float4 Color    : COLOR;
+};
+
+struct vtxOutHSSilhouette
+{
+  float4 HPosition : SV_Position;
+  float2 baseTC    : TEXCOORDN;
+};
+
+vtxOutHSSilhouette HSSilhouetteVS(vtxInHSSilhouette IN)
+{
+  // Common.cfi's Get2dHPos: the vertex position is in 0..1 screen units, y down.
+  vtxOutHSSilhouette OUT = (vtxOutHSSilhouette)0;
+  OUT.HPosition = float4(IN.Position.xy * float2(2.0, -2.0) - float2(1.0, -1.0), IN.Position.zw);
+  OUT.baseTC = IN.baseTC.xy;
+  return OUT;
+}
+
+float HSMax3(float3 c)
+{
+  return max(c.r, max(c.g, c.b));
+}
+
+// The mask texel at t, clamped to the mask viewport.
+float4 HSMaskAt(int2 t)
+{
+  const int2 size = int2(psParams[1].zw);
+  return HSMask.Load(int3(clamp(t, int2(0, 0), size - 1), 0));
+}
+
+// The linear depth of the texel at t, read without a filter so an edge texel never averages two surfaces. The depth
+// target has the size of the mask viewport.
+float HSDepthAt(int2 t)
+{
+  const int2 size = int2(psParams[1].zw);
+  return HSDepth.Load(int3(clamp(t, int2(0, 0), size - 1), 0)).r;
+}
+
+// The style code of a texel with a word: 1 Outline, 2 Fill, 3 OutlineFill. valid is 0 when the bytes fail the check,
+// and the code is then 1.
+int HSStyleCode(float4 texel, out int valid)
+{
+  const int3 bytes = int3(texel.rgb * 255.0 + 0.5);
+  const int code = bytes.r & 3;
+  valid = (code != 0 && (bytes.g & 3) == code && (bytes.b & 1) != 0) ? 1 : 0;
+  return valid != 0 ? code : 1;
+}
+
+// The highlight at the pixel: the interior colour of the word under the pixel plus the outer outline.
+float3 HSEvaluate(float2 baseTC)
+{
+  const float strength = psParams[0].x;
+  const float interior = psParams[0].y;
+  const float width    = max(psParams[0].z, 0.5);
+  const float softness = max(psParams[0].w, 0.75);
+  const int2  t        = int2(baseTC * psParams[1].zw);
+
+  // Sixteen directions, so no side is favoured and no thin stem slips between two samples at the usual widths.
+  static const float2 dirs[16] = {
+    float2( 1.000,  0.000), float2( 0.924,  0.383), float2( 0.707,  0.707), float2( 0.383,  0.924),
+    float2( 0.000,  1.000), float2(-0.383,  0.924), float2(-0.707,  0.707), float2(-0.924,  0.383),
+    float2(-1.000,  0.000), float2(-0.924, -0.383), float2(-0.707, -0.707), float2(-0.383, -0.924),
+    float2( 0.000, -1.000), float2( 0.383, -0.924), float2( 0.707, -0.707), float2( 0.924, -0.383)
+  };
+
+  const float4 center = HSMaskAt(t);
+  const float  centerLevel = HSMax3(center.rgb);
+  int centerValid = 0;
+  int centerCode = 0;
+  if (centerLevel > 0.0)
+    centerCode = HSStyleCode(center, centerValid);
+
+  // The debug view paints the decoded codes: red Outline, green Fill, blue OutlineFill, magenta a failed check.
+  if (psParams[1].x > 0.5)
+  {
+    if (centerLevel <= 0.0)
+      return float3(0, 0, 0);
+    if (centerValid == 0)
+      return float3(1, 0, 1);
+    return float3(centerCode == 1 ? 1 : 0, centerCode == 2 ? 1 : 0, centerCode == 3 ? 1 : 0);
+  }
+
+  // The outer outline: the nearest outline-word texel within reach sets the distance to the silhouette. Only Outline
+  // and OutlineFill words draw one. A Fill word stays a flat tint.
+  //
+  // A pixel covered by another highlighted object gets the outline only from a sample of another colour whose depth is
+  // clearly nearer than the pixel's: a person standing in front of an outlined door keeps the outline along the door,
+  // while the door's outline stays out of the person. Objects of one colour that touch still share one outline (a
+  // colour change is the only sign of a second object; within one object depth varies too).
+  float3 ringColor = 0;
+  float  ringAlpha = 0;
+  float3 frontColor = 0;
+  float  frontAlpha = 0;
+  float  centerDepth = 0.0;
+  float3 centerHue = 0;
+  if (centerLevel > 0.0)
+  {
+    centerDepth = HSDepthAt(t);
+    centerHue = center.rgb / centerLevel;
+  }
+  const float reach = width + softness;
+  [loop]
+  for (float radius = 1.0; radius <= reach + 0.001; radius += 1.0)
+  {
+    [unroll]
+    for (int i = 0; i < 16; i++)
+    {
+      const int2   offset = int2(round(dirs[i] * radius));
+      const float4 s = HSMaskAt(t + offset);
+      const float  level = HSMax3(s.rgb);
+      if (level <= 0.0 || s.a <= 0.0)
+        continue;
+      int sampleValid = 0;
+      if (HSStyleCode(s, sampleValid) == 2)
+        continue;
+      // The pixel centre lies half a texel outside the edge of an adjacent word texel.
+      const float distance = length(float2(offset)) - 0.5;
+      const float alpha = saturate((width - distance) / softness + 0.5);
+      if (alpha > ringAlpha)
+      {
+        ringAlpha = alpha;
+        ringColor = s.rgb;
+      }
+      if (centerDepth > 0.0 && alpha > frontAlpha && HSMax3(abs(s.rgb / level - centerHue)) > 0.1 &&
+          HSDepthAt(t + offset) < centerDepth * 0.98)
+      {
+        frontAlpha = alpha;
+        frontColor = s.rgb;
+      }
+    }
+  }
+
+  // Inside: a Fill word as it is (its opacity is in the colour), an OutlineFill word tinted, an Outline word empty.
+  // Outside: the ring. Over another highlighted object: only the outline of a nearer object of another colour.
+  const float3 inside = centerCode == 2 ? center.rgb : (centerCode == 3 ? center.rgb * interior : float3(0, 0, 0));
+  const float3 ring = centerLevel > 0.0 ? frontColor * frontAlpha : ringColor * ringAlpha;
+  return inside + ring * strength;
+}
+
+pixout HSSilhouettePS(vtxOutHSSilhouette IN)
+{
+  pixout OUT = (pixout)0;
+  OUT.Color = float4(HSEvaluate(IN.baseTC.xy), 0);
+  return OUT;
+}
+
+technique HenrySensesSilhouette
+{
+  pass p0
+  {
+    VertexShader = HSSilhouetteVS();
+    PixelShader = HSSilhouettePS();
+    CullMode = None;
+  }
+}
